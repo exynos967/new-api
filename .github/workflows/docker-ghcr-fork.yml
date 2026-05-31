@@ -6,10 +6,6 @@ on:
       - main
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Optional extra image tag"
-        required: false
-        default: ""
       platforms:
         description: "Target platforms"
         required: false
@@ -32,7 +28,6 @@ jobs:
         id: vars
         shell: bash
         env:
-          REQUESTED_TAG: ${{ github.event.inputs.tag }}
           REQUESTED_PLATFORMS: ${{ github.event.inputs.platforms }}
         run: |
           repo="${GITHUB_REPOSITORY,,}"
@@ -48,10 +43,6 @@ jobs:
             echo "platforms=$platforms"
             echo "tags<<EOF"
             echo "$image:latest"
-            echo "$image:$version"
-            if [ -n "$REQUESTED_TAG" ] && [ "$REQUESTED_TAG" != "latest" ]; then
-              echo "$image:$REQUESTED_TAG"
-            fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
