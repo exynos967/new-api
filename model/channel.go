@@ -194,6 +194,25 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	}
 }
 
+func (channel *Channel) GetEnabledKeyByIndex(index int) (string, int, bool) {
+	if !channel.ChannelInfo.IsMultiKey || index < 0 {
+		return "", 0, false
+	}
+	keys := channel.GetKeys()
+	if index >= len(keys) {
+		return "", 0, false
+	}
+
+	lock := GetChannelPollingLock(channel.Id)
+	lock.Lock()
+	defer lock.Unlock()
+
+	if status, ok := channel.ChannelInfo.MultiKeyStatusList[index]; ok && status != common.ChannelStatusEnabled {
+		return "", 0, false
+	}
+	return keys[index], index, true
+}
+
 func (channel *Channel) SaveChannelInfo() error {
 	return DB.Model(channel).Update("channel_info", channel.ChannelInfo).Error
 }

@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
@@ -19,6 +21,91 @@ func buildChannelAffinityTemplateContextForTest(meta channelAffinityMeta) *gin.C
 	ctx, _ := gin.CreateTestContext(rec)
 	setChannelAffinityContext(ctx, meta)
 	return ctx
+}
+
+func TestChannelKeyAffinityRecordsAndReadsMultiKeyIndex(t *testing.T) {
+	setting := operation_setting.GetChannelAffinitySetting()
+	require.NotNil(t, setting)
+
+	originalEnabled := setting.Enabled
+	originalSwitchOnSuccess := setting.SwitchOnSuccess
+	originalKeyAffinity := setting.KeyAffinity
+	originalDefaultTTLSeconds := setting.DefaultTTLSeconds
+	setting.Enabled = true
+	setting.SwitchOnSuccess = false
+	setting.KeyAffinity = true
+	setting.DefaultTTLSeconds = 60
+	t.Cleanup(func() {
+		setting.Enabled = originalEnabled
+		setting.SwitchOnSuccess = originalSwitchOnSuccess
+		setting.KeyAffinity = originalKeyAffinity
+		setting.DefaultTTLSeconds = originalDefaultTTLSeconds
+	})
+
+	channelID := 9876
+	cacheKeySuffix := fmt.Sprintf("rule-%s:default:key-fp", t.Name())
+	meta := channelAffinityMeta{
+		CacheKey:       cacheKeySuffix,
+		CacheKeySuffix: cacheKeySuffix,
+		TTLSeconds:     60,
+		RuleName:       "rule-" + t.Name(),
+		UsingGroup:     "default",
+		KeyFingerprint: "key-fp",
+	}
+	ctx := buildChannelAffinityTemplateContextForTest(meta)
+	common.SetContextKey(ctx, constant.ContextKeyChannelIsMultiKey, true)
+	common.SetContextKey(ctx, constant.ContextKeyChannelMultiKeyIndex, 2)
+
+	t.Cleanup(func() {
+		_, _ = getChannelAffinityCache().DeleteMany([]string{cacheKeySuffix})
+		_, _ = getChannelKeyAffinityCache().DeleteMany([]string{buildChannelKeyAffinityCacheKeySuffix(meta, channelID)})
+	})
+
+	RecordChannelAffinity(ctx, channelID)
+
+	keyIndex, found := GetPreferredKeyIndexByAffinity(ctx, channelID)
+	require.True(t, found)
+	require.Equal(t, 2, keyIndex)
+
+	_, found = GetPreferredKeyIndexByAffinity(ctx, channelID+1)
+	require.False(t, found)
+}
+
+func TestChannelKeyAffinityDisabledDoesNotRead(t *testing.T) {
+	setting := operation_setting.GetChannelAffinitySetting()
+	require.NotNil(t, setting)
+
+	originalEnabled := setting.Enabled
+	originalKeyAffinity := setting.KeyAffinity
+	setting.Enabled = true
+	setting.KeyAffinity = false
+	t.Cleanup(func() {
+		setting.Enabled = originalEnabled
+		setting.KeyAffinity = originalKeyAffinity
+	})
+
+	channelID := 9877
+	cacheKeySuffix := fmt.Sprintf("rule-%s:default:key-fp", t.Name())
+	meta := channelAffinityMeta{
+		CacheKey:       cacheKeySuffix,
+		CacheKeySuffix: cacheKeySuffix,
+		TTLSeconds:     60,
+		RuleName:       "rule-" + t.Name(),
+		UsingGroup:     "default",
+		KeyFingerprint: "key-fp",
+	}
+	ctx := buildChannelAffinityTemplateContextForTest(meta)
+	require.NoError(t, getChannelKeyAffinityCache().SetWithTTL(
+		buildChannelKeyAffinityCacheKeySuffix(meta, channelID),
+		1,
+		time.Minute,
+	))
+	t.Cleanup(func() {
+		_, _ = getChannelKeyAffinityCache().DeleteMany([]string{buildChannelKeyAffinityCacheKeySuffix(meta, channelID)})
+	})
+
+	_, found := GetPreferredKeyIndexByAffinity(ctx, channelID)
+	require.False(t, found)
 }
 
 func TestApplyChannelAffinityOverrideTemplate_NoTemplate(t *testing.T) {

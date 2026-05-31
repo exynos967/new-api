@@ -30,6 +30,7 @@ type ChannelAffinityRule struct {
 type ChannelAffinitySetting struct {
 	Enabled           bool                  `json:"enabled"`
 	SwitchOnSuccess   bool                  `json:"switch_on_success"`
+	KeyAffinity       bool                  `json:"key_affinity"`
 	MaxEntries        int                   `json:"max_entries"`
 	DefaultTTLSeconds int                   `json:"default_ttl_seconds"`
 	Rules             []ChannelAffinityRule `json:"rules"`
@@ -76,6 +77,7 @@ func buildPassHeaderTemplate(headers []string) map[string]interface{} {
 var channelAffinitySetting = ChannelAffinitySetting{
 	Enabled:           true,
 	SwitchOnSuccess:   true,
+	KeyAffinity:       true,
 	MaxEntries:        100_000,
 	DefaultTTLSeconds: 3600,
 	Rules: []ChannelAffinityRule{
