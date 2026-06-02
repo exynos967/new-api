@@ -16,6 +16,7 @@ func TestGetEnabledKeyByIndex(t *testing.T) {
 			IsMultiKey:   true,
 			MultiKeyMode: constant.MultiKeyModeRandom,
 			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusManuallyDisabled,
 				1: common.ChannelStatusAutoDisabled,
 			},
 		},
@@ -27,6 +28,9 @@ func TestGetEnabledKeyByIndex(t *testing.T) {
 	require.Equal(t, 2, index)
 
 	_, _, ok = channel.GetEnabledKeyByIndex(1)
+	require.False(t, ok)
+
+	_, _, ok = channel.GetEnabledKeyByIndex(0)
 	require.False(t, ok)
 
 	_, _, ok = channel.GetEnabledKeyByIndex(3)

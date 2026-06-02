@@ -712,6 +712,24 @@ func GetPreferredKeyIndexByAffinity(c *gin.Context, channelID int) (int, bool) {
 	return keyIndex, true
 }
 
+func DeletePreferredKeyIndexByAffinity(c *gin.Context, channelID int) {
+	if channelID <= 0 {
+		return
+	}
+	meta, ok := getChannelAffinityMeta(c)
+	if !ok {
+		return
+	}
+	cacheKeySuffix := buildChannelKeyAffinityCacheKeySuffix(meta, channelID)
+	if cacheKeySuffix == "" {
+		return
+	}
+	cache := getChannelKeyAffinityCache()
+	if _, err := cache.DeleteMany([]string{cacheKeySuffix}); err != nil {
+		common.SysError(fmt.Sprintf("channel key affinity cache delete failed: key=%s, err=%v", cache.FullKey(cacheKeySuffix), err))
+	}
+}
+
 func ShouldSkipRetryAfterChannelAffinityFailure(c *gin.Context) bool {
 	if c == nil {
 		return false

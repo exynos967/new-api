@@ -108,6 +108,45 @@ func TestChannelKeyAffinityDisabledDoesNotRead(t *testing.T) {
 	require.False(t, found)
 }
 
+func TestDeletePreferredKeyIndexByAffinity(t *testing.T) {
+	setting := operation_setting.GetChannelAffinitySetting()
+	require.NotNil(t, setting)
+
+	originalEnabled := setting.Enabled
+	originalKeyAffinity := setting.KeyAffinity
+	setting.Enabled = true
+	setting.KeyAffinity = true
+	t.Cleanup(func() {
+		setting.Enabled = originalEnabled
+		setting.KeyAffinity = originalKeyAffinity
+	})
+
+	channelID := 9878
+	cacheKeySuffix := fmt.Sprintf("rule-%s:default:key-fp", t.Name())
+	meta := channelAffinityMeta{
+		CacheKey:       cacheKeySuffix,
+		CacheKeySuffix: cacheKeySuffix,
+		TTLSeconds:     60,
+		RuleName:       "rule-" + t.Name(),
+		UsingGroup:     "default",
+		KeyFingerprint: "key-fp",
+	}
+	cacheKey := buildChannelKeyAffinityCacheKeySuffix(meta, channelID)
+	ctx := buildChannelAffinityTemplateContextForTest(meta)
+	require.NoError(t, getChannelKeyAffinityCache().SetWithTTL(cacheKey, 1, time.Minute))
+	t.Cleanup(func() {
+		_, _ = getChannelKeyAffinityCache().DeleteMany([]string{cacheKey})
+	})
+
+	_, found := GetPreferredKeyIndexByAffinity(ctx, channelID)
+	require.True(t, found)
+
+	DeletePreferredKeyIndexByAffinity(ctx, channelID)
+
+	_, found = GetPreferredKeyIndexByAffinity(ctx, channelID)
+	require.False(t, found)
+}
+
 func TestApplyChannelAffinityOverrideTemplate_NoTemplate(t *testing.T) {
 	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
 		RuleName: "rule-no-template",
