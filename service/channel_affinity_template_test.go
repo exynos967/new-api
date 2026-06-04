@@ -147,6 +147,34 @@ func TestDeletePreferredKeyIndexByAffinity(t *testing.T) {
 	require.False(t, found)
 }
 
+func TestClearChannelKeyAffinityCacheByChannelID(t *testing.T) {
+	channelID := 9879
+	otherChannelID := 9880
+	meta := channelAffinityMeta{
+		CacheKeySuffix: "rule-clear-channel:default:key-fp",
+	}
+	cache := getChannelKeyAffinityCache()
+	key := buildChannelKeyAffinityCacheKeySuffix(meta, channelID)
+	otherKey := buildChannelKeyAffinityCacheKeySuffix(meta, otherChannelID)
+	require.NoError(t, cache.SetWithTTL(key, 1, time.Minute))
+	require.NoError(t, cache.SetWithTTL(otherKey, 2, time.Minute))
+	t.Cleanup(func() {
+		_, _ = cache.DeleteMany([]string{key, otherKey})
+	})
+
+	deleted := ClearChannelKeyAffinityCacheByChannelID(channelID)
+	require.Equal(t, 1, deleted)
+
+	_, found, err := cache.Get(key)
+	require.NoError(t, err)
+	require.False(t, found)
+
+	otherValue, found, err := cache.Get(otherKey)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, 2, otherValue)
+}
+
 func TestApplyChannelAffinityOverrideTemplate_NoTemplate(t *testing.T) {
 	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{
 		RuleName: "rule-no-template",

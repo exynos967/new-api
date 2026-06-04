@@ -298,6 +298,33 @@ func ClearChannelAffinityCacheByRuleName(ruleName string) (int, error) {
 	return deleted + keyCacheDeleted, nil
 }
 
+func ClearChannelKeyAffinityCacheByChannelID(channelID int) int {
+	if channelID <= 0 {
+		return 0
+	}
+	cache := getChannelKeyAffinityCache()
+	keys, err := cache.Keys()
+	if err != nil {
+		common.SysError(fmt.Sprintf("channel key affinity cache list keys failed: err=%v", err))
+		return 0
+	}
+	suffix := ":" + strconv.Itoa(channelID)
+	matched := make([]string, 0, 16)
+	for _, key := range keys {
+		rawKey := strings.TrimPrefix(key, channelKeyAffinityCacheNamespace+":")
+		if strings.HasSuffix(rawKey, suffix) {
+			matched = append(matched, key)
+		}
+	}
+	if len(matched) == 0 {
+		return 0
+	}
+	if _, err := cache.DeleteMany(matched); err != nil {
+		common.SysError(fmt.Sprintf("channel key affinity cache delete by channel failed: channel_id=%d, err=%v", channelID, err))
+	}
+	return len(matched)
+}
+
 func matchAnyRegexCached(patterns []string, s string) bool {
 	if len(patterns) == 0 || s == "" {
 		return false
