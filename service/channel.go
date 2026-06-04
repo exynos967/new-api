@@ -50,6 +50,20 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 	if !common.AutomaticDisableChannelEnabled {
 		return false
 	}
+	return shouldDisableByError(err)
+}
+
+func ShouldDisableChannelError(err *types.NewAPIError, channelError types.ChannelError) bool {
+	if channelError.IsMultiKey {
+		if !common.AutomaticDisableChannelKeyEnabled {
+			return false
+		}
+		return shouldDisableByError(err)
+	}
+	return ShouldDisableChannel(err)
+}
+
+func shouldDisableByError(err *types.NewAPIError) bool {
 	if err == nil {
 		return false
 	}

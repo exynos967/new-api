@@ -37,6 +37,7 @@ export default function SettingsMonitoring(props) {
     ChannelDisableThreshold: '',
     QuotaRemindThreshold: '',
     AutomaticDisableChannelEnabled: false,
+    AutomaticDisableChannelKeyEnabled: false,
     AutomaticEnableChannelEnabled: false,
     AutomaticDisableKeywords: '',
     AutomaticDisableStatusCodes: '401',
@@ -215,6 +216,22 @@ export default function SettingsMonitoring(props) {
                     setInputs({
                       ...inputs,
                       AutomaticDisableChannelEnabled: value,
+                    });
+                  }}
+                />
+              </Col>
+              <Col xs={24} sm={12} md={8} lg={8} xl={8}>
+                <Form.Switch
+                  field={'AutomaticDisableChannelKeyEnabled'}
+                  label={t('失败时自动禁用key')}
+                  extraText={t('仅密钥聚合模式')}
+                  size='default'
+                  checkedText='｜'
+                  uncheckedText='〇'
+                  onChange={(value) => {
+                    setInputs({
+                      ...inputs,
+                      AutomaticDisableChannelKeyEnabled: value,
                     });
                   }}
                 />
