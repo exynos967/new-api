@@ -372,13 +372,7 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	var newAPIError *types.NewAPIError
 	if channel.ChannelInfo.IsMultiKey {
 		if preferredKeyIndex, found := service.GetPreferredKeyIndexByAffinity(c, channel.Id); found {
-			keyChannel := channel
-			if common.MemoryCacheEnabled {
-				if latestChannel, err := model.GetChannelById(channel.Id, true); err == nil && latestChannel != nil {
-					keyChannel = latestChannel
-				}
-			}
-			if preferredKey, selectedIndex, ok := keyChannel.GetEnabledKeyByIndex(preferredKeyIndex); ok {
+			if preferredKey, selectedIndex, ok := channel.GetEnabledKeyByIndex(preferredKeyIndex); ok {
 				key = preferredKey
 				index = selectedIndex
 			} else {
