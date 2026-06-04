@@ -263,6 +263,36 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+const channelKeyDisabledForRetryKey = "channel_key_disabled_for_retry"
+const channelKeyDisabledRetryChannelIDKey = "channel_key_disabled_retry_channel_id"
+
+func markChannelKeyDisabledForRetry(c *gin.Context, channelID int) {
+	if c == nil {
+		return
+	}
+	c.Set(channelKeyDisabledForRetryKey, true)
+	if channelID > 0 {
+		c.Set(channelKeyDisabledRetryChannelIDKey, channelID)
+	}
+}
+
+func shouldBypassAffinitySkipRetryForDisabledKey(c *gin.Context) bool {
+	if c == nil || !c.GetBool(channelKeyDisabledForRetryKey) {
+		return false
+	}
+	c.Set(channelKeyDisabledForRetryKey, false)
+	return true
+}
+
+func consumeChannelKeyDisabledRetryChannelID(c *gin.Context) int {
+	if c == nil {
+		return 0
+	}
+	channelID := c.GetInt(channelKeyDisabledRetryChannelIDKey)
+	c.Set(channelKeyDisabledRetryChannelIDKey, 0)
+	return channelID
+}
+
 func addUsedChannel(c *gin.Context, channelId int) {
 	useChannel := c.GetStringSlice("use_channel")
 	useChannel = append(useChannel, fmt.Sprintf("%d", channelId))
@@ -363,6 +393,14 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 			}, nil
 		}
 	}
+	if channelID := consumeChannelKeyDisabledRetryChannelID(c); channelID > 0 && !isSpecificChannelRequest(c) && !service.IsChannelDailySuccessLimitSkipped(c, channelID) {
+		if channel, err := model.CacheGetChannel(channelID); err == nil && channel != nil && channel.Status == common.ChannelStatusEnabled {
+			info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
+			if newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName); newAPIError == nil {
+				return channel, nil
+			}
+		}
+	}
 	channel, selectGroup, err := service.CacheGetRandomSatisfiedChannel(retryParam)
 
 	info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
@@ -388,7 +426,7 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if openaiErr == nil {
 		return false
 	}
-	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
+	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) && !shouldBypassAffinitySkipRetryForDisabledKey(c) {
 		return false
 	}
 	if types.IsChannelError(openaiErr) {
@@ -420,10 +458,20 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, err.Error()))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
-	if service.ShouldDisableChannel(err) && channelError.AutoBan {
-		gopool.Go(func() {
-			service.DisableChannel(channelError, err.ErrorWithStatusCode())
-		})
+	if service.ShouldDisableChannelError(err, channelError) && channelError.AutoBan {
+		reason := err.ErrorWithStatusCode()
+		if channelError.IsMultiKey {
+			if service.DisableChannelStatus(channelError, reason) {
+				markChannelKeyDisabledForRetry(c, channelError.ChannelId)
+				gopool.Go(func() {
+					service.NotifyChannelDisabled(channelError, reason)
+				})
+			}
+		} else {
+			gopool.Go(func() {
+				service.DisableChannel(channelError, reason)
+			})
+		}
 	}
 
 	if constant.ErrorLogEnabled && types.IsRecordErrorLog(err) {
@@ -705,7 +753,7 @@ func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError,
 	if taskErr == nil {
 		return false
 	}
-	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
+	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) && !shouldBypassAffinitySkipRetryForDisabledKey(c) {
 		return false
 	}
 	if retryTimes <= 0 {
