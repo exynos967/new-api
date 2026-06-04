@@ -1398,6 +1398,55 @@ type KeyStatus struct {
 	KeyPreview   string `json:"key_preview"` // first 10 chars of key for identification
 }
 
+const multiKeyAllDisabledReason = "All keys are disabled"
+
+func getMultiKeyStatus(channel *model.Channel, index int) int {
+	if channel == nil || channel.ChannelInfo.MultiKeyStatusList == nil {
+		return common.ChannelStatusEnabled
+	}
+	if status, exists := channel.ChannelInfo.MultiKeyStatusList[index]; exists {
+		return status
+	}
+	return common.ChannelStatusEnabled
+}
+
+func hasEnabledMultiKey(channel *model.Channel) bool {
+	if channel == nil || !channel.ChannelInfo.IsMultiKey {
+		return false
+	}
+	keys := channel.GetKeys()
+	for i := range keys {
+		if getMultiKeyStatus(channel, i) == common.ChannelStatusEnabled {
+			return true
+		}
+	}
+	return false
+}
+
+func syncManagedMultiKeyChannelStatus(channel *model.Channel, disabledStatus int) {
+	if channel == nil || !channel.ChannelInfo.IsMultiKey {
+		return
+	}
+	info := channel.GetOtherInfo()
+	if hasEnabledMultiKey(channel) {
+		if channel.Status != common.ChannelStatusEnabled && info["status_reason"] == multiKeyAllDisabledReason {
+			channel.Status = common.ChannelStatusEnabled
+			delete(info, "status_reason")
+			delete(info, "status_time")
+			channel.SetOtherInfo(info)
+		}
+		return
+	}
+
+	if disabledStatus == 0 {
+		disabledStatus = common.ChannelStatusManuallyDisabled
+	}
+	channel.Status = disabledStatus
+	info["status_reason"] = multiKeyAllDisabledReason
+	info["status_time"] = common.GetTimestamp()
+	channel.SetOtherInfo(info)
+}
+
 // ManageMultiKeys handles multi-key management operations
 func ManageMultiKeys(c *gin.Context) {
 	request := MultiKeyManageRequest{}
@@ -1572,6 +1621,9 @@ func ManageMultiKeys(c *gin.Context) {
 		}
 
 		channel.ChannelInfo.MultiKeyStatusList[keyIndex] = 2 // disabled
+		channel.ChannelInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
+		channel.ChannelInfo.MultiKeyDisabledReason[keyIndex] = "manual disabled"
+		syncManagedMultiKeyChannelStatus(channel, common.ChannelStatusManuallyDisabled)
 
 		err = channel.Update()
 		if err != nil {
@@ -1615,6 +1667,7 @@ func ManageMultiKeys(c *gin.Context) {
 		if channel.ChannelInfo.MultiKeyDisabledReason != nil {
 			delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
 		}
+		syncManagedMultiKeyChannelStatus(channel, common.ChannelStatusManuallyDisabled)
 
 		err = channel.Update()
 		if err != nil {
@@ -1640,6 +1693,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
 		channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
 		channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
+		syncManagedMultiKeyChannelStatus(channel, common.ChannelStatusManuallyDisabled)
 
 		err = channel.Update()
 		if err != nil {
@@ -1677,6 +1731,8 @@ func ManageMultiKeys(c *gin.Context) {
 			// 只禁用当前启用的密钥
 			if status == 1 {
 				channel.ChannelInfo.MultiKeyStatusList[i] = 2 // disabled
+				channel.ChannelInfo.MultiKeyDisabledTime[i] = common.GetTimestamp()
+				channel.ChannelInfo.MultiKeyDisabledReason[i] = "manual disabled"
 				disabledCount++
 			}
 		}
@@ -1688,6 +1744,7 @@ func ManageMultiKeys(c *gin.Context) {
 			})
 			return
 		}
+		syncManagedMultiKeyChannelStatus(channel, common.ChannelStatusManuallyDisabled)
 
 		err = channel.Update()
 		if err != nil {
@@ -1769,6 +1826,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyStatusList = newStatusList
 		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
 		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
+		syncManagedMultiKeyChannelStatus(channel, common.ChannelStatusManuallyDisabled)
 
 		err = channel.Update()
 		if err != nil {
@@ -1838,6 +1896,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyStatusList = newStatusList
 		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
 		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
+		syncManagedMultiKeyChannelStatus(channel, common.ChannelStatusManuallyDisabled)
 
 		err = channel.Update()
 		if err != nil {
