@@ -68,6 +68,7 @@ const OperationSetting = () => {
     ChannelDisableThreshold: 0,
     QuotaRemindThreshold: 0,
     AutomaticDisableChannelEnabled: false,
+    AutomaticDisableChannelKeyEnabled: false,
     AutomaticEnableChannelEnabled: false,
     AutomaticDisableKeywords: '',
     AutomaticDisableStatusCodes: '401',

@@ -108,16 +108,26 @@ func (channel *Channel) GetKeys() []string {
 }
 
 func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
-	// If not in multi-key mode, return the original key string directly.
-	if !channel.ChannelInfo.IsMultiKey {
-		return channel.Key, 0, nil
+	if channel == nil {
+		return "", 0, types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed)
 	}
 
-	lock := GetChannelPollingLock(channel.Id)
+	keyChannel := channel.latestChannelForKeySelection()
+	if keyChannel == nil {
+		return "", 0, types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed)
+	}
+
+	// Always prefer the latest channel snapshot before deciding whether this is a multi-key channel.
+	// A stale caller-side snapshot can miss the multi-key flag or disabled-key status and would otherwise
+	// cause requests to fall back to the raw key string.
+	if !keyChannel.ChannelInfo.IsMultiKey {
+		return keyChannel.Key, 0, nil
+	}
+
+	lock := GetChannelPollingLock(keyChannel.Id)
 	lock.Lock()
 	defer lock.Unlock()
 
-	keyChannel := channel.latestChannelForKeySelection()
 	// Obtain all keys (split by \n) from the latest channel snapshot so status indexes
 	// stay aligned after key edits, manual disables, or cache refreshes.
 	keys := keyChannel.GetKeys()
@@ -215,15 +225,19 @@ func (channel *Channel) latestChannelForKeySelection() *Channel {
 }
 
 func (channel *Channel) GetEnabledKeyByIndex(index int) (string, int, bool) {
-	if !channel.ChannelInfo.IsMultiKey || index < 0 {
+	if channel == nil || index < 0 {
 		return "", 0, false
 	}
 
-	lock := GetChannelPollingLock(channel.Id)
+	keyChannel := channel.latestChannelForKeySelection()
+	if keyChannel == nil || !keyChannel.ChannelInfo.IsMultiKey {
+		return "", 0, false
+	}
+
+	lock := GetChannelPollingLock(keyChannel.Id)
 	lock.Lock()
 	defer lock.Unlock()
 
-	keyChannel := channel.latestChannelForKeySelection()
 	keys := keyChannel.GetKeys()
 	if index >= len(keys) {
 		return "", 0, false

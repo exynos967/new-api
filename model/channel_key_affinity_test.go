@@ -82,3 +82,87 @@ func TestGetNextEnabledKeyPollingUsesLatestDisabledStatus(t *testing.T) {
 	require.Equal(t, "key-b", key)
 	require.Equal(t, 1, index)
 }
+
+func TestGetNextEnabledKeyUsesLatestMultiKeyFlagFromStaleSnapshot(t *testing.T) {
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalChannelsIDM := channelsIDM
+	originalGroup2Model2Channels := group2model2channels
+	common.MemoryCacheEnabled = true
+	channelSyncLock.Lock()
+	channelsIDM = map[int]*Channel{
+		998003: {
+			Id:  998003,
+			Key: "key-a\nkey-b",
+			ChannelInfo: ChannelInfo{
+				IsMultiKey:           true,
+				MultiKeyMode:         constant.MultiKeyModePolling,
+				MultiKeyPollingIndex: 0,
+				MultiKeyStatusList: map[int]int{
+					0: common.ChannelStatusManuallyDisabled,
+				},
+			},
+		},
+	}
+	group2model2channels = map[string]map[string][]int{}
+	channelSyncLock.Unlock()
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		channelSyncLock.Lock()
+		channelsIDM = originalChannelsIDM
+		group2model2channels = originalGroup2Model2Channels
+		channelSyncLock.Unlock()
+	})
+
+	staleChannel := &Channel{
+		Id:  998003,
+		Key: "key-a\nkey-b",
+	}
+
+	key, index, err := staleChannel.GetNextEnabledKey()
+	require.Nil(t, err)
+	require.Equal(t, "key-b", key)
+	require.Equal(t, 1, index)
+}
+
+func TestGetEnabledKeyByIndexUsesLatestMultiKeyFlagFromStaleSnapshot(t *testing.T) {
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalChannelsIDM := channelsIDM
+	originalGroup2Model2Channels := group2model2channels
+	common.MemoryCacheEnabled = true
+	channelSyncLock.Lock()
+	channelsIDM = map[int]*Channel{
+		998004: {
+			Id:  998004,
+			Key: "key-a\nkey-b",
+			ChannelInfo: ChannelInfo{
+				IsMultiKey:   true,
+				MultiKeyMode: constant.MultiKeyModeRandom,
+				MultiKeyStatusList: map[int]int{
+					0: common.ChannelStatusAutoDisabled,
+				},
+			},
+		},
+	}
+	group2model2channels = map[string]map[string][]int{}
+	channelSyncLock.Unlock()
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		channelSyncLock.Lock()
+		channelsIDM = originalChannelsIDM
+		group2model2channels = originalGroup2Model2Channels
+		channelSyncLock.Unlock()
+	})
+
+	staleChannel := &Channel{
+		Id:  998004,
+		Key: "key-a\nkey-b",
+	}
+
+	_, _, ok := staleChannel.GetEnabledKeyByIndex(0)
+	require.False(t, ok)
+
+	key, index, ok := staleChannel.GetEnabledKeyByIndex(1)
+	require.True(t, ok)
+	require.Equal(t, "key-b", key)
+	require.Equal(t, 1, index)
+}
