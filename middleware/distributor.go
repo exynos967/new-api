@@ -370,12 +370,17 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
+	// 使用最新快照判断是否为多 key 模式，避免因传入过时 channel 对象
+	// 导致跳过密钥亲和性检查或错误地返回原始 key 字符串
+	keyChannel := channel.LatestChannelForKeySelection()
+	isMultiKey := keyChannel != nil && keyChannel.ChannelInfo.IsMultiKey
+
 	var key string
 	var index int
 	var newAPIError *types.NewAPIError
-	if channel.ChannelInfo.IsMultiKey {
+	if isMultiKey {
 		if preferredKeyIndex, found := service.GetPreferredKeyIndexByAffinity(c, channel.Id); found {
-			if preferredKey, selectedIndex, ok := channel.GetEnabledKeyByIndex(preferredKeyIndex); ok {
+			if preferredKey, selectedIndex, ok := keyChannel.GetEnabledKeyByIndex(preferredKeyIndex); ok {
 				key = preferredKey
 				index = selectedIndex
 			} else {
@@ -384,12 +389,13 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 		}
 	}
 	if key == "" {
+		// GetNextEnabledKey 内部已使用 latestChannelForKeySelection，传入 channel 即可
 		key, index, newAPIError = channel.GetNextEnabledKey()
 	}
 	if newAPIError != nil {
 		return newAPIError
 	}
-	if channel.ChannelInfo.IsMultiKey {
+	if isMultiKey {
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)
 		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, index)
 	} else {

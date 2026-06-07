@@ -112,7 +112,7 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		return "", 0, types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed)
 	}
 
-	keyChannel := channel.latestChannelForKeySelection()
+	keyChannel := channel.LatestChannelForKeySelection()
 	if keyChannel == nil {
 		return "", 0, types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed)
 	}
@@ -202,7 +202,10 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	}
 }
 
-func (channel *Channel) latestChannelForKeySelection() *Channel {
+// LatestChannelForKeySelection 返回最新可用的渠道快照，优先使用内存缓存中的共享对象，
+// 当内存缓存未启用或最新快照的 IsMultiKey 标记与预期不一致时退回 DB 查询。
+// 用于确保密钥选择始终基于最新的 MultiKeyStatusList，避免选中已禁用的 key。
+func (channel *Channel) LatestChannelForKeySelection() *Channel {
 	if channel == nil {
 		return nil
 	}
@@ -229,7 +232,7 @@ func (channel *Channel) GetEnabledKeyByIndex(index int) (string, int, bool) {
 		return "", 0, false
 	}
 
-	keyChannel := channel.latestChannelForKeySelection()
+	keyChannel := channel.LatestChannelForKeySelection()
 	if keyChannel == nil || !keyChannel.ChannelInfo.IsMultiKey {
 		return "", 0, false
 	}
@@ -714,12 +717,16 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 	if len(keys) == 0 {
 		channel.Status = status
 	} else {
-		var keyIndex int
+		var keyIndex int = -1
 		for i, key := range keys {
 			if key == usingKey {
 				keyIndex = i
 				break
 			}
+		}
+		// 未匹配到 key 时跳过，避免误禁用索引 0 的 key
+		if keyIndex < 0 {
+			return
 		}
 		if channel.ChannelInfo.MultiKeyStatusList == nil {
 			channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
