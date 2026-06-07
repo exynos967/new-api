@@ -768,10 +768,23 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 			pollingLock := GetChannelPollingLock(channelId)
 			pollingLock.Lock()
 			// 如果是多Key模式，更新缓存中的状态
+			beforeStatus := channelCache.Status
 			handlerMultiKeyUpdate(channelCache, usingKey, status, reason)
 			pollingLock.Unlock()
-			//CacheUpdateChannel(channelCache)
-			//return true
+
+			// 从内存缓存的共享指针直接持久化到 DB，避免重新从 DB 加载
+			// 过时 channel 对象导致 MultiKeyStatusList 中已有的禁用状态丢失。
+			// key 级别的状态变更不改变 channel.Status 时也需要持久化 MultiKeyStatusList。
+			statusChanged := channelCache.Status != beforeStatus
+			err := channelCache.SaveWithoutKey()
+			if err != nil {
+				common.SysLog(fmt.Sprintf("failed to update channel key status: channel_id=%d, error=%v", channelId, err))
+				return false
+			}
+			if statusChanged {
+				_ = UpdateAbilityStatus(channelId, channelCache.Status == common.ChannelStatusEnabled)
+			}
+			return true
 		} else {
 			// 如果缓存渠道存在，且状态已是目标状态，直接返回
 			if channelCache.Status == status {
@@ -794,10 +807,6 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 	if err != nil {
 		return false
 	} else {
-		if channel.Status == status {
-			return false
-		}
-
 		if channel.ChannelInfo.IsMultiKey {
 			beforeStatus := channel.Status
 			// Protect map writes with the same per-channel lock used by readers
@@ -808,7 +817,19 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 			if beforeStatus != channel.Status {
 				shouldUpdateAbilities = true
 			}
+			if channel.Status == status {
+				// 渠道整体状态未变化（仅单个 key 状态变化），仍需持久化 MultiKeyStatusList
+				err = channel.SaveWithoutKey()
+				if err != nil {
+					common.SysLog(fmt.Sprintf("failed to update channel key status: channel_id=%d, error=%v", channelId, err))
+					return false
+				}
+				return true
+			}
 		} else {
+			if channel.Status == status {
+				return false
+			}
 			info := channel.GetOtherInfo()
 			info["status_reason"] = reason
 			info["status_time"] = common.GetTimestamp()
