@@ -107,19 +107,8 @@ func VideoProxy(c *gin.Context) {
 			return
 		}
 	case constant.ChannelTypeOpenAI, constant.ChannelTypeSora:
-		apiKey := getVideoProxyTaskKey(channel, task)
-		if apiKey == "" {
-			logger.LogError(c.Request.Context(), fmt.Sprintf("Missing API key for video task %s", taskID))
-			videoProxyError(c, http.StatusInternalServerError, "server_error", "API key not available for task")
-			return
-		}
-		upstreamTaskID := getVideoProxyUpstreamTaskID(task)
-		videoURL = fmt.Sprintf("%s/v1/videos/%s/content", strings.TrimRight(baseURL, "/"), url.PathEscape(upstreamTaskID))
-		if c.Request.URL.RawQuery != "" {
-			videoURL += "?" + c.Request.URL.RawQuery
-		}
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("Accept", "application/binary")
+		videoURL = fmt.Sprintf("%s/v1/videos/%s/content", baseURL, task.GetUpstreamTaskID())
+		req.Header.Set("Authorization", "Bearer "+channel.Key)
 	default:
 		// Video URL is stored in PrivateData.ResultURL (fallback to FailReason for old data)
 		videoURL = task.GetResultURL()
@@ -153,9 +142,6 @@ func VideoProxy(c *gin.Context) {
 		videoProxyError(c, http.StatusInternalServerError, "server_error", "Failed to create proxy request")
 		return
 	}
-	if rangeHeader := strings.TrimSpace(c.GetHeader("Range")); rangeHeader != "" {
-		req.Header.Set("Range", rangeHeader)
-	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -165,7 +151,7 @@ func VideoProxy(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+	if resp.StatusCode != http.StatusOK {
 		logger.LogError(c.Request.Context(), fmt.Sprintf("Upstream returned status %d for %s", resp.StatusCode, videoURL))
 		videoProxyError(c, http.StatusBadGateway, "server_error",
 			fmt.Sprintf("Upstream service returned status %d", resp.StatusCode))
@@ -183,54 +169,6 @@ func VideoProxy(c *gin.Context) {
 	if _, err = io.Copy(c.Writer, resp.Body); err != nil {
 		logger.LogError(c.Request.Context(), fmt.Sprintf("Failed to stream video content: %s", err.Error()))
 	}
-}
-
-func getVideoProxyTaskKey(channel *model.Channel, task *model.Task) string {
-	if task != nil {
-		if key := strings.TrimSpace(task.PrivateData.Key); key != "" {
-			return key
-		}
-	}
-	if channel == nil {
-		return ""
-	}
-	for _, key := range channel.GetKeys() {
-		if key = strings.TrimSpace(key); key != "" {
-			return key
-		}
-	}
-	return strings.TrimSpace(channel.Key)
-}
-
-func getVideoProxyUpstreamTaskID(task *model.Task) string {
-	if task == nil {
-		return ""
-	}
-	if upstreamTaskID := strings.TrimSpace(task.PrivateData.UpstreamTaskID); upstreamTaskID != "" {
-		return upstreamTaskID
-	}
-	if upstreamTaskID := extractVideoProxyTaskIDFromData(task); upstreamTaskID != "" {
-		return upstreamTaskID
-	}
-	return strings.TrimSpace(task.TaskID)
-}
-
-func extractVideoProxyTaskIDFromData(task *model.Task) string {
-	if task == nil || len(task.Data) == 0 {
-		return ""
-	}
-	var payload map[string]any
-	if err := common.Unmarshal(task.Data, &payload); err != nil {
-		return ""
-	}
-	for _, key := range []string{"id", "task_id", "request_id"} {
-		value, _ := payload[key].(string)
-		value = strings.TrimSpace(value)
-		if value != "" && value != task.TaskID {
-			return value
-		}
-	}
-	return ""
 }
 
 func writeVideoDataURL(c *gin.Context, dataURL string) error {
