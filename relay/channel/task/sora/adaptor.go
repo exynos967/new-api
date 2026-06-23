@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/task/seedance"
 	taskcommon "github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
@@ -51,7 +52,12 @@ type responseTask struct {
 	Seconds            string `json:"seconds,omitempty"`
 	Size               string `json:"size,omitempty"`
 	RemixedFromVideoID string `json:"remixed_from_video_id,omitempty"`
-	Error              *struct {
+	// Metadata 携带 Seedance 2.0 的 token 用量（total_tokens）与视频地址。
+	Metadata *struct {
+		TotalTokens int    `json:"total_tokens,omitempty"`
+		URL         string `json:"url,omitempty"`
+	} `json:"metadata,omitempty"`
+	Error *struct {
 		Message string `json:"message"`
 		Code    string `json:"code"`
 	} `json:"error,omitempty"`
@@ -94,11 +100,18 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 	return relaycommon.ValidateMultipartDirect(c, info)
 }
 
-// EstimateBilling 根据用户请求的 seconds 和 size 计算 OtherRatios。
+// EstimateBilling 根据用户请求计算 OtherRatios。
+//   - Seedance 2.0（按 token 计费）：返回价格修饰比（相对 720p 无视频基准价），
+//     让预扣费随分辨率/视频输入分档；时长由结算阶段按上游真实 total_tokens 重算。
+//   - Sora 2 原生：沿用 seconds × size 计费。
 func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInfo) map[string]float64 {
 	// remix 路径的 OtherRatios 已在 ResolveOriginTask 中设置
 	if info.Action == constant.TaskActionRemix {
 		return nil
+	}
+
+	if seedance.IsSeedanceModel(info.OriginModelName) {
+		return seedanceEstimateBilling(c, info.OriginModelName)
 	}
 
 	req, err := relaycommon.GetTaskRequest(c)
@@ -127,6 +140,28 @@ func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInf
 		ratios["size"] = 1.666667
 	}
 	return ratios
+}
+
+// seedanceEstimateBilling 解析请求体提取分辨率与视频输入，返回 Seedance 价格修饰比。
+func seedanceEstimateBilling(c *gin.Context, modelName string) map[string]float64 {
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return nil
+	}
+	bodyBytes, err := storage.Bytes()
+	if err != nil {
+		return nil
+	}
+	var bodyMap map[string]interface{}
+	if err := common.Unmarshal(bodyBytes, &bodyMap); err != nil {
+		return nil
+	}
+	resolution, hasVideo := seedance.ParseRequestInfo(bodyMap)
+	ratio, ok := seedance.PriceRatio(modelName, resolution, hasVideo)
+	if !ok || ratio == 1.0 {
+		return nil
+	}
+	return map[string]float64{"price_ratio": ratio}
 }
 
 func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, error) {
@@ -305,6 +340,10 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 	case "completed":
 		taskResult.Status = model.TaskStatusSuccess
 		// Url intentionally left empty — the caller constructs the proxy URL using the public task ID
+		// Seedance 2.0 在 metadata.total_tokens 返回真实 token 用量，供结算阶段按 token 重算。
+		if seedance.IsSeedanceModel(resTask.Model) && resTask.Metadata != nil {
+			taskResult.TotalTokens = resTask.Metadata.TotalTokens
+		}
 	case "failed", "cancelled":
 		taskResult.Status = model.TaskStatusFailure
 		if resTask.Error != nil {
