@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/task/seedance"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
@@ -132,47 +133,30 @@ func (a *TaskAdaptor) BuildRequestHeader(_ *gin.Context, req *http.Request, _ *r
 	return nil
 }
 
-// EstimateBilling 检测请求 metadata 中是否包含视频输入，返回视频折扣 OtherRatio。
+// EstimateBilling 返回 Seedance 价格修饰比（相对 720p 无视频基准价），让预扣费随分辨率/视频输入分档。
+// 时长不在预扣阶段体现，由结算阶段按上游真实 total_tokens 重算。
 func (a *TaskAdaptor) EstimateBilling(c *gin.Context, info *relaycommon.RelayInfo) map[string]float64 {
-	req, err := relaycommon.GetTaskRequest(c)
+	if !seedance.IsSeedanceModel(info.OriginModelName) {
+		return nil
+	}
+	storage, err := common.GetBodyStorage(c)
 	if err != nil {
 		return nil
 	}
-	if hasVideoInMetadata(req.Metadata) {
-		if ratio, ok := GetVideoInputRatio(info.OriginModelName); ok {
-			return map[string]float64{"video_input": ratio}
-		}
+	bodyBytes, err := storage.Bytes()
+	if err != nil {
+		return nil
 	}
-	return nil
-}
-
-// hasVideoInMetadata 直接检查 metadata 的 content 数组是否包含 video_url 条目，
-// 避免构建完整的上游 requestPayload。
-func hasVideoInMetadata(metadata map[string]interface{}) bool {
-	if metadata == nil {
-		return false
+	var bodyMap map[string]interface{}
+	if err := common.Unmarshal(bodyBytes, &bodyMap); err != nil {
+		return nil
 	}
-	contentRaw, ok := metadata["content"]
-	if !ok {
-		return false
+	resolution, hasVideo := seedance.ParseRequestInfo(bodyMap)
+	ratio, ok := seedance.PriceRatio(info.OriginModelName, resolution, hasVideo)
+	if !ok || ratio == 1.0 {
+		return nil
 	}
-	contentSlice, ok := contentRaw.([]interface{})
-	if !ok {
-		return false
-	}
-	for _, item := range contentSlice {
-		itemMap, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if itemMap["type"] == "video_url" {
-			return true
-		}
-		if _, has := itemMap["video_url"]; has {
-			return true
-		}
-	}
-	return false
+	return map[string]float64{"price_ratio": ratio}
 }
 
 // BuildRequestBody converts request into Doubao specific format.
@@ -290,8 +274,17 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq) (*
 		return nil, errors.Wrap(err, "unmarshal metadata failed")
 	}
 
+	// 顶层字段优先于 metadata（兼容火山官方方式 1：顶层直接传参）
+	if req.Resolution != "" {
+		r.Resolution = req.Resolution
+	}
+	if req.Ratio != "" {
+		r.Ratio = req.Ratio
+	}
 	if sec, _ := strconv.Atoi(req.Seconds); sec > 0 {
 		r.Duration = lo.ToPtr(dto.IntValue(sec))
+	} else if req.Duration > 0 {
+		r.Duration = lo.ToPtr(dto.IntValue(req.Duration))
 	}
 
 	r.Content = lo.Reject(r.Content, func(c ContentItem, _ int) bool { return c.Type == "text" })
