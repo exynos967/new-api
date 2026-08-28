@@ -42,6 +42,10 @@ const (
 
 	RelayModeVideoFetchByID
 	RelayModeVideoSubmit
+	RelayModeAudioGenerationFetchByID
+	RelayModeAudioGenerationSubmit
+	RelayModeBatchGenerationFetchByID
+	RelayModeBatchGenerationSubmit
 
 	RelayModeRerank
 
@@ -52,6 +56,8 @@ const (
 	RelayModeGemini
 
 	RelayModeResponsesCompact
+
+	RelayModeOpenAILocalSearch
 )
 
 func Path2RelayMode(path string) int {
@@ -76,6 +82,16 @@ func Path2RelayMode(path string) int {
 		relayMode = RelayModeResponsesCompact
 	} else if strings.HasPrefix(path, "/v1/responses") {
 		relayMode = RelayModeResponses
+	} else if strings.HasPrefix(path, "/v1/search") {
+		relayMode = RelayModeOpenAILocalSearch
+	} else if path == "/v1/audio/generations" || path == "/v1/music/generations" {
+		relayMode = RelayModeAudioGenerationSubmit
+	} else if strings.HasPrefix(path, "/v1/audio/generations/") || strings.HasPrefix(path, "/v1/music/generations/") {
+		relayMode = RelayModeAudioGenerationFetchByID
+	} else if path == "/v1/batch/generations" {
+		relayMode = RelayModeBatchGenerationSubmit
+	} else if strings.HasPrefix(path, "/v1/batch/generations/") {
+		relayMode = RelayModeBatchGenerationFetchByID
 	} else if strings.HasPrefix(path, "/v1/audio/speech") {
 		relayMode = RelayModeAudioSpeech
 	} else if strings.HasPrefix(path, "/v1/audio/transcriptions") {
@@ -86,6 +102,14 @@ func Path2RelayMode(path string) int {
 		relayMode = RelayModeRerank
 	} else if strings.HasPrefix(path, "/v1/realtime") {
 		relayMode = RelayModeRealtime
+	} else if path == "/v1/video/generations" ||
+		path == "/v1/videos/generations" ||
+		path == "/v1/videos" ||
+		(strings.HasPrefix(path, "/v1/videos/") && strings.HasSuffix(path, "/remix")) {
+		relayMode = RelayModeVideoSubmit
+	} else if strings.HasPrefix(path, "/v1/video/generations/") ||
+		strings.HasPrefix(path, "/v1/videos/") {
+		relayMode = RelayModeVideoFetchByID
 	} else if strings.HasPrefix(path, "/v1beta/models") || strings.HasPrefix(path, "/v1/models") {
 		relayMode = RelayModeGemini
 	} else if strings.HasPrefix(path, "/mj") {

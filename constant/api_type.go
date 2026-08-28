@@ -36,5 +36,13 @@ const (
 	APITypeMiniMax
 	APITypeReplicate
 	APITypeCodex
+	APITypeAgnesAI
+	APITypePoe
+	APITypeGCP
+	APITypeCerebras
+	APITypeOpenCode
+	APITypeOpenCodeGo
+	APITypeMistralConsole
+	APITypeVyceAI
 	APITypeDummy // this one is only for count, do not add any channel after this
 )

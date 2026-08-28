@@ -28,6 +28,19 @@ const (
 	MsgBatchTooMany      = "common.batch_too_many"
 )
 
+// IP ban page messages
+const (
+	MsgIPBanPageTitle             = "ip_ban.page_title"
+	MsgIPBanPageHeading           = "ip_ban.page_heading"
+	MsgIPBanPageDescription       = "ip_ban.page_description"
+	MsgIPBanPageCurrentIP         = "ip_ban.page_current_ip"
+	MsgIPBanPageReason            = "ip_ban.page_reason"
+	MsgIPBanPageRestrictionPeriod = "ip_ban.page_restriction_period"
+	MsgIPBanPageUnblocksAt        = "ip_ban.page_unblocks_at"
+	MsgIPBanPagePermanent         = "ip_ban.page_permanent"
+	MsgIPBanPageContactAdmin      = "ip_ban.page_contact_admin"
+)
+
 // Auth middleware messages
 const (
 	MsgAuthNotLoggedIn           = "auth.not_logged_in"
@@ -87,6 +100,8 @@ const (
 	MsgUserRequire2FA                = "user.require_2fa"
 	MsgUserEmailVerificationRequired = "user.email_verification_required"
 	MsgUserVerificationCodeError     = "user.verification_code_error"
+	MsgUserEmailTaken                = "user.email_taken"
+	MsgUserEmailAmbiguous            = "user.email_ambiguous"
 	MsgUserInputInvalid              = "user.input_invalid"
 	MsgUserNoPermissionSameLevel     = "user.no_permission_same_level"
 	MsgUserNoPermissionHigherLevel   = "user.no_permission_higher_level"
@@ -280,20 +295,22 @@ const (
 
 // OAuth related messages
 const (
-	MsgOAuthInvalidCode     = "oauth.invalid_code"
-	MsgOAuthGetUserErr      = "oauth.get_user_error"
-	MsgOAuthAccountUsed     = "oauth.account_used"
-	MsgOAuthUnknownProvider = "oauth.unknown_provider"
-	MsgOAuthStateInvalid    = "oauth.state_invalid"
-	MsgOAuthNotEnabled      = "oauth.not_enabled"
-	MsgOAuthUserDeleted     = "oauth.user_deleted"
-	MsgOAuthUserBanned      = "oauth.user_banned"
-	MsgOAuthBindSuccess     = "oauth.bind_success"
-	MsgOAuthAlreadyBound    = "oauth.already_bound"
-	MsgOAuthConnectFailed   = "oauth.connect_failed"
-	MsgOAuthTokenFailed     = "oauth.token_failed"
-	MsgOAuthUserInfoEmpty   = "oauth.user_info_empty"
-	MsgOAuthTrustLevelLow   = "oauth.trust_level_low"
+	MsgOAuthInvalidCode      = "oauth.invalid_code"
+	MsgOAuthGetUserErr       = "oauth.get_user_error"
+	MsgOAuthAccountUsed      = "oauth.account_used"
+	MsgOAuthUnknownProvider  = "oauth.unknown_provider"
+	MsgOAuthStateInvalid     = "oauth.state_invalid"
+	MsgOAuthNotEnabled       = "oauth.not_enabled"
+	MsgOAuthUserDeleted      = "oauth.user_deleted"
+	MsgOAuthUserBanned       = "oauth.user_banned"
+	MsgOAuthBindSuccess      = "oauth.bind_success"
+	MsgOAuthAlreadyBound     = "oauth.already_bound"
+	MsgOAuthEmailAlreadyUsed = "oauth.email_already_used"
+	MsgOAuthConnectFailed    = "oauth.connect_failed"
+	MsgOAuthTokenFailed      = "oauth.token_failed"
+	MsgOAuthUserInfoEmpty    = "oauth.user_info_empty"
+	MsgOAuthTrustLevelLow    = "oauth.trust_level_low"
+	MsgOAuthAccountAgeTooLow = "oauth.account_age_too_low"
 )
 
 // Model layer error messages (for translation in controller)

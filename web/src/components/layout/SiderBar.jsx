@@ -37,11 +37,12 @@ const routerMap = {
   redemption: '/console/redemption',
   topup: '/console/topup',
   user: '/console/user',
+  ip_ban: '/console/ip-ban',
   subscription: '/console/subscription',
   log: '/console/log',
+  email_log: '/console/email-log',
   midjourney: '/console/midjourney',
   setting: '/console/setting',
-  site: '/console/site',
   about: '/about',
   detail: '/console',
   pricing: '/pricing',
@@ -50,7 +51,7 @@ const routerMap = {
   deployment: '/console/deployment',
   playground: '/console/playground',
   personal: '/console/personal',
-  enhancements: '/console/enhancements/dashboard',
+  enhancements: '/console/enhancements?tab=redemptions',
 };
 
 const SiderBar = ({ onNavigate = () => {} }) => {
@@ -92,6 +93,12 @@ const SiderBar = ({ onNavigate = () => {} }) => {
         to: '/log',
       },
       {
+        text: t('邮件日志'),
+        itemKey: 'email_log',
+        to: '/email-log',
+        className: isAdmin() ? '' : 'tableHiddle',
+      },
+      {
         text: t('绘图日志'),
         itemKey: 'midjourney',
         to: '/midjourney',
@@ -120,6 +127,7 @@ const SiderBar = ({ onNavigate = () => {} }) => {
     localStorage.getItem('enable_data_export'),
     localStorage.getItem('enable_drawing'),
     localStorage.getItem('enable_task'),
+    isAdmin(),
     t,
     isModuleVisible,
   ]);
@@ -149,6 +157,12 @@ const SiderBar = ({ onNavigate = () => {} }) => {
 
   const adminItems = useMemo(() => {
     const items = [
+      {
+        text: t('IP封禁'),
+        itemKey: 'ip_ban',
+        to: '/console/ip-ban',
+        className: isAdmin() ? '' : 'tableHiddle',
+      },
       {
         text: t('渠道管理'),
         itemKey: 'channel',
@@ -192,15 +206,9 @@ const SiderBar = ({ onNavigate = () => {} }) => {
         className: isRoot() ? '' : 'tableHiddle',
       },
       {
-        text: t('站点管理'),
-        itemKey: 'site',
-        to: '/site',
-        className: isRoot() ? '' : 'tableHiddle',
-      },
-      {
         text: t('增强管理'),
         itemKey: 'enhancements',
-        to: '/console/enhancements/dashboard',
+        to: '/console/enhancements?tab=redemptions',
         className: isAdmin() ? '' : 'tableHiddle',
       },
     ];
@@ -302,7 +310,7 @@ const SiderBar = ({ onNavigate = () => {} }) => {
       }
     }
 
-    if (!matchingKey && currentPath.startsWith('/console/enhancements/')) {
+    if (!matchingKey && currentPath.startsWith('/console/enhancements')) {
       matchingKey = 'enhancements';
     }
 

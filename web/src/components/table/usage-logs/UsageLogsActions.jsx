@@ -25,22 +25,70 @@ import { useMinimumLoadingTime } from '../../../hooks/common/useMinimumLoadingTi
 
 const LogsActions = ({
   stat,
+  logCount,
+  logType,
+  fixedLogType,
   loadingStat,
+  loading,
   showStat,
   compactMode,
   setCompactMode,
   t,
 }) => {
   const showSkeleton = useMinimumLoadingTime(loadingStat);
+  const showListSkeleton = useMinimumLoadingTime(loading);
   const needSkeleton = !showStat || showSkeleton;
+  const currentLogType =
+    fixedLogType !== null && fixedLogType !== undefined
+      ? fixedLogType
+      : logType;
+  const rpmSuccess = stat.rpm ?? 0;
+  const rpmTotal = stat.rpm_total ?? rpmSuccess;
+  const rpmSuccessRate = Number(
+    stat.rpm_success_rate ?? (rpmTotal > 0 ? (rpmSuccess / rpmTotal) * 100 : 0),
+  ).toLocaleString(undefined, {
+    maximumFractionDigits: 2,
+  });
 
   const placeholder = (
     <Space>
       <Skeleton.Title style={{ width: 108, height: 21, borderRadius: 6 }} />
-      <Skeleton.Title style={{ width: 65, height: 21, borderRadius: 6 }} />
+      <Skeleton.Title style={{ width: 240, height: 21, borderRadius: 6 }} />
       <Skeleton.Title style={{ width: 64, height: 21, borderRadius: 6 }} />
     </Space>
   );
+
+  if (currentLogType === 7) {
+    return (
+      <div className='flex flex-col md:flex-row justify-between items-start md:items-center gap-2 w-full'>
+        <Skeleton
+          loading={showListSkeleton}
+          active
+          placeholder={
+            <Skeleton.Title style={{ width: 108, height: 21, borderRadius: 6 }} />
+          }
+        >
+          <Tag
+            color='blue'
+            style={{
+              fontWeight: 500,
+              boxShadow: '0 2px 8px rgba(0, 0, 0, 0.1)',
+              padding: 13,
+            }}
+            className='!rounded-lg'
+          >
+            {t('邮件日志')}: {logCount}
+          </Tag>
+        </Skeleton>
+
+        <CompactModeToggle
+          compactMode={compactMode}
+          setCompactMode={setCompactMode}
+          t={t}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className='flex flex-col md:flex-row justify-between items-start md:items-center gap-2 w-full'>
@@ -66,7 +114,8 @@ const LogsActions = ({
             }}
             className='!rounded-lg'
           >
-            RPM: {stat.rpm}
+            RPM: {t('成功')} {rpmSuccess} / {t('总')} {rpmTotal} / {t('成功率')}{' '}
+            {rpmSuccessRate}%
           </Tag>
           <Tag
             color='white'

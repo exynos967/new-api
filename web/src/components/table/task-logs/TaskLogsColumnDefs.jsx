@@ -18,10 +18,11 @@ For commercial licensing, please contact support@quantumnous.com
 */
 
 import React from 'react';
-import { Progress, Tag, Tooltip, Typography } from '@douyinfe/semi-ui';
+import { Button, Progress, Tag, Typography } from '@douyinfe/semi-ui';
 import {
   Music,
   FileText,
+  FileDown,
   HelpCircle,
   CheckCircle,
   Pause,
@@ -30,19 +31,26 @@ import {
   XCircle,
   Loader,
   List,
-  Hash,
-  Video,
   Sparkles,
+  Image,
 } from 'lucide-react';
 import {
   TASK_ACTION_FIRST_TAIL_GENERATE,
   TASK_ACTION_GENERATE,
+  TASK_ACTION_IMAGE_EDIT,
+  TASK_ACTION_IMAGE_GENERATION,
+  TASK_ACTION_AUDIO_GENERATION,
+  TASK_ACTION_BATCH_INFERENCE,
+  TASK_ACTION_MUSIC_GENERATION,
+  TASK_ACTION_PPT,
+  TASK_ACTION_PSD,
   TASK_ACTION_REFERENCE_GENERATE,
   TASK_ACTION_TEXT_GENERATE,
+  TASK_ACTION_VOICE_CLONE,
   TASK_ACTION_REMIX_GENERATE,
 } from '../../../constants/common.constant';
 import { CHANNEL_OPTIONS } from '../../../constants/channel.constants';
-import { stringToColor } from '../../../helpers/render';
+import { renderModelTag, stringToColor } from '../../../helpers/render';
 import { Avatar, Space } from '@douyinfe/semi-ui';
 
 const colors = [
@@ -78,14 +86,17 @@ const renderTimestamp = (timestampInSeconds) => {
 };
 
 function renderDuration(submit_time, finishTime) {
-  if (!submit_time || !finishTime) return 'N/A';
+  if (!submit_time || !finishTime) return '-';
   const durationSec = finishTime - submit_time;
-  const color = durationSec > 60 ? 'red' : 'green';
+  if (durationSec < 0) return '-';
+  const color =
+    durationSec > 60 ? 'red' : durationSec > 10 ? 'yellow' : 'green';
+  const durationText = durationSec === 0 ? '< 1 s' : `${durationSec} s`;
 
   // 返回带有样式的颜色标签
   return (
     <Tag color={color} shape='circle'>
-      {durationSec} s
+      {durationText}
     </Tag>
   );
 }
@@ -134,6 +145,54 @@ const renderType = (type, t) => {
           {t('视频Remix')}
         </Tag>
       );
+    case TASK_ACTION_PPT:
+      return (
+        <Tag color='teal' shape='circle' prefixIcon={<FileText size={14} />}>
+          {t('生成PPT')}
+        </Tag>
+      );
+    case TASK_ACTION_PSD:
+      return (
+        <Tag color='purple' shape='circle' prefixIcon={<FileText size={14} />}>
+          {t('生成PSD')}
+        </Tag>
+      );
+    case TASK_ACTION_IMAGE_GENERATION:
+      return (
+        <Tag color='green' shape='circle' prefixIcon={<Image size={14} />}>
+          {t('图片生成')}
+        </Tag>
+      );
+    case TASK_ACTION_IMAGE_EDIT:
+      return (
+        <Tag color='green' shape='circle' prefixIcon={<Image size={14} />}>
+          {t('图片编辑')}
+        </Tag>
+      );
+    case TASK_ACTION_AUDIO_GENERATION:
+      return (
+        <Tag color='cyan' shape='circle' prefixIcon={<Play size={14} />}>
+          {t('生成语音')}
+        </Tag>
+      );
+    case TASK_ACTION_MUSIC_GENERATION:
+      return (
+        <Tag color='violet' shape='circle' prefixIcon={<Music size={14} />}>
+          {t('生成音乐')}
+        </Tag>
+      );
+    case TASK_ACTION_VOICE_CLONE:
+      return (
+        <Tag color='purple' shape='circle' prefixIcon={<Sparkles size={14} />}>
+          {t('音色克隆')}
+        </Tag>
+      );
+    case TASK_ACTION_BATCH_INFERENCE:
+      return (
+        <Tag color='indigo' shape='circle' prefixIcon={<List size={14} />}>
+          {t('批量推理')}
+        </Tag>
+      );
     default:
       return (
         <Tag color='white' shape='circle' prefixIcon={<HelpCircle size={14} />}>
@@ -168,6 +227,129 @@ const renderPlatform = (platform, t) => {
         </Tag>
       );
   }
+};
+
+const getTaskModelName = (record) => {
+  return (
+    record?.model_name ||
+    record?.properties?.origin_model_name ||
+    record?.properties?.upstream_model_name ||
+    ''
+  );
+};
+
+const getEditableFileResult = (record) => {
+  const data = record?.data || {};
+  const itemResult = Array.isArray(data?.items) ? data.items[0]?.result : null;
+  const result = data?.result || itemResult || {};
+  return {
+    primaryUrl: result?.primary_url || record?.result_url || '',
+    zipUrl: result?.zip_url || '',
+  };
+};
+
+const getImageResultCount = (record) => {
+  const data = record?.data;
+  if (Array.isArray(data)) {
+    return data.length;
+  }
+  if (Array.isArray(data?.data)) {
+    return data.data.length;
+  }
+  return record?.result_url ? 1 : 0;
+};
+
+const audioTaskActions = new Set([
+  TASK_ACTION_AUDIO_GENERATION,
+  TASK_ACTION_MUSIC_GENERATION,
+  TASK_ACTION_VOICE_CLONE,
+]);
+
+const getAudioClips = (record) => {
+  const clips = [];
+  const seen = new Set();
+  const modelName = getTaskModelName(record);
+
+  const addClip = (clip, fallbackTitle = modelName) => {
+    if (!clip || typeof clip !== 'object') return;
+    const audioUrl = clip.audio_url || clip.url;
+    if (!audioUrl || seen.has(audioUrl)) return;
+    seen.add(audioUrl);
+    const duration =
+      clip.duration ||
+      clip.metadata?.duration ||
+      (clip.duration_ms ? clip.duration_ms / 1000 : undefined);
+    clips.push({
+      ...clip,
+      audio_url: audioUrl,
+      title: clip.title || fallbackTitle || 'Audio',
+      duration,
+    });
+  };
+
+  const data = record?.data;
+  if (Array.isArray(data)) {
+    data.forEach((clip) => addClip(clip));
+  } else if (data && typeof data === 'object') {
+    if (Array.isArray(data.data)) {
+      data.data.forEach((clip) => addClip(clip));
+    }
+    const outcome = data.outcome || data.data?.outcome;
+    if (outcome && typeof outcome === 'object') {
+      if (outcome.audio_url) {
+        addClip({
+          ...outcome,
+          audio_url: outcome.audio_url,
+        });
+      }
+      if (Array.isArray(outcome.media_urls)) {
+        outcome.media_urls.forEach((clip) => addClip(clip));
+      }
+      if (Array.isArray(outcome.medias)) {
+        outcome.medias.forEach((clip) => addClip(clip));
+      }
+    }
+  }
+
+  const isAudioTask =
+    record?.platform === 'suno' || audioTaskActions.has(record?.action);
+  if (isAudioTask && record?.result_url) {
+    addClip({ audio_url: record.result_url });
+  }
+  return clips;
+};
+
+const renderDownloadButton = (href, label) => {
+  if (!href) {
+    return null;
+  }
+  return (
+    <a href={href} target='_blank' rel='noreferrer'>
+      <Button size='small' theme='borderless' icon={<FileDown size={14} />}>
+        {label}
+      </Button>
+    </a>
+  );
+};
+
+const getBatchResultUrls = (record) => {
+  const urls = [];
+  const seen = new Set();
+  const addUrl = (url) => {
+    if (typeof url !== 'string' || !/^https?:\/\//.test(url) || seen.has(url)) {
+      return;
+    }
+    seen.add(url);
+    urls.push(url);
+  };
+
+  const outcome = record?.data?.outcome || record?.data?.data?.outcome;
+  if (Array.isArray(outcome?.output_download_urls)) {
+    outcome.output_download_urls.forEach(addUrl);
+  }
+  addUrl(outcome?.output_url);
+  addUrl(record?.result_url);
+  return urls;
 };
 
 const renderStatus = (type, t) => {
@@ -241,6 +423,7 @@ export const getTaskLogsColumns = ({
   isAdminUser,
   openVideoModal,
   openAudioModal,
+  openImageModal,
 }) => {
   return [
     {
@@ -264,7 +447,8 @@ export const getTaskLogsColumns = ({
       title: t('花费时间'),
       dataIndex: 'finish_time',
       render: (finish, record) => {
-        return <>{finish ? renderDuration(record.submit_time, finish) : '-'}</>;
+        const start = record.start_time || record.submit_time;
+        return <>{finish ? renderDuration(start, finish) : '-'}</>;
       },
     },
     {
@@ -301,15 +485,10 @@ export const getTaskLogsColumns = ({
         const displayText = String(record.username || userId || '?');
         return (
           <Space>
-            <Avatar
-              size='extra-small'
-              color={stringToColor(displayText)}
-            >
+            <Avatar size='extra-small' color={stringToColor(displayText)}>
               {displayText.slice(0, 1)}
             </Avatar>
-            <Typography.Text>
-              {displayText}
-            </Typography.Text>
+            <Typography.Text>{displayText}</Typography.Text>
           </Space>
         );
       },
@@ -320,6 +499,26 @@ export const getTaskLogsColumns = ({
       dataIndex: 'platform',
       render: (text, record, index) => {
         return <div>{renderPlatform(text, t)}</div>;
+      },
+    },
+    {
+      key: COLUMN_KEYS.MODEL,
+      title: t('模型'),
+      dataIndex: 'model_name',
+      render: (text, record, index) => {
+        const modelName = getTaskModelName(record);
+        if (!modelName) {
+          return '-';
+        }
+        return (
+          <div>
+            {renderModelTag(modelName, {
+              onClick: () => {
+                copyText(modelName);
+              },
+            })}
+          </div>
+        );
       },
     },
     {
@@ -343,6 +542,27 @@ export const getTaskLogsColumns = ({
             }}
           >
             <div>{text}</div>
+          </Typography.Text>
+        );
+      },
+    },
+    {
+      key: COLUMN_KEYS.REQUEST_ID,
+      title: t('Request ID'),
+      dataIndex: 'request_id',
+      render: (text, record, index) => {
+        if (!text) {
+          return '-';
+        }
+        return (
+          <Typography.Text
+            ellipsis={{ showTooltip: true }}
+            style={{ maxWidth: 180 }}
+            onClick={() => {
+              copyText(text);
+            }}
+          >
+            {text}
           </Typography.Text>
         );
       },
@@ -387,22 +607,18 @@ export const getTaskLogsColumns = ({
       dataIndex: 'fail_reason',
       fixed: 'right',
       render: (text, record, index) => {
-        // Suno audio preview
-        const isSunoSuccess =
-          record.platform === 'suno' &&
-          record.status === 'SUCCESS' &&
-          Array.isArray(record.data) &&
-          record.data.some((c) => c.audio_url);
-        if (isSunoSuccess) {
+        // Audio task preview (Suno, GMICLOUD Speech / Voice Clone / Music)
+        const audioClips = getAudioClips(record);
+        if (record.status === 'SUCCESS' && audioClips.length > 0) {
           return (
             <a
               href='#'
               onClick={(e) => {
                 e.preventDefault();
-                openAudioModal(record.data);
+                openAudioModal(audioClips);
               }}
             >
-              {t('点击预览音乐')}
+              {t('点击预览音频')}
             </a>
           );
         }
@@ -416,7 +632,63 @@ export const getTaskLogsColumns = ({
           record.action === TASK_ACTION_REMIX_GENERATE;
         const isSuccess = record.status === 'SUCCESS';
         const resultUrl = record.result_url;
-        const hasResultUrl = typeof resultUrl === 'string' && /^https?:\/\//.test(resultUrl);
+        const hasResultUrl =
+          typeof resultUrl === 'string' && /^https?:\/\//.test(resultUrl);
+        const isEditableFileTask =
+          record.action === TASK_ACTION_PPT ||
+          record.action === TASK_ACTION_PSD;
+        if (isSuccess && isEditableFileTask) {
+          const { primaryUrl, zipUrl } = getEditableFileResult(record);
+          if (primaryUrl || zipUrl) {
+            return (
+              <Space wrap>
+                {renderDownloadButton(primaryUrl, t('主文件'))}
+                {renderDownloadButton(zipUrl, t('素材包'))}
+              </Space>
+            );
+          }
+        }
+
+        const isImageTask =
+          record.action === TASK_ACTION_IMAGE_GENERATION ||
+          record.action === TASK_ACTION_IMAGE_EDIT;
+        if (isSuccess && isImageTask) {
+          const imageCount = getImageResultCount(record);
+          return (
+            <Typography.Text
+              link
+              onClick={() => {
+                openImageModal(record);
+              }}
+            >
+              {imageCount > 1
+                ? `${t('查看图片结果')} (${imageCount})`
+                : t('查看图片结果')}
+            </Typography.Text>
+          );
+        }
+
+        const isBatchTask = record.action === TASK_ACTION_BATCH_INFERENCE;
+        if (isSuccess && isBatchTask) {
+          const resultUrls = getBatchResultUrls(record);
+          if (resultUrls.length > 0) {
+            return (
+              <Space wrap>
+                {resultUrls.map((url, resultIndex) => (
+                  <React.Fragment key={url}>
+                    {renderDownloadButton(
+                      url,
+                      resultUrls.length > 1
+                        ? t('结果 {{index}}', { index: resultIndex + 1 })
+                        : t('下载结果'),
+                    )}
+                  </React.Fragment>
+                ))}
+              </Space>
+            );
+          }
+        }
+
         if (isSuccess && isVideoTask && hasResultUrl) {
           return (
             <a

@@ -35,7 +35,6 @@ import {
   renderModelPriceSimple,
   renderTieredModelPriceSimple,
 } from '../../../helpers';
-import { IconHelpCircle } from '@douyinfe/semi-icons';
 import { CircleAlert, Route, Sparkles } from 'lucide-react';
 
 const colors = [
@@ -131,6 +130,12 @@ function renderType(type, t) {
       return (
         <Tag color='teal' shape='circle'>
           {t('退款')}
+        </Tag>
+      );
+    case 7:
+      return (
+        <Tag color='blue' shape='circle'>
+          {t('邮件')}
         </Tag>
       );
     default:
@@ -300,7 +305,7 @@ function renderOutputTokenSpeed(record, other) {
   }
 
   return (
-    <Tag color='white' shape='circle'>
+    <Tag color='cyan' shape='circle'>
       {formatTokenSpeed(speed)}t/s
     </Tag>
   );
@@ -624,7 +629,7 @@ export const getLogsColumns = ({
               )}
             </span>
             {isMultiKey && (
-              <Tag color='white' shape='circle'>
+              <Tag color='grey' shape='circle'>
                 {multiKeyIndex}
               </Tag>
             )}
@@ -778,18 +783,7 @@ export const getLogsColumns = ({
     },
     {
       key: COLUMN_KEYS.PROMPT,
-      title: (
-        <div className='flex items-center gap-1'>
-          {t('输入')}
-          <Tooltip
-            content={t(
-              '根据 Anthropic 协定，/v1/messages 的输入 tokens 仅统计非缓存输入，不包含缓存读取与缓存写入 tokens。',
-            )}
-          >
-            <IconHelpCircle className='text-gray-400 cursor-help' />
-          </Tooltip>
-        </div>
-      ),
+      title: t('输入'),
       dataIndex: 'prompt_tokens',
       render: (text, record, index) => {
         const other = getLogOther(record.other);
@@ -882,23 +876,13 @@ export const getLogsColumns = ({
     },
     {
       key: COLUMN_KEYS.IP,
-      title: (
-        <div className='flex items-center gap-1'>
-          {t('IP')}
-          <Tooltip
-            content={t(
-              '只有当用户设置开启IP记录时，才会进行请求和错误类型日志的IP记录',
-            )}
-          >
-            <IconHelpCircle className='text-gray-400 cursor-help' />
-          </Tooltip>
-        </div>
-      ),
+      title: t('IP'),
       dataIndex: 'ip',
       render: (text, record, index) => {
         const showIp =
           (record.type === 2 ||
             record.type === 5 ||
+            record.type === 7 ||
             (isAdminUser && record.type === 1)) &&
           text;
         return showIp ? (
@@ -914,6 +898,42 @@ export const getLogsColumns = ({
                 {text}
               </Tag>
             </span>
+          </Tooltip>
+        ) : (
+          <></>
+        );
+      },
+    },
+    {
+      key: COLUMN_KEYS.USER_AGENT,
+      title: t('User-Agent'),
+      dataIndex: 'user_agent',
+      width: 180,
+      render: (text, record, index) => {
+        return text ? (
+          <Tooltip
+            content={
+              <div style={{ maxWidth: 480, wordBreak: 'break-word' }}>
+                {text}
+              </div>
+            }
+          >
+            <Typography.Text
+              style={{
+                display: 'inline-block',
+                maxWidth: 180,
+                cursor: 'pointer',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                verticalAlign: 'middle',
+              }}
+              onClick={(event) => {
+                copyText(event, text);
+              }}
+            >
+              {text}
+            </Typography.Text>
           </Tooltip>
         ) : (
           <></>

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -274,6 +275,7 @@ func GetAllMidjourney(c *gin.Context) {
 			items[i] = midjourney
 		}
 	}
+	items = midjourneyTasksForViewer(items, c.GetInt("role") >= common.RoleRootUser)
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(items)
 	common.ApiSuccess(c, pageInfo)
@@ -299,7 +301,33 @@ func GetUserMidjourney(c *gin.Context) {
 			items[i] = midjourney
 		}
 	}
+	items = midjourneyTasksForViewer(items, false)
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(items)
 	common.ApiSuccess(c, pageInfo)
+}
+
+func midjourneyTasksForViewer(items []*model.Midjourney, showErrorDetails bool) []*model.Midjourney {
+	if showErrorDetails {
+		return items
+	}
+	result := make([]*model.Midjourney, len(items))
+	for i, task := range items {
+		if task == nil {
+			continue
+		}
+		clientTask := *task
+		if strings.EqualFold(task.Status, "FAILURE") || strings.TrimSpace(task.FailReason) != "" {
+			clientTask.FailReason = dto.TaskFailureCode
+			clientTask.Description = dto.TaskFailureCode
+			clientTask.Properties = ""
+			clientTask.State = ""
+			clientTask.ImageUrl = ""
+			clientTask.VideoUrl = ""
+			clientTask.VideoUrls = ""
+			clientTask.Buttons = ""
+		}
+		result[i] = &clientTask
+	}
+	return result
 }

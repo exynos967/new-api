@@ -46,6 +46,8 @@ export const CHANNEL_OPTIONS = [
     label: 'AWS Claude',
   },
   { value: 41, color: 'blue', label: 'Vertex AI' },
+  { value: 60, color: 'blue', label: 'Google Cloud' },
+  { value: 61, color: 'green', label: 'OpenAI-local' },
   {
     value: 3,
     color: 'teal',
@@ -58,6 +60,12 @@ export const CHANNEL_OPTIONS = [
   },
   { value: 39, color: 'grey', label: 'Cloudflare' },
   { value: 43, color: 'blue', label: 'DeepSeek' },
+  { value: 62, color: 'orange', label: 'Cerebras' },
+  { value: 66, color: 'black', label: 'Vercel AI Gateway' },
+  { value: 67, color: 'blue', label: 'GMI Cloud' },
+  { value: 68, color: 'blue', label: 'VyceAI' },
+  { value: 63, color: 'cyan', label: 'OpenCode Zen' },
+  { value: 64, color: 'green', label: 'OpenCode Go' },
   {
     value: 15,
     color: 'blue',
@@ -118,6 +126,7 @@ export const CHANNEL_OPTIONS = [
   { value: 38, color: 'blue', label: 'Jina' },
   { value: 40, color: 'purple', label: 'SiliconCloud' },
   { value: 42, color: 'blue', label: 'Mistral AI' },
+  { value: 65, color: 'blue', label: 'Mistral Console' },
   { value: 8, color: 'pink', label: '自定义渠道' },
   {
     value: 22,
@@ -189,11 +198,39 @@ export const CHANNEL_OPTIONS = [
     color: 'blue',
     label: 'Codex (OpenAI OAuth)',
   },
+  {
+    value: 58,
+    color: 'green',
+    label: 'Agnes AI',
+  },
+  {
+    value: 59,
+    color: 'blue',
+    label: 'Poe',
+  },
 ];
 
 // Channel types that support upstream model list fetching in UI.
 export const MODEL_FETCHABLE_CHANNEL_TYPES = new Set([
-  1, 4, 14, 34, 17, 26, 27, 24, 47, 25, 20, 23, 31, 40, 42, 48, 43,
+  1, 4, 14, 33, 34, 17, 26, 27, 24, 47, 25, 20, 23, 31, 40, 42, 48, 43, 58, 59,
+  61, 62, 63, 64, 65, 66, 67,
 ]);
+
+export const isManualModelFetchSupported = (
+  type,
+  vertexKeyType = 'json',
+  customModelListUrl = '',
+) => {
+  if (MODEL_FETCHABLE_CHANNEL_TYPES.has(Number(type))) {
+    return true;
+  }
+  if (Number(type) !== 41) {
+    return false;
+  }
+  return (
+    String(customModelListUrl || '').trim() !== '' ||
+    String(vertexKeyType || 'json') !== 'api_key'
+  );
+};
 
 export const MODEL_TABLE_PAGE_SIZE = 10;

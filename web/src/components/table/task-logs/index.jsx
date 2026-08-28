@@ -26,6 +26,7 @@ import TaskLogsFilters from './TaskLogsFilters';
 import ColumnSelectorModal from './modals/ColumnSelectorModal';
 import ContentModal from './modals/ContentModal';
 import AudioPreviewModal from './modals/AudioPreviewModal';
+import ImageResultsModal from './modals/ImageResultsModal';
 import { useTaskLogsData } from '../../../hooks/task-logs/useTaskLogsData';
 import { useIsMobile } from '../../../hooks/common/useIsMobile';
 import { createCardProPagination } from '../../../helpers/utils';
@@ -51,8 +52,13 @@ const TaskLogsPage = () => {
         setIsModalOpen={taskLogsData.setIsAudioModalOpen}
         audioClips={taskLogsData.audioClips}
       />
+      <ImageResultsModal
+        isModalOpen={taskLogsData.isImageModalOpen}
+        setIsModalOpen={taskLogsData.setIsImageModalOpen}
+        imageRecord={taskLogsData.imageRecord}
+      />
 
-      <Layout>
+      <Layout className='site-background-page-surface'>
         <CardPro
           type='type2'
           statsArea={<TaskLogsActions {...taskLogsData} />}

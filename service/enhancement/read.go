@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"gorm.io/gorm"
 )
 
@@ -272,29 +273,78 @@ func redemptionUsedUsernameMap(redemptions []model.Redemption) (map[int]string, 
 	return usernames, nil
 }
 
-func ListRedemptions(page int, pageSize int, status int, keyword string) (PageResult[RedemptionSummary], error) {
-	page = clampPage(page)
-	pageSize = clampLimit(pageSize)
-	query := model.DB.Model(&model.Redemption{})
-	if status > 0 {
-		query = query.Where("status = ?", status)
+func redemptionMatchesQuery(item RedemptionSummary, query ListQuery) bool {
+	if !matchesKeyword(query.Keyword,
+		strconv.Itoa(item.Id),
+		strconv.Itoa(item.UserId),
+		item.Key,
+		item.Name,
+		strconv.Itoa(item.Status),
+		strconv.Itoa(item.UsedUserId),
+		item.UsedUsername,
+		strconv.Itoa(item.Quota),
+		strconv.FormatInt(item.CreatedTime, 10),
+		strconv.FormatInt(item.RedeemedTime, 10),
+		strconv.FormatInt(item.ExpiredTime, 10),
+	) {
+		return false
 	}
-	if strings.TrimSpace(keyword) != "" {
-		userIDs, err := redemptionSearchUserIDs(keyword)
-		if err != nil {
-			return PageResult[RedemptionSummary]{}, err
+	return matchesFilters(query.Filters, map[string]func(string) bool{
+		"id":            matchInt(int64(item.Id)),
+		"user_id":       matchInt(int64(item.UserId)),
+		"key":           matchText(item.Key),
+		"status":        matchInt(int64(item.Status)),
+		"name":          matchText(item.Name),
+		"quota":         matchInt(int64(item.Quota)),
+		"created_time":  matchInt(item.CreatedTime),
+		"redeemed_time": matchInt(item.RedeemedTime),
+		"used_user_id":  matchInt(int64(item.UsedUserId)),
+		"used_username": matchText(item.UsedUsername),
+		"expired_time":  matchInt(item.ExpiredTime),
+	})
+}
+
+func sortRedemptionSummaries(items []RedemptionSummary, sortKey string, order string) {
+	desc := sortDesc(order)
+	sort.SliceStable(items, func(i, j int) bool {
+		left := items[i]
+		right := items[j]
+		result := 0
+		switch sortKey {
+		case "user_id":
+			result = compareInt(int64(left.UserId), int64(right.UserId), desc)
+		case "key":
+			result = compareString(left.Key, right.Key, desc)
+		case "status":
+			result = compareInt(int64(left.Status), int64(right.Status), desc)
+		case "name":
+			result = compareString(left.Name, right.Name, desc)
+		case "quota":
+			result = compareInt(int64(left.Quota), int64(right.Quota), desc)
+		case "created_time":
+			result = compareInt(left.CreatedTime, right.CreatedTime, desc)
+		case "redeemed_time":
+			result = compareInt(left.RedeemedTime, right.RedeemedTime, desc)
+		case "used_user_id":
+			result = compareInt(int64(left.UsedUserId), int64(right.UsedUserId), desc)
+		case "used_username":
+			result = compareString(left.UsedUsername, right.UsedUsername, desc)
+		case "expired_time":
+			result = compareInt(left.ExpiredTime, right.ExpiredTime, desc)
+		case "id", "":
+			result = compareInt(int64(left.Id), int64(right.Id), desc)
 		}
-		if len(userIDs) == 0 {
-			return PageResult[RedemptionSummary]{Items: []RedemptionSummary{}, Total: 0, Page: page, PageSize: pageSize}, nil
+		if result != 0 {
+			return result < 0
 		}
-		query = query.Where("used_user_id IN ?", userIDs)
-	}
-	var total int64
-	if err := query.Count(&total).Error; err != nil {
-		return PageResult[RedemptionSummary]{}, err
-	}
+		return left.Id > right.Id
+	})
+}
+
+func ListRedemptions(query ListQuery) (PageResult[RedemptionSummary], error) {
+	query = normalizeListQuery(query)
 	var redemptions []model.Redemption
-	if err := query.Order("id DESC").Limit(pageSize).Offset(offset(page, pageSize)).Find(&redemptions).Error; err != nil {
+	if err := model.DB.Model(&model.Redemption{}).Order("id DESC").Find(&redemptions).Error; err != nil {
 		return PageResult[RedemptionSummary]{}, err
 	}
 	usernames, err := redemptionUsedUsernameMap(redemptions)
@@ -303,9 +353,13 @@ func ListRedemptions(page int, pageSize int, status int, keyword string) (PageRe
 	}
 	items := make([]RedemptionSummary, 0, len(redemptions))
 	for _, redemption := range redemptions {
-		items = append(items, redemptionToSummaryWithUsername(redemption, false, usernames[redemption.UsedUserId]))
+		item := redemptionToSummaryWithUsername(redemption, true, usernames[redemption.UsedUserId])
+		if redemptionMatchesQuery(item, query) {
+			items = append(items, item)
+		}
 	}
-	return PageResult[RedemptionSummary]{Items: items, Total: total, Page: page, PageSize: pageSize}, nil
+	sortRedemptionSummaries(items, query.Sort, query.Order)
+	return pageResult(items, query.Page, query.PageSize), nil
 }
 
 func RedemptionStats() (map[string]interface{}, error) {
@@ -330,35 +384,10 @@ func RedemptionStats() (map[string]interface{}, error) {
 	return out, nil
 }
 
-func ListUsers(page int, pageSize int, status int, group string) (PageResult[UserSummary], error) {
-	page = clampPage(page)
-	pageSize = clampLimit(pageSize)
-	query := model.DB.Model(&model.User{}).Omit("password")
-	if status > 0 {
-		query = query.Where("status = ?", status)
-	}
-	if group != "" {
-		query = query.Where("`group` = ?", group)
-		if common.UsingPostgreSQL {
-			query = model.DB.Model(&model.User{}).Omit("password").Where(`"group" = ?`, group)
-			if status > 0 {
-				query = query.Where("status = ?", status)
-			}
-		}
-	}
-	var total int64
-	if err := query.Count(&total).Error; err != nil {
-		return PageResult[UserSummary]{}, err
-	}
-	var users []model.User
-	if err := query.Order("id DESC").Limit(pageSize).Offset(offset(page, pageSize)).Find(&users).Error; err != nil {
-		return PageResult[UserSummary]{}, err
-	}
-	items := make([]UserSummary, 0, len(users))
-	userIDs := make([]int, 0, len(users))
-	for _, user := range users {
-		items = append(items, userToSummary(user))
-		userIDs = append(userIDs, user.Id)
+func attachTodayUsage(items []UserSummary) error {
+	userIDs := make([]int, 0, len(items))
+	for _, item := range items {
+		userIDs = append(userIDs, item.Id)
 	}
 	if len(userIDs) > 0 {
 		type todayUsage struct {
@@ -374,7 +403,7 @@ func ListUsers(page int, pageSize int, status int, group string) (PageResult[Use
 			Where("type = ? AND user_id IN ? AND created_at >= ? AND created_at <= ?", model.LogTypeConsume, userIDs, todayStart, common.GetTimestamp()).
 			Group("user_id").
 			Scan(&rows).Error; err != nil {
-			return PageResult[UserSummary]{}, err
+			return err
 		}
 		usageByUser := make(map[int]todayUsage, len(rows))
 		for _, row := range rows {
@@ -387,7 +416,177 @@ func ListUsers(page int, pageSize int, status int, group string) (PageResult[Use
 			}
 		}
 	}
-	return PageResult[UserSummary]{Items: items, Total: total, Page: page, PageSize: pageSize}, nil
+	return nil
+}
+
+func attachUserRedemptions(items []UserSummary) error {
+	userIDs := make([]int, 0, len(items))
+	indexByUserID := make(map[int]int, len(items))
+	for index, item := range items {
+		userIDs = append(userIDs, item.Id)
+		indexByUserID[item.Id] = index
+	}
+	if len(userIDs) == 0 {
+		return nil
+	}
+
+	var redemptions []model.Redemption
+	if err := model.DB.Model(&model.Redemption{}).
+		Where("used_user_id IN ?", userIDs).
+		Order("redeemed_time DESC, id DESC").
+		Find(&redemptions).Error; err != nil {
+		return err
+	}
+
+	codesByUserID := make(map[int][]string, len(items))
+	for _, redemption := range redemptions {
+		if redemption.UsedUserId <= 0 {
+			continue
+		}
+		codesByUserID[redemption.UsedUserId] = append(
+			codesByUserID[redemption.UsedUserId],
+			redemption.Key,
+		)
+	}
+	for userID, codes := range codesByUserID {
+		index, ok := indexByUserID[userID]
+		if !ok {
+			continue
+		}
+		items[index].RedemptionCount = len(codes)
+		items[index].RedemptionCodes = strings.Join(codes, ", ")
+	}
+	return nil
+}
+
+func userMatchesQuery(item UserSummary, query ListQuery) bool {
+	if !matchesKeyword(query.Keyword,
+		strconv.Itoa(item.Id),
+		item.Username,
+		item.DisplayName,
+		strconv.Itoa(item.Role),
+		strconv.Itoa(item.Status),
+		item.DisableReason,
+		item.Email,
+		item.GitHubId,
+		strconv.Itoa(item.Quota),
+		strconv.Itoa(item.UsedQuota),
+		strconv.Itoa(item.RequestCount),
+		strconv.FormatInt(item.TodayRequestCount, 10),
+		strconv.FormatInt(item.TodayUsedTokens, 10),
+		item.Group,
+		strconv.Itoa(item.InviterId),
+		item.AffCode,
+		strconv.Itoa(item.AffCount),
+		strconv.Itoa(item.RedemptionCount),
+		item.RedemptionCodes,
+		item.LinuxDOId,
+	) {
+		return false
+	}
+	return matchesFilters(query.Filters, map[string]func(string) bool{
+		"id":                  matchInt(int64(item.Id)),
+		"username":            matchText(item.Username),
+		"display_name":        matchText(item.DisplayName),
+		"role":                matchInt(int64(item.Role)),
+		"status":              matchInt(int64(item.Status)),
+		"disable_reason":      matchText(item.DisableReason),
+		"email":               matchText(item.Email),
+		"github_id":           matchText(item.GitHubId),
+		"quota":               matchInt(int64(item.Quota)),
+		"used_quota":          matchInt(int64(item.UsedQuota)),
+		"request_count":       matchInt(int64(item.RequestCount)),
+		"today_request_count": matchInt(item.TodayRequestCount),
+		"today_used_tokens":   matchInt(item.TodayUsedTokens),
+		"group":               matchText(item.Group),
+		"inviter_id":          matchInt(int64(item.InviterId)),
+		"aff_code":            matchText(item.AffCode),
+		"aff_count":           matchInt(int64(item.AffCount)),
+		"redemption_count":    matchInt(int64(item.RedemptionCount)),
+		"redemption_codes":    matchText(item.RedemptionCodes),
+		"linux_do_id":         matchText(item.LinuxDOId),
+	})
+}
+
+func sortUserSummaries(items []UserSummary, sortKey string, order string) {
+	desc := sortDesc(order)
+	sort.SliceStable(items, func(i, j int) bool {
+		left := items[i]
+		right := items[j]
+		result := 0
+		switch sortKey {
+		case "username":
+			result = compareString(left.Username, right.Username, desc)
+		case "display_name":
+			result = compareString(left.DisplayName, right.DisplayName, desc)
+		case "role":
+			result = compareInt(int64(left.Role), int64(right.Role), desc)
+		case "status":
+			result = compareInt(int64(left.Status), int64(right.Status), desc)
+		case "disable_reason":
+			result = compareString(left.DisableReason, right.DisableReason, desc)
+		case "email":
+			result = compareString(left.Email, right.Email, desc)
+		case "github_id":
+			result = compareString(left.GitHubId, right.GitHubId, desc)
+		case "quota":
+			result = compareInt(int64(left.Quota), int64(right.Quota), desc)
+		case "used_quota":
+			result = compareInt(int64(left.UsedQuota), int64(right.UsedQuota), desc)
+		case "request_count":
+			result = compareInt(int64(left.RequestCount), int64(right.RequestCount), desc)
+		case "today_request_count":
+			result = compareInt(left.TodayRequestCount, right.TodayRequestCount, desc)
+		case "today_used_tokens":
+			result = compareInt(left.TodayUsedTokens, right.TodayUsedTokens, desc)
+		case "group":
+			result = compareString(left.Group, right.Group, desc)
+		case "inviter_id":
+			result = compareInt(int64(left.InviterId), int64(right.InviterId), desc)
+		case "aff_code":
+			result = compareString(left.AffCode, right.AffCode, desc)
+		case "aff_count":
+			result = compareInt(int64(left.AffCount), int64(right.AffCount), desc)
+		case "redemption_count":
+			result = compareInt(int64(left.RedemptionCount), int64(right.RedemptionCount), desc)
+		case "redemption_codes":
+			result = compareString(left.RedemptionCodes, right.RedemptionCodes, desc)
+		case "linux_do_id":
+			result = compareString(left.LinuxDOId, right.LinuxDOId, desc)
+		case "id", "":
+			result = compareInt(int64(left.Id), int64(right.Id), desc)
+		}
+		if result != 0 {
+			return result < 0
+		}
+		return left.Id > right.Id
+	})
+}
+
+func ListUsers(query ListQuery) (PageResult[UserSummary], error) {
+	query = normalizeListQuery(query)
+	var users []model.User
+	if err := model.DB.Model(&model.User{}).Omit("password").Order("id DESC").Find(&users).Error; err != nil {
+		return PageResult[UserSummary]{}, err
+	}
+	items := make([]UserSummary, 0, len(users))
+	for _, user := range users {
+		items = append(items, userToSummary(user))
+	}
+	if err := attachTodayUsage(items); err != nil {
+		return PageResult[UserSummary]{}, err
+	}
+	if err := attachUserRedemptions(items); err != nil {
+		return PageResult[UserSummary]{}, err
+	}
+	filtered := make([]UserSummary, 0, len(items))
+	for _, item := range items {
+		if userMatchesQuery(item, query) {
+			filtered = append(filtered, item)
+		}
+	}
+	sortUserSummaries(filtered, query.Sort, query.Order)
+	return pageResult(filtered, query.Page, query.PageSize), nil
 }
 
 func UserActivityStats(start int64, end int64) (map[string]interface{}, error) {
@@ -406,10 +605,15 @@ func UserActivityStats(start int64, end int64) (map[string]interface{}, error) {
 	if err := model.DB.Model(&model.User{}).Where("status = ?", common.UserStatusDisabled).Count(&disabledUsers).Error; err != nil {
 		return nil, err
 	}
+	var inviteCount int64
+	if err := model.DB.Model(&model.User{}).Select("COALESCE(SUM(aff_count), 0)").Scan(&inviteCount).Error; err != nil {
+		return nil, err
+	}
 	return map[string]interface{}{
 		"total_users":    totalUsers,
 		"active_users":   activeUsers,
 		"disabled_users": disabledUsers,
+		"invite_count":   inviteCount,
 	}, nil
 }
 
@@ -445,39 +649,105 @@ func tokenKeyColumn() string {
 	return "`key`"
 }
 
-func ListTokens(page int, pageSize int, status int, group string, key string) (PageResult[TokenSummary], error) {
-	page = clampPage(page)
-	pageSize = clampLimit(pageSize)
-	query := model.DB.Model(&model.Token{})
-	if status > 0 {
-		query = query.Where("status = ?", status)
+func tokenMatchesQuery(item TokenSummary, query ListQuery) bool {
+	if !matchesKeyword(query.Keyword,
+		strconv.Itoa(item.Id),
+		strconv.Itoa(item.UserId),
+		item.Name,
+		item.Key,
+		strconv.Itoa(item.Status),
+		item.Group,
+		strconv.FormatInt(item.CreatedTime, 10),
+		strconv.FormatInt(item.AccessedTime, 10),
+		strconv.FormatInt(item.ExpiredTime, 10),
+		strconv.Itoa(item.RemainQuota),
+		strconv.Itoa(item.UsedQuota),
+		strconv.FormatBool(item.UnlimitedQuota),
+		strconv.FormatBool(item.ModelLimitsEnabled),
+		item.ModelLimits,
+		item.AllowIps,
+	) {
+		return false
 	}
-	if group != "" {
-		query = query.Where("`group` = ?", group)
-		if common.UsingPostgreSQL {
-			query = model.DB.Model(&model.Token{}).Where(`"group" = ?`, group)
-			if status > 0 {
-				query = query.Where("status = ?", status)
-			}
+	return matchesFilters(query.Filters, map[string]func(string) bool{
+		"id":                   matchInt(int64(item.Id)),
+		"user_id":              matchInt(int64(item.UserId)),
+		"name":                 matchText(item.Name),
+		"key":                  matchText(item.Key),
+		"status":               matchInt(int64(item.Status)),
+		"group":                matchText(item.Group),
+		"created_time":         matchInt(item.CreatedTime),
+		"accessed_time":        matchInt(item.AccessedTime),
+		"expired_time":         matchInt(item.ExpiredTime),
+		"remain_quota":         matchInt(int64(item.RemainQuota)),
+		"used_quota":           matchInt(int64(item.UsedQuota)),
+		"unlimited_quota":      matchBool(item.UnlimitedQuota),
+		"model_limits_enabled": matchBool(item.ModelLimitsEnabled),
+		"model_limits":         matchText(item.ModelLimits),
+		"allow_ips":            matchText(item.AllowIps),
+	})
+}
+
+func sortTokenSummaries(items []TokenSummary, sortKey string, order string) {
+	desc := sortDesc(order)
+	sort.SliceStable(items, func(i, j int) bool {
+		left := items[i]
+		right := items[j]
+		result := 0
+		switch sortKey {
+		case "user_id":
+			result = compareInt(int64(left.UserId), int64(right.UserId), desc)
+		case "name":
+			result = compareString(left.Name, right.Name, desc)
+		case "key":
+			result = compareString(left.Key, right.Key, desc)
+		case "status":
+			result = compareInt(int64(left.Status), int64(right.Status), desc)
+		case "group":
+			result = compareString(left.Group, right.Group, desc)
+		case "created_time":
+			result = compareInt(left.CreatedTime, right.CreatedTime, desc)
+		case "accessed_time":
+			result = compareInt(left.AccessedTime, right.AccessedTime, desc)
+		case "expired_time":
+			result = compareInt(left.ExpiredTime, right.ExpiredTime, desc)
+		case "remain_quota":
+			result = compareInt(int64(left.RemainQuota), int64(right.RemainQuota), desc)
+		case "used_quota":
+			result = compareInt(int64(left.UsedQuota), int64(right.UsedQuota), desc)
+		case "unlimited_quota":
+			result = compareString(strconv.FormatBool(left.UnlimitedQuota), strconv.FormatBool(right.UnlimitedQuota), desc)
+		case "model_limits_enabled":
+			result = compareString(strconv.FormatBool(left.ModelLimitsEnabled), strconv.FormatBool(right.ModelLimitsEnabled), desc)
+		case "model_limits":
+			result = compareString(left.ModelLimits, right.ModelLimits, desc)
+		case "allow_ips":
+			result = compareString(left.AllowIps, right.AllowIps, desc)
+		case "id", "":
+			result = compareInt(int64(left.Id), int64(right.Id), desc)
 		}
-	}
-	key = strings.TrimSpace(strings.TrimPrefix(key, "sk-"))
-	if key != "" {
-		query = query.Where(tokenKeyColumn()+" LIKE ?", "%"+key+"%")
-	}
-	var total int64
-	if err := query.Count(&total).Error; err != nil {
-		return PageResult[TokenSummary]{}, err
-	}
+		if result != 0 {
+			return result < 0
+		}
+		return left.Id > right.Id
+	})
+}
+
+func ListTokens(query ListQuery) (PageResult[TokenSummary], error) {
+	query = normalizeListQuery(query)
 	var tokens []model.Token
-	if err := query.Order("id DESC").Limit(pageSize).Offset(offset(page, pageSize)).Find(&tokens).Error; err != nil {
+	if err := model.DB.Model(&model.Token{}).Order("id DESC").Find(&tokens).Error; err != nil {
 		return PageResult[TokenSummary]{}, err
 	}
 	items := make([]TokenSummary, 0, len(tokens))
 	for _, token := range tokens {
-		items = append(items, tokenToSummary(token))
+		item := tokenToSummary(token)
+		if tokenMatchesQuery(item, query) {
+			items = append(items, item)
+		}
 	}
-	return PageResult[TokenSummary]{Items: items, Total: total, Page: page, PageSize: pageSize}, nil
+	sortTokenSummaries(items, query.Sort, query.Order)
+	return pageResult(items, query.Page, query.PageSize), nil
 }
 
 func TokenStats() (map[string]interface{}, error) {
@@ -499,42 +769,36 @@ func TokenStats() (map[string]interface{}, error) {
 }
 
 func TokenGroups() (map[string]int64, error) {
-	var groups []struct {
-		GroupName string `gorm:"column:group_name"`
-		Count     int64  `gorm:"column:count"`
-	}
-	groupCol := "`group`"
-	if common.UsingPostgreSQL {
-		groupCol = `"group"`
-	}
-	if err := model.DB.Model(&model.Token{}).
-		Select(groupCol + " AS group_name, COUNT(*) AS count").
-		Group("group_name").
-		Scan(&groups).Error; err != nil {
+	var tokens []model.Token
+	if err := model.DB.Select("group", "groups").Find(&tokens).Error; err != nil {
 		return nil, err
 	}
 	groupMap := map[string]int64{}
-	for _, item := range groups {
-		key := item.GroupName
-		if key == "" {
-			key = "default"
+	for _, token := range tokens {
+		groups := token.GetGroups()
+		if len(groups) == 0 {
+			groupMap["default"]++
+			continue
 		}
-		groupMap[key] = item.Count
+		for _, group := range groups {
+			groupMap[group]++
+		}
 	}
 	return groupMap, nil
 }
 
-func RiskLeaderboards(start int64, end int64, limit int) ([]UserUsage, error) {
+func riskLeaderboards(start int64, end int64, limit int) ([]UserUsage, error) {
 	start, end = queryWindow(start, end, MaxAdminQueryWindow)
-	limit = clampLimit(limit)
-	var users []UserUsage
-	err := model.LOG_DB.Model(&model.Log{}).
+	query := model.LOG_DB.Model(&model.Log{}).
 		Select("user_id, username, COUNT(*) AS requests, COALESCE(SUM(quota), 0) AS quota, COUNT(DISTINCT ip) AS distinct_ips").
 		Where("user_id > 0 AND created_at >= ? AND created_at <= ?", start, end).
 		Group("user_id, username").
-		Order("distinct_ips DESC, requests DESC").
-		Limit(limit).
-		Scan(&users).Error
+		Order("distinct_ips DESC, requests DESC")
+	if limit > 0 {
+		query = query.Limit(clampLimit(limit))
+	}
+	var users []UserUsage
+	err := query.Scan(&users).Error
 	if err != nil {
 		return nil, err
 	}
@@ -546,6 +810,89 @@ func RiskLeaderboards(start int64, end int64, limit int) ([]UserUsage, error) {
 		users[i].RiskScore = score
 	}
 	return users, nil
+}
+
+func RiskLeaderboards(start int64, end int64, limit int) ([]UserUsage, error) {
+	return riskLeaderboards(start, end, limit)
+}
+
+func userUsageMatchesQuery(item UserUsage, query ListQuery) bool {
+	if !matchesKeyword(query.Keyword,
+		strconv.Itoa(item.UserId),
+		item.Username,
+		item.Group,
+		strconv.FormatInt(item.Requests, 10),
+		strconv.FormatInt(item.Quota, 10),
+		strconv.FormatInt(item.DistinctIPs, 10),
+		strconv.Itoa(item.RiskScore),
+		strconv.Itoa(item.Status),
+		strconv.FormatInt(item.LastActivity, 10),
+	) {
+		return false
+	}
+	return matchesFilters(query.Filters, map[string]func(string) bool{
+		"user_id":       matchInt(int64(item.UserId)),
+		"username":      matchText(item.Username),
+		"group":         matchText(item.Group),
+		"requests":      matchInt(item.Requests),
+		"quota":         matchInt(item.Quota),
+		"distinct_ips":  matchInt(item.DistinctIPs),
+		"risk_score":    matchInt(int64(item.RiskScore)),
+		"status":        matchInt(int64(item.Status)),
+		"last_activity": matchInt(item.LastActivity),
+	})
+}
+
+func sortUserUsage(items []UserUsage, sortKey string, order string) {
+	desc := sortDesc(order)
+	sort.SliceStable(items, func(i, j int) bool {
+		left := items[i]
+		right := items[j]
+		result := 0
+		switch sortKey {
+		case "user_id":
+			result = compareInt(int64(left.UserId), int64(right.UserId), desc)
+		case "username":
+			result = compareString(left.Username, right.Username, desc)
+		case "group":
+			result = compareString(left.Group, right.Group, desc)
+		case "requests":
+			result = compareInt(left.Requests, right.Requests, desc)
+		case "quota":
+			result = compareInt(left.Quota, right.Quota, desc)
+		case "risk_score":
+			result = compareInt(int64(left.RiskScore), int64(right.RiskScore), desc)
+		case "status":
+			result = compareInt(int64(left.Status), int64(right.Status), desc)
+		case "last_activity":
+			result = compareInt(left.LastActivity, right.LastActivity, desc)
+		case "distinct_ips", "":
+			result = compareInt(left.DistinctIPs, right.DistinctIPs, desc)
+		}
+		if result != 0 {
+			return result < 0
+		}
+		if left.Requests != right.Requests {
+			return left.Requests > right.Requests
+		}
+		return left.UserId < right.UserId
+	})
+}
+
+func RiskLeaderboardsPage(start int64, end int64, query ListQuery) (PageResult[UserUsage], error) {
+	query = normalizeListQuery(query)
+	users, err := riskLeaderboards(start, end, 0)
+	if err != nil {
+		return PageResult[UserUsage]{}, err
+	}
+	filtered := make([]UserUsage, 0, len(users))
+	for _, user := range users {
+		if userUsageMatchesQuery(user, query) {
+			filtered = append(filtered, user)
+		}
+	}
+	sortUserUsage(filtered, query.Sort, query.Order)
+	return pageResult(filtered, query.Page, query.PageSize), nil
 }
 
 func UserRiskAnalysis(userId int, start int64, end int64) (map[string]interface{}, error) {
@@ -613,6 +960,8 @@ const (
 	ModelStatusWindow24h   = "24h"
 	ModelStatusWindow7d    = "7d"
 	ModelStatusWindow30d   = "30d"
+
+	recentModelStatusLogLimit = 10
 )
 
 type modelStatusWindow struct {
@@ -911,6 +1260,119 @@ func maxInt64(a, b int64) int64 {
 	return b
 }
 
+func floatFromInterface(value interface{}) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return 0, false
+		}
+		return v, true
+	case float32:
+		value := float64(v)
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return 0, false
+		}
+		return value, true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case uint:
+		return float64(v), true
+	case uint64:
+		return float64(v), true
+	case uint32:
+		return float64(v), true
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
+func modelStatusFirstResponseTimeMs(other string) float64 {
+	other = strings.TrimSpace(other)
+	if other == "" {
+		return 0
+	}
+	var data map[string]interface{}
+	if err := common.UnmarshalJsonStr(other, &data); err != nil {
+		return 0
+	}
+	frt, ok := floatFromInterface(data["frt"])
+	if !ok || frt <= 0 {
+		return 0
+	}
+	return frt
+}
+
+func modelStatusOutputTokenSpeed(row model.Log, firstResponseMs float64) float64 {
+	if row.CompletionTokens <= 0 || row.UseTime <= 0 {
+		return 0
+	}
+	durationSeconds := float64(row.UseTime)
+	if row.IsStream && firstResponseMs > 0 {
+		firstResponseSeconds := firstResponseMs / 1000
+		if firstResponseSeconds > 0 && firstResponseSeconds < durationSeconds {
+			durationSeconds -= firstResponseSeconds
+		}
+	}
+	if durationSeconds <= 0 {
+		return 0
+	}
+	speed := float64(row.CompletionTokens) / durationSeconds
+	if math.IsNaN(speed) || math.IsInf(speed, 0) || speed <= 0 {
+		return 0
+	}
+	return speed
+}
+
+func populateRecentModelStatusMetrics(status *ModelStatus, groupName string, modelName string) error {
+	var rows []model.Log
+	query := model.LOG_DB.Model(&model.Log{}).
+		Select("id, created_at, completion_tokens, use_time, is_stream, other").
+		Where("model_name = ? AND type = ?", modelName, model.LogTypeConsume)
+	if groupName != "" {
+		if common.UsingPostgreSQL {
+			query = query.Where(`"group" = ?`, groupName)
+		} else {
+			query = query.Where("`group` = ?", groupName)
+		}
+	}
+	if err := query.Order("created_at DESC, id DESC").Limit(recentModelStatusLogLimit).Find(&rows).Error; err != nil {
+		return err
+	}
+
+	var firstResponseTotal float64
+	var firstResponseCount int
+	var outputSpeedTotal float64
+	var outputSpeedCount int
+	for _, row := range rows {
+		firstResponseMs := modelStatusFirstResponseTimeMs(row.Other)
+		if firstResponseMs > 0 {
+			firstResponseTotal += firstResponseMs
+			firstResponseCount++
+		}
+		if speed := modelStatusOutputTokenSpeed(row, firstResponseMs); speed > 0 {
+			outputSpeedTotal += speed
+			outputSpeedCount++
+		}
+	}
+	if firstResponseCount > 0 {
+		status.RecentAvgFirstResponseTime = firstResponseTotal / float64(firstResponseCount)
+	}
+	if outputSpeedCount > 0 {
+		status.RecentAvgOutputTokenSpeed = outputSpeedTotal / float64(outputSpeedCount)
+	}
+	return nil
+}
+
 func modelStatusForTarget(target modelStatusTarget, window string, public bool) (ModelStatus, error) {
 	groupName := strings.TrimSpace(target.Group)
 	if groupName == "" {
@@ -989,9 +1451,13 @@ func buildModelStatus(groupName string, modelName string, window string, public 
 		return status, err
 	}
 
+	ignoredErrorKeywords := modelStatusIgnoredErrorKeywordsForMatch()
 	var useTimeTotal int64
 	for _, row := range rows {
 		if row.CreatedAt < resolved.Start || row.CreatedAt > resolved.End {
+			continue
+		}
+		if row.Type == model.LogTypeError && shouldIgnoreModelStatusError(row, ignoredErrorKeywords) {
 			continue
 		}
 		slotIndex := int((row.CreatedAt - resolved.Start) / resolved.SlotSeconds)
@@ -1042,7 +1508,40 @@ func buildModelStatus(groupName string, modelName string, window string, public 
 	}
 	status.SlotData = slots
 
+	if err := populateRecentModelStatusMetrics(&status, groupName, modelName); err != nil {
+		return status, err
+	}
+
 	return status, nil
+}
+
+func modelStatusIgnoredErrorKeywordsForMatch() []string {
+	cfg := setting.GetEnhancementSetting()
+	if !cfg.ModelStatusIgnoreErrorKeywordsEnabled || len(cfg.ModelStatusIgnoredErrorKeywords) == 0 {
+		return nil
+	}
+	keywords, err := normalizeModelStatusIgnoredErrorKeywords(cfg.ModelStatusIgnoredErrorKeywords)
+	if err != nil || len(keywords) == 0 {
+		return nil
+	}
+	matchers := make([]string, 0, len(keywords))
+	for _, keyword := range keywords {
+		matchers = append(matchers, strings.ToLower(keyword))
+	}
+	return matchers
+}
+
+func shouldIgnoreModelStatusError(row model.Log, keywords []string) bool {
+	if len(keywords) == 0 {
+		return false
+	}
+	haystack := strings.ToLower(row.Content + "\n" + row.Other)
+	for _, keyword := range keywords {
+		if keyword != "" && strings.Contains(haystack, keyword) {
+			return true
+		}
+	}
+	return false
 }
 
 func ModelStatusFor(modelName string, minutes int, public bool) (ModelStatus, error) {
@@ -1091,6 +1590,115 @@ func ModelStatusesForWindow(modelNames []string, window string, public bool) ([]
 	return out, nil
 }
 
+func modelStatusMatchesQuery(item ModelStatus, query ListQuery) bool {
+	if !matchesKeyword(query.Keyword,
+		item.ModelName,
+		item.Group,
+		item.GroupName,
+		item.DisplayName,
+		item.TimeWindow,
+		strconv.FormatInt(item.TotalRequests, 10),
+		strconv.FormatInt(item.SuccessCount, 10),
+		strconv.FormatInt(item.ErrorCount, 10),
+		strconv.FormatFloat(item.SuccessRate, 'f', -1, 64),
+		item.CurrentStatus,
+		strconv.FormatInt(item.Quota, 10),
+		strconv.FormatFloat(item.AvgUseTime, 'f', -1, 64),
+		strconv.FormatInt(item.PromptTokens, 10),
+		strconv.FormatInt(item.CompletionTokens, 10),
+		strconv.FormatInt(item.LastRequestAt, 10),
+	) {
+		return false
+	}
+	return matchesFilters(query.Filters, map[string]func(string) bool{
+		"model_name":          matchText(item.ModelName),
+		"group":               matchText(item.Group),
+		"group_name":          matchText(item.GroupName),
+		"display_name":        matchText(item.DisplayName),
+		"time_window":         matchText(item.TimeWindow),
+		"total_requests":      matchInt(item.TotalRequests),
+		"success_count":       matchInt(item.SuccessCount),
+		"error_count":         matchInt(item.ErrorCount),
+		"success_rate":        matchFloat(item.SuccessRate),
+		"current_status":      matchText(item.CurrentStatus),
+		"status":              matchText(item.Status),
+		"requests":            matchInt(item.Requests),
+		"error_rate":          matchFloat(item.ErrorRate),
+		"quota":               matchInt(item.Quota),
+		"avg_use_time":        matchFloat(item.AvgUseTime),
+		"prompt_tokens":       matchInt(item.PromptTokens),
+		"completion_tokens":   matchInt(item.CompletionTokens),
+		"last_request_at":     matchInt(item.LastRequestAt),
+		"time_window_minutes": matchInt(int64(item.TimeWindowMinutes)),
+	})
+}
+
+func sortModelStatuses(items []ModelStatus, sortKey string, order string) {
+	desc := sortDesc(order)
+	sort.SliceStable(items, func(i, j int) bool {
+		left := items[i]
+		right := items[j]
+		result := 0
+		switch sortKey {
+		case "group":
+			result = compareString(left.Group, right.Group, desc)
+		case "group_name":
+			result = compareString(left.GroupName, right.GroupName, desc)
+		case "display_name":
+			result = compareString(left.DisplayName, right.DisplayName, desc)
+		case "time_window":
+			result = compareString(left.TimeWindow, right.TimeWindow, desc)
+		case "total_requests", "requests":
+			result = compareInt(left.TotalRequests, right.TotalRequests, desc)
+		case "success_count":
+			result = compareInt(left.SuccessCount, right.SuccessCount, desc)
+		case "error_count":
+			result = compareInt(left.ErrorCount, right.ErrorCount, desc)
+		case "success_rate":
+			result = compareFloat(left.SuccessRate, right.SuccessRate, desc)
+		case "current_status", "status":
+			result = compareString(left.CurrentStatus, right.CurrentStatus, desc)
+		case "quota":
+			result = compareInt(left.Quota, right.Quota, desc)
+		case "avg_use_time":
+			result = compareFloat(left.AvgUseTime, right.AvgUseTime, desc)
+		case "prompt_tokens":
+			result = compareInt(left.PromptTokens, right.PromptTokens, desc)
+		case "completion_tokens":
+			result = compareInt(left.CompletionTokens, right.CompletionTokens, desc)
+		case "last_request_at":
+			result = compareInt(left.LastRequestAt, right.LastRequestAt, desc)
+		case "time_window_minutes":
+			result = compareInt(int64(left.TimeWindowMinutes), int64(right.TimeWindowMinutes), desc)
+		case "model_name", "":
+			result = compareString(left.ModelName, right.ModelName, desc)
+		}
+		if result != 0 {
+			return result < 0
+		}
+		if left.Group != right.Group {
+			return left.Group < right.Group
+		}
+		return left.ModelName < right.ModelName
+	})
+}
+
+func ModelStatusesPageForWindow(window string, query ListQuery, public bool) (PageResult[ModelStatus], error) {
+	query = normalizeListQuery(query)
+	statuses, err := ModelStatusesForWindow(nil, window, public)
+	if err != nil {
+		return PageResult[ModelStatus]{}, err
+	}
+	filtered := make([]ModelStatus, 0, len(statuses))
+	for _, status := range statuses {
+		if modelStatusMatchesQuery(status, query) {
+			filtered = append(filtered, status)
+		}
+	}
+	sortModelStatuses(filtered, query.Sort, query.Order)
+	return pageResult(filtered, query.Page, query.PageSize), nil
+}
+
 func ModelStatuses(modelNames []string, minutes int, public bool) ([]ModelStatus, error) {
 	return ModelStatusesForWindow(modelNames, ModelStatusWindowFromMinutes(minutes), public)
 }
@@ -1114,22 +1722,13 @@ func ClearModelStatusPublicCache() {
 	modelStatusPublicCache.data = nil
 }
 
-func modelStatusHasRequests(status ModelStatus) bool {
-	if status.TotalRequests > 0 {
-		return true
+func filterLowRequestModelStatuses(statuses []ModelStatus, threshold int) []ModelStatus {
+	if threshold < 0 {
+		threshold = 0
 	}
-	for _, slot := range status.SlotData {
-		if slot.TotalRequests > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func filterZeroRequestModelStatuses(statuses []ModelStatus) []ModelStatus {
 	filtered := make([]ModelStatus, 0, len(statuses))
 	for _, status := range statuses {
-		if modelStatusHasRequests(status) {
+		if status.TotalRequests > int64(threshold) {
 			filtered = append(filtered, status)
 		}
 	}
@@ -1142,12 +1741,12 @@ func ModelStatusesForPublicConfig() ([]ModelStatus, error) {
 	}
 	window := ModelStatusConfiguredWindow()
 	greenThreshold, yellowThreshold := ModelStatusThresholds()
-	showZeroRequests := setting.GetEnhancementSetting().ModelStatusShowZeroRequests
+	requestCountHideThreshold := setting.GetEnhancementSetting().ModelStatusRequestCountHideThreshold
 	key := "public:" + window + ":" +
 		strconv.Itoa(ModelStatusSlotMinutes()) + ":" +
 		strconv.FormatFloat(greenThreshold, 'f', -1, 64) + ":" +
 		strconv.FormatFloat(yellowThreshold, 'f', -1, 64) + ":" +
-		strconv.FormatBool(showZeroRequests) + ":" +
+		strconv.Itoa(requestCountHideThreshold) + ":" +
 		ratio_setting.GroupDisplay2JSONString() + ":" +
 		setting.UserUsableGroups2JSONString()
 	now := common.GetTimestamp()
@@ -1164,9 +1763,7 @@ func ModelStatusesForPublicConfig() ([]ModelStatus, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !showZeroRequests {
-		statuses = filterZeroRequestModelStatuses(statuses)
-	}
+	statuses = filterLowRequestModelStatuses(statuses, requestCountHideThreshold)
 
 	modelStatusPublicCache.Lock()
 	modelStatusPublicCache.key = key
@@ -1194,7 +1791,6 @@ func ModelStatusConfig(public bool) map[string]interface{} {
 		"slot_minutes":             ModelStatusSlotMinutes(),
 		"green_threshold":          greenThreshold,
 		"yellow_threshold":         yellowThreshold,
-		"show_zero_request_models": cfg.ModelStatusShowZeroRequests,
 		"sort_mode":                cfg.ModelStatusSortMode,
 		"selected_models":          selected,
 		"time_window_minutes":      cfg.ModelStatusTimeWindowMins,
@@ -1203,9 +1799,14 @@ func ModelStatusConfig(public bool) map[string]interface{} {
 		"current_window":           currentWindow,
 		"public_embed_enabled":     cfg.PublicEmbedEnabled,
 		"public_url_path":          "/model-status",
+		"server_address":           system_setting.ServerAddress,
 	}
+	base["model_status_request_count_hide_threshold"] = cfg.ModelStatusRequestCountHideThreshold
 	if public {
 		base["public"] = true
+	} else {
+		base["model_status_ignore_error_keywords_enabled"] = cfg.ModelStatusIgnoreErrorKeywordsEnabled
+		base["model_status_ignored_error_keywords"] = append([]string{}, cfg.ModelStatusIgnoredErrorKeywords...)
 	}
 	return base
 }

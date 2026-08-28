@@ -28,7 +28,7 @@ import {
   verifyJSON,
 } from '../../../../helpers';
 import { useIsMobile } from '../../../../hooks/common/useIsMobile';
-import { CHANNEL_OPTIONS, MODEL_FETCHABLE_CHANNEL_TYPES } from '../../../../constants';
+import { CHANNEL_OPTIONS, MODEL_FETCHABLE_CHANNEL_TYPES, isManualModelFetchSupported } from '../../../../constants';
 import {
   SideSheet,
   Space,
@@ -48,7 +48,6 @@ import {
   Highlight,
   Input,
   Tooltip,
-  Collapse,
   Dropdown,
 } from '@douyinfe/semi-ui';
 import {
@@ -78,7 +77,6 @@ import {
   IconSave,
   IconClose,
   IconServer,
-  IconSetting,
   IconCode,
   IconCopy,
   IconGlobe,
@@ -104,7 +102,6 @@ const REGION_EXAMPLE = {
   'claude-3-5-sonnet-20240620': 'europe-west1',
 };
 const UPSTREAM_DETECTED_MODEL_PREVIEW_LIMIT = 8;
-const ADVANCED_SETTINGS_EXPANDED_KEY = 'channel-advanced-settings-expanded';
 
 const PARAM_OVERRIDE_LEGACY_TEMPLATE = {
   temperature: 0,
@@ -129,11 +126,15 @@ const PARAM_OVERRIDE_OPERATIONS_TEMPLATE = {
 };
 
 const DEPRECATED_DOUBAO_CODING_PLAN_BASE_URL = 'doubao-coding-plan';
+const VERTEX_CHANNEL_TYPE = 41;
+const GCP_CHANNEL_TYPE = 60;
+const MISTRAL_CONSOLE_CHANNEL_TYPE = 65;
 
-// 支持并且已适配通过接口获取模型列表的渠道类型
-const MODEL_FETCHABLE_TYPES = new Set([
-  1, 4, 14, 34, 17, 26, 27, 24, 47, 25, 20, 23, 31, 40, 42, 48, 43,
-]);
+const isVertexChannel = (type) => Number(type) === VERTEX_CHANNEL_TYPE;
+const isServiceAccountChannel = (type) =>
+  isVertexChannel(type) || Number(type) === GCP_CHANNEL_TYPE;
+const getServiceAccountKeyType = (type, keyType) =>
+  isVertexChannel(type) ? keyType || 'json' : 'json';
 
 function type2secretPrompt(type) {
   // inputs.type === 15 ? '按照如下格式输入：APIKey|SecretKey' : (inputs.type === 18 ? '按照如下格式输入：APPID|APISecret|APIKey' : '请输入渠道对应的鉴权密钥')
@@ -156,6 +157,8 @@ function type2secretPrompt(type) {
       return '按照如下格式输入: AccessKey|SecretAccessKey';
     case 57:
       return '请输入 JSON 格式的 OAuth 凭据（必须包含 access_token 和 account_id）';
+    case 65:
+      return '请输入完整 Cookie 请求头值；批量创建时也可每行仅填一个 ory_session 值（不包含 Cookie: 前缀）';
     default:
       return '请输入渠道对应的鉴权密钥';
   }
@@ -179,6 +182,7 @@ const EditChannelModal = (props) => {
     base_url: '',
     other: '',
     model_mapping: '',
+    model_mapping_full_enabled: false,
     param_override: '',
     status_code_mapping: '',
     models: [],
@@ -189,11 +193,16 @@ const EditChannelModal = (props) => {
     weight: 0,
     retry_times: null,
     daily_success_limit: 0,
+    rpm_protection_enabled: false,
+    rpm_limit: 1000,
+    rpm_protection_threshold_percent: 60,
+    rpm_ramp_minutes: 5,
     tag: '',
     multi_key_mode: 'random',
     // 渠道额外设置的默认值
     force_format: false,
     thinking_to_content: false,
+    show_error_details: false,
     proxy: '',
     pass_through_body_enabled: false,
     system_prompt: '',
@@ -210,11 +219,18 @@ const EditChannelModal = (props) => {
     disable_store: false, // false = 允许透传（默认开启）
     allow_safety_identifier: false,
     allow_include_obfuscation: false,
+    remove_gif_images_enabled: true,
+    mistral_console_code_interpreter_enabled: true,
+    mistral_console_image_generation_enabled: true,
+    mistral_console_web_search_enabled: true,
     conversation_log_enabled: false,
     allow_inference_geo: false,
     allow_speed: false,
     claude_beta_query: false,
+    xai_codex_compatibility_enabled: false,
     custom_model_list_url: '',
+    openrouter_auto_sync_free_and_alpha_models_enabled: false,
+    openrouter_free_model_name_simplification_enabled: false,
     upstream_model_update_check_enabled: false,
     upstream_model_update_auto_sync_enabled: false,
     upstream_model_update_last_check_time: 0,
@@ -409,12 +425,6 @@ const EditChannelModal = (props) => {
   // 剪贴板连接信息自动检测
   const [clipboardConfig, setClipboardConfig] = useState(null);
 
-  // 高级设置折叠状态
-  const [advancedSettingsOpen, setAdvancedSettingsOpen] = useState(false);
-  const toggleAdvancedSettings = (open) => {
-    setAdvancedSettingsOpen(open);
-    localStorage.setItem(ADVANCED_SETTINGS_EXPANDED_KEY, String(open));
-  };
   const formContainerRef = useRef(null);
   const doubaoApiClickCountRef = useRef(0);
   const initialBaseUrlRef = useRef('');
@@ -501,6 +511,8 @@ const EditChannelModal = (props) => {
   const [channelSettings, setChannelSettings] = useState({
     force_format: false,
     thinking_to_content: false,
+    model_mapping_full_enabled: false,
+    show_error_details: false,
     proxy: '',
     pass_through_body_enabled: false,
     system_prompt: '',
@@ -853,28 +865,58 @@ const EditChannelModal = (props) => {
           data.force_format = parsedSettings.force_format || false;
           data.thinking_to_content =
             parsedSettings.thinking_to_content || false;
+          data.model_mapping_full_enabled =
+            parsedSettings.model_mapping_full_enabled === true;
+          data.show_error_details =
+            parsedSettings.show_error_details === true;
           data.proxy = parsedSettings.proxy || '';
           data.pass_through_body_enabled =
             parsedSettings.pass_through_body_enabled || false;
           data.system_prompt = parsedSettings.system_prompt || '';
           data.system_prompt_override =
             parsedSettings.system_prompt_override || false;
+          const rpmProtection = parsedSettings.rpm_protection;
+          data.rpm_protection_enabled = rpmProtection?.enabled === true;
+          data.rpm_limit =
+            typeof rpmProtection?.rpm_limit === 'number'
+              ? rpmProtection.rpm_limit
+              : 1000;
+          data.rpm_protection_threshold_percent =
+            typeof rpmProtection?.protection_threshold_percent === 'number'
+              ? rpmProtection.protection_threshold_percent
+              : 60;
+          data.rpm_ramp_minutes =
+            typeof rpmProtection?.ramp_minutes === 'number'
+              ? rpmProtection.ramp_minutes
+              : 5;
         } catch (error) {
           console.error('解析渠道设置失败:', error);
           data.force_format = false;
           data.thinking_to_content = false;
+          data.model_mapping_full_enabled = false;
+          data.show_error_details = false;
           data.proxy = '';
           data.pass_through_body_enabled = false;
           data.system_prompt = '';
           data.system_prompt_override = false;
+          data.rpm_protection_enabled = false;
+          data.rpm_limit = 1000;
+          data.rpm_protection_threshold_percent = 60;
+          data.rpm_ramp_minutes = 5;
         }
       } else {
         data.force_format = false;
         data.thinking_to_content = false;
+        data.model_mapping_full_enabled = false;
+        data.show_error_details = false;
         data.proxy = '';
         data.pass_through_body_enabled = false;
         data.system_prompt = '';
         data.system_prompt_override = false;
+        data.rpm_protection_enabled = false;
+        data.rpm_limit = 1000;
+        data.rpm_protection_threshold_percent = 60;
+        data.rpm_ramp_minutes = 5;
       }
 
       if (data.settings) {
@@ -896,14 +938,30 @@ const EditChannelModal = (props) => {
             parsedSettings.allow_safety_identifier || false;
           data.allow_include_obfuscation =
             parsedSettings.allow_include_obfuscation || false;
+          data.remove_gif_images_enabled =
+            parsedSettings.remove_gif_images_enabled !== false;
+          data.mistral_console_code_interpreter_enabled =
+            parsedSettings.mistral_console_code_interpreter_enabled !== false;
+          data.mistral_console_image_generation_enabled =
+            parsedSettings.mistral_console_image_generation_enabled !== false;
+          data.mistral_console_web_search_enabled =
+            parsedSettings.mistral_console_web_search_enabled !== false;
           data.conversation_log_enabled =
             parsedSettings.conversation_log_enabled === true;
           data.allow_inference_geo =
             parsedSettings.allow_inference_geo || false;
           data.allow_speed = parsedSettings.allow_speed || false;
           data.claude_beta_query = parsedSettings.claude_beta_query || false;
+          data.xai_codex_compatibility_enabled =
+            parsedSettings.xai_codex_compatibility_enabled === true;
           data.custom_model_list_url =
             parsedSettings.custom_model_list_url || '';
+          data.openrouter_auto_sync_free_and_alpha_models_enabled =
+            parsedSettings.openrouter_auto_sync_free_and_alpha_models_enabled ===
+            true;
+          data.openrouter_free_model_name_simplification_enabled =
+            parsedSettings.openrouter_free_model_name_simplification_enabled ===
+            true;
           data.upstream_model_update_check_enabled =
             parsedSettings.upstream_model_update_check_enabled === true;
           data.upstream_model_update_auto_sync_enabled =
@@ -931,11 +989,18 @@ const EditChannelModal = (props) => {
           data.disable_store = false;
           data.allow_safety_identifier = false;
           data.allow_include_obfuscation = false;
+          data.remove_gif_images_enabled = true;
+          data.mistral_console_code_interpreter_enabled = true;
+          data.mistral_console_image_generation_enabled = true;
+          data.mistral_console_web_search_enabled = true;
           data.conversation_log_enabled = false;
           data.allow_inference_geo = false;
           data.allow_speed = false;
           data.claude_beta_query = false;
+          data.xai_codex_compatibility_enabled = false;
           data.custom_model_list_url = '';
+          data.openrouter_auto_sync_free_and_alpha_models_enabled = false;
+          data.openrouter_free_model_name_simplification_enabled = false;
           data.upstream_model_update_check_enabled = false;
           data.upstream_model_update_auto_sync_enabled = false;
           data.upstream_model_update_last_check_time = 0;
@@ -951,11 +1016,18 @@ const EditChannelModal = (props) => {
         data.disable_store = false;
         data.allow_safety_identifier = false;
         data.allow_include_obfuscation = false;
+        data.remove_gif_images_enabled = true;
+        data.mistral_console_code_interpreter_enabled = true;
+        data.mistral_console_image_generation_enabled = true;
+        data.mistral_console_web_search_enabled = true;
         data.conversation_log_enabled = false;
         data.allow_inference_geo = false;
         data.allow_speed = false;
         data.claude_beta_query = false;
+        data.xai_codex_compatibility_enabled = false;
         data.custom_model_list_url = '';
+        data.openrouter_auto_sync_free_and_alpha_models_enabled = false;
+        data.openrouter_free_model_name_simplification_enabled = false;
         data.upstream_model_update_check_enabled = false;
         data.upstream_model_update_auto_sync_enabled = false;
         data.upstream_model_update_last_check_time = 0;
@@ -988,6 +1060,8 @@ const EditChannelModal = (props) => {
       setChannelSettings({
         force_format: data.force_format,
         thinking_to_content: data.thinking_to_content,
+        model_mapping_full_enabled: data.model_mapping_full_enabled,
+        show_error_details: data.show_error_details,
         proxy: data.proxy,
         pass_through_body_enabled: data.pass_through_body_enabled,
         system_prompt: data.system_prompt,
@@ -1017,28 +1091,6 @@ const EditChannelModal = (props) => {
       const managedByIonet = !!parsedIonet;
       setIsIonetChannel(managedByIonet);
       setIonetMetadata(parsedIonet);
-
-      // Smart expand: auto-open advanced settings if any advanced field has a value
-      const hasAdvancedValues =
-        (data.model_mapping && data.model_mapping.trim()) ||
-        (data.param_override && data.param_override.trim()) ||
-        (data.status_code_mapping && data.status_code_mapping.trim()) ||
-        (data.header_override && data.header_override.trim()) ||
-        (data.tag && data.tag.trim()) ||
-        (data.remark && data.remark.trim()) ||
-        (data.priority && data.priority !== 0) ||
-        (data.weight && data.weight !== 0) ||
-        (data.daily_success_limit && data.daily_success_limit !== 0) ||
-        (data.proxy && data.proxy.trim()) ||
-        (data.system_prompt && data.system_prompt.trim()) ||
-        data.thinking_to_content ||
-        data.pass_through_body_enabled ||
-        data.force_format ||
-        data.claude_beta_query ||
-        data.system_prompt_override;
-      if (hasAdvancedValues) {
-        setAdvancedSettingsOpen(true);
-      }
     } else {
       showError(message);
     }
@@ -1047,28 +1099,58 @@ const EditChannelModal = (props) => {
 
   const fetchUpstreamModelList = async (name, options = {}) => {
     const silent = !!options.silent;
-    // if (inputs['type'] !== 1) {
-    //   showError(t('仅支持 OpenAI 接口格式'));
-    //   return;
-    // }
     setLoading(true);
     const models = [];
     let err = false;
+    let errorMessage = '';
 
     if (isEdit) {
       // 如果是编辑模式，使用已有的 channelId 获取模型列表
-      const res = await API.get('/api/channel/fetch_models/' + channelId, {
-        skipErrorHandler: true,
-      });
-      if (res && res.data && res.data.success) {
-        models.push(...res.data.data);
-      } else {
+      try {
+        const res = await API.get('/api/channel/fetch_models/' + channelId, {
+          skipErrorHandler: true,
+        });
+        if (res && res.data && res.data.success) {
+          models.push(...res.data.data);
+        } else {
+          err = true;
+          errorMessage = res?.data?.message || '';
+        }
+      } catch (error) {
         err = true;
+        errorMessage = error?.response?.data?.message || error?.message || '';
       }
     } else {
       // 如果是新建模式，通过后端代理获取模型列表
-      if (!inputs?.['key']) {
-        showError(t('请填写密钥'));
+      let fetchKey = inputs?.['key'] || '';
+      if (
+        isVertexChannel(inputs.type) &&
+        getServiceAccountKeyType(inputs.type, inputs.vertex_key_type) === 'json'
+      ) {
+        if (useManualInput) {
+          try {
+            fetchKey = JSON.stringify(JSON.parse(fetchKey));
+          } catch {
+            fetchKey = '';
+            errorMessage = t('密钥格式无效，请输入有效的 JSON 格式密钥');
+          }
+        } else {
+          let parsedKey = vertexKeys[0];
+          if (!parsedKey && vertexFileList[0]?.fileInstance) {
+            try {
+              parsedKey = JSON.parse(await vertexFileList[0].fileInstance.text());
+            } catch (error) {
+              errorMessage = t('解析密钥文件失败: {{msg}}', {
+                msg: error?.message || t('未知错误'),
+              });
+            }
+          }
+          fetchKey = parsedKey ? JSON.stringify(parsedKey) : '';
+        }
+      }
+
+      if (!fetchKey) {
+        errorMessage = errorMessage || t('请填写密钥');
         err = true;
       } else {
         try {
@@ -1077,9 +1159,13 @@ const EditChannelModal = (props) => {
             {
               base_url: inputs['base_url'],
               type: inputs['type'],
-              key: inputs['key'],
+              key: fetchKey,
               header_override: inputs['header_override'],
               custom_model_list_url: inputs['custom_model_list_url'],
+              vertex_key_type: inputs['vertex_key_type'],
+              aws_key_type: inputs['aws_key_type'],
+              other: inputs['other'],
+              proxy: inputs['proxy'],
             },
             { skipErrorHandler: true },
           );
@@ -1088,10 +1174,11 @@ const EditChannelModal = (props) => {
             models.push(...res.data.data);
           } else {
             err = true;
+            errorMessage = res?.data?.message || '';
           }
         } catch (error) {
-          console.error('Error fetching models:', error);
           err = true;
+          errorMessage = error?.response?.data?.message || error?.message || '';
         }
       }
     }
@@ -1105,7 +1192,11 @@ const EditChannelModal = (props) => {
       setLoading(false);
       return uniqueModels;
     } else {
-      showError(t('获取模型列表失败'));
+      showError(
+        errorMessage
+          ? `${t('获取模型列表失败')}: ${errorMessage}`
+          : t('获取模型列表失败'),
+      );
     }
     setLoading(false);
     return null;
@@ -1115,7 +1206,7 @@ const EditChannelModal = (props) => {
     const mappingKey = String(pairKey ?? '').trim();
     if (!mappingKey) return;
 
-    if (!MODEL_FETCHABLE_CHANNEL_TYPES.has(inputs.type)) {
+    if (!isManualModelFetchSupported(inputs.type, inputs.vertex_key_type, inputs.custom_model_list_url)) {
       return;
     }
 
@@ -1179,10 +1270,12 @@ const EditChannelModal = (props) => {
         return;
       }
       setGroupOptions(
-        res.data.data.map((group) => ({
-          label: group,
-          value: group,
-        })),
+        res.data.data
+          .map((group) => ({
+            label: group,
+            value: group,
+          }))
+          .sort((a, b) => a.value.localeCompare(b.value)),
       );
     } catch (error) {
       showError(error.message);
@@ -1345,10 +1438,6 @@ const EditChannelModal = (props) => {
       fetchModelGroups();
       // 重置手动输入模式状态
       setUseManualInput(false);
-      // 编辑模式下恢复用户偏好，创建模式一律折叠
-      setAdvancedSettingsOpen(
-        isEdit && localStorage.getItem(ADVANCED_SETTINGS_EXPANDED_KEY) === 'true'
-      );
     } else {
       // 统一的模态框关闭重置逻辑
       resetModalState();
@@ -1380,6 +1469,8 @@ const EditChannelModal = (props) => {
     setChannelSettings({
       force_format: false,
       thinking_to_content: false,
+      model_mapping_full_enabled: false,
+      show_error_details: false,
       proxy: '',
       pass_through_body_enabled: false,
       system_prompt: '',
@@ -1393,8 +1484,6 @@ const EditChannelModal = (props) => {
     setDoubaoApiEditUnlocked(false);
     doubaoApiClickCountRef.current = 0;
     setModelSearchValue('');
-    // 重置高级设置折叠状态
-    setAdvancedSettingsOpen(false);
     // 清空表单中的key_mode字段
     if (formApiRef.current) {
       formApiRef.current.setValue('key_mode', undefined);
@@ -1587,8 +1676,11 @@ const EditChannelModal = (props) => {
       }
     }
 
-    if (localInputs.type === 41) {
-      const keyType = localInputs.vertex_key_type || 'json';
+    if (isServiceAccountChannel(localInputs.type)) {
+      const keyType = getServiceAccountKeyType(
+        localInputs.type,
+        localInputs.vertex_key_type,
+      );
       if (keyType === 'api_key') {
         // 直接作为普通字符串密钥处理
         if (!isEdit && (!localInputs.key || localInputs.key.trim() === '')) {
@@ -1746,14 +1838,35 @@ const EditChannelModal = (props) => {
       localInputs.other = 'v2.1';
     }
 
+    const parsedRPMLimit = Number(localInputs.rpm_limit);
+    const parsedRPMThreshold = Number(
+      localInputs.rpm_protection_threshold_percent,
+    );
+    const parsedRPMRampMinutes = Number(localInputs.rpm_ramp_minutes);
+
     // 生成渠道额外设置JSON
     const channelExtraSettings = {
       force_format: localInputs.force_format || false,
       thinking_to_content: localInputs.thinking_to_content || false,
+      model_mapping_full_enabled:
+        localInputs.model_mapping_full_enabled === true,
+      show_error_details: localInputs.show_error_details === true,
       proxy: localInputs.proxy || '',
       pass_through_body_enabled: localInputs.pass_through_body_enabled || false,
       system_prompt: localInputs.system_prompt || '',
       system_prompt_override: localInputs.system_prompt_override || false,
+      rpm_protection: {
+        enabled: localInputs.rpm_protection_enabled === true,
+        rpm_limit: Number.isFinite(parsedRPMLimit)
+          ? Math.max(0, Math.trunc(parsedRPMLimit))
+          : 1000,
+        protection_threshold_percent: Number.isFinite(parsedRPMThreshold)
+          ? Math.trunc(parsedRPMThreshold)
+          : 60,
+        ramp_minutes: Number.isFinite(parsedRPMRampMinutes)
+          ? Math.trunc(parsedRPMRampMinutes)
+          : 5,
+      },
     };
     localInputs.setting = JSON.stringify(channelExtraSettings);
 
@@ -1771,6 +1884,17 @@ const EditChannelModal = (props) => {
     if (localInputs.type === 20) {
       settings.openrouter_enterprise =
         localInputs.is_enterprise_account === true;
+      settings.openrouter_auto_sync_free_and_alpha_models_enabled =
+        localInputs.openrouter_auto_sync_free_and_alpha_models_enabled === true;
+      settings.openrouter_free_model_name_simplification_enabled =
+        settings.openrouter_auto_sync_free_and_alpha_models_enabled &&
+        localInputs.openrouter_free_model_name_simplification_enabled === true;
+    } else if (
+      'openrouter_auto_sync_free_and_alpha_models_enabled' in settings ||
+      'openrouter_free_model_name_simplification_enabled' in settings
+    ) {
+      delete settings.openrouter_auto_sync_free_and_alpha_models_enabled;
+      delete settings.openrouter_free_model_name_simplification_enabled;
     }
 
     // type === 33 (AWS): 保存 aws_key_type 到 settings
@@ -1778,9 +1902,12 @@ const EditChannelModal = (props) => {
       settings.aws_key_type = localInputs.aws_key_type || 'ak_sk';
     }
 
-    // type === 41 (Vertex): 始终保存 vertex_key_type 到 settings，避免编辑时被重置
-    if (localInputs.type === 41) {
-      settings.vertex_key_type = localInputs.vertex_key_type || 'json';
+    // Vertex/GCP: 始终保存服务账号密钥格式到 settings，避免编辑时被重置
+    if (isServiceAccountChannel(localInputs.type)) {
+      settings.vertex_key_type = getServiceAccountKeyType(
+        localInputs.type,
+        localInputs.vertex_key_type,
+      );
     } else if ('vertex_key_type' in settings) {
       delete settings.vertex_key_type;
     }
@@ -1811,6 +1938,30 @@ const EditChannelModal = (props) => {
         settings.claude_beta_query = localInputs.claude_beta_query === true;
       }
     }
+    if (localInputs.type === 48) {
+      settings.xai_codex_compatibility_enabled =
+        localInputs.xai_codex_compatibility_enabled === true;
+    } else if ('xai_codex_compatibility_enabled' in settings) {
+      delete settings.xai_codex_compatibility_enabled;
+    }
+    if (localInputs.type === 24) {
+      settings.remove_gif_images_enabled =
+        localInputs.remove_gif_images_enabled === true;
+    } else if ('remove_gif_images_enabled' in settings) {
+      delete settings.remove_gif_images_enabled;
+    }
+    if (localInputs.type === MISTRAL_CONSOLE_CHANNEL_TYPE) {
+      settings.mistral_console_code_interpreter_enabled =
+        localInputs.mistral_console_code_interpreter_enabled !== false;
+      settings.mistral_console_image_generation_enabled =
+        localInputs.mistral_console_image_generation_enabled !== false;
+      settings.mistral_console_web_search_enabled =
+        localInputs.mistral_console_web_search_enabled !== false;
+    } else {
+      delete settings.mistral_console_code_interpreter_enabled;
+      delete settings.mistral_console_image_generation_enabled;
+      delete settings.mistral_console_web_search_enabled;
+    }
     if (isRoot()) {
       settings.conversation_log_enabled =
         localInputs.conversation_log_enabled === true;
@@ -1831,7 +1982,8 @@ const EditChannelModal = (props) => {
     );
     if (
       !Array.isArray(settings.upstream_model_update_last_detected_models) ||
-      !settings.upstream_model_update_check_enabled
+      (!settings.upstream_model_update_check_enabled &&
+        !settings.openrouter_auto_sync_free_and_alpha_models_enabled)
     ) {
       settings.upstream_model_update_last_detected_models = [];
     }
@@ -1844,10 +1996,16 @@ const EditChannelModal = (props) => {
     // 清理不需要发送到后端的字段
     delete localInputs.force_format;
     delete localInputs.thinking_to_content;
+    delete localInputs.model_mapping_full_enabled;
+    delete localInputs.show_error_details;
     delete localInputs.proxy;
     delete localInputs.pass_through_body_enabled;
     delete localInputs.system_prompt;
     delete localInputs.system_prompt_override;
+    delete localInputs.rpm_protection_enabled;
+    delete localInputs.rpm_limit;
+    delete localInputs.rpm_protection_threshold_percent;
+    delete localInputs.rpm_ramp_minutes;
     delete localInputs.is_enterprise_account;
     // 顶层的 vertex_key_type 不应发送给后端
     delete localInputs.vertex_key_type;
@@ -1858,11 +2016,18 @@ const EditChannelModal = (props) => {
     delete localInputs.disable_store;
     delete localInputs.allow_safety_identifier;
     delete localInputs.allow_include_obfuscation;
+    delete localInputs.remove_gif_images_enabled;
+    delete localInputs.mistral_console_code_interpreter_enabled;
+    delete localInputs.mistral_console_image_generation_enabled;
+    delete localInputs.mistral_console_web_search_enabled;
     delete localInputs.conversation_log_enabled;
     delete localInputs.allow_inference_geo;
     delete localInputs.allow_speed;
     delete localInputs.claude_beta_query;
+    delete localInputs.xai_codex_compatibility_enabled;
     delete localInputs.custom_model_list_url;
+    delete localInputs.openrouter_auto_sync_free_and_alpha_models_enabled;
+    delete localInputs.openrouter_free_model_name_simplification_enabled;
     delete localInputs.upstream_model_update_check_enabled;
     delete localInputs.upstream_model_update_auto_sync_enabled;
     delete localInputs.upstream_model_update_last_check_time;
@@ -2062,7 +2227,7 @@ const EditChannelModal = (props) => {
             } else {
               // 批量模式下禁用手动输入，并清空手动输入的内容
               setUseManualInput(false);
-              if (inputs.type === 41) {
+              if (isServiceAccountChannel(inputs.type)) {
                 // 清空手动输入的密钥内容
                 if (formApiRef.current) {
                   formApiRef.current.setValue('key', '');
@@ -2099,7 +2264,7 @@ const EditChannelModal = (props) => {
             {t('密钥聚合模式')}
           </Checkbox>
 
-          {inputs.type !== 41 && (
+          {!isServiceAccountChannel(inputs.type) && (
             <Button
               size='small'
               type='tertiary'
@@ -2257,11 +2422,52 @@ const EditChannelModal = (props) => {
                     {t('上游模型管理')}
                   </Text>
 
+                  {inputs.type === 20 && (
+                    <Form.Switch
+                      field='openrouter_auto_sync_free_and_alpha_models_enabled'
+                      label={t('自动维护 OpenRouter 免费及匿名 Alpha 模型')}
+                      checkedText={t('开')}
+                      uncheckedText={t('关')}
+                      onChange={(value) =>
+                        handleChannelOtherSettingsChange(
+                          'openrouter_auto_sync_free_and_alpha_models_enabled',
+                          value,
+                        )
+                      }
+                      extraText={t(
+                        '开启后自动增删以 :free 结尾、openrouter/free 及 openrouter/*-alpha 模型，并保留其他模型',
+                      )}
+                    />
+                  )}
+                  {inputs.type === 20 && (
+                    <Form.Switch
+                      field='openrouter_free_model_name_simplification_enabled'
+                      label={t('简化 OpenRouter 免费模型名称')}
+                      checkedText={t('开')}
+                      uncheckedText={t('关')}
+                      disabled={
+                        !inputs.openrouter_auto_sync_free_and_alpha_models_enabled
+                      }
+                      onChange={(value) =>
+                        handleChannelOtherSettingsChange(
+                          'openrouter_free_model_name_simplification_enabled',
+                          value,
+                        )
+                      }
+                      extraText={t(
+                        '将 provider/model:free 简化为 model 并自动添加模型重定向；openrouter/free 和匿名 Alpha 模型保持原名，名称冲突时保留完整模型名',
+                      )}
+                    />
+                  )}
                   <Form.Switch
                     field='upstream_model_update_check_enabled'
                     label={t('是否检测上游模型更新')}
                     checkedText={t('开')}
                     uncheckedText={t('关')}
+                    disabled={
+                      inputs.type === 20 &&
+                      inputs.openrouter_auto_sync_free_and_alpha_models_enabled
+                    }
                     onChange={(value) =>
                       handleChannelOtherSettingsChange(
                         'upstream_model_update_check_enabled',
@@ -2269,7 +2475,10 @@ const EditChannelModal = (props) => {
                       )
                     }
                     extraText={t(
-                      '开启后由后端定时任务检测该渠道上游模型变化',
+                      inputs.type === 20 &&
+                        inputs.openrouter_auto_sync_free_and_alpha_models_enabled
+                        ? 'OpenRouter 免费及匿名 Alpha 模型同步已开启，全部模型巡检设置暂时停用'
+                        : '开启后由后端定时任务检测该渠道上游模型变化',
                     )}
                   />
                   <Form.Switch
@@ -2277,7 +2486,11 @@ const EditChannelModal = (props) => {
                     label={t('是否自动同步上游模型更新')}
                     checkedText={t('开')}
                     uncheckedText={t('关')}
-                    disabled={!inputs.upstream_model_update_check_enabled}
+                    disabled={
+                      !inputs.upstream_model_update_check_enabled ||
+                      (inputs.type === 20 &&
+                        inputs.openrouter_auto_sync_free_and_alpha_models_enabled)
+                    }
                     onChange={(value) =>
                       handleChannelOtherSettingsChange('upstream_model_update_auto_sync_enabled', value)
                     }
@@ -2562,6 +2775,88 @@ const EditChannelModal = (props) => {
                     </Col>
                   </Row>
 
+                  <div className='mt-4 mb-2 text-sm font-medium text-gray-700'>
+                    {t('RPM 动态保护')}
+                  </div>
+                  <Form.Switch
+                    field='rpm_protection_enabled'
+                    label={t('启用 RPM 保护')}
+                    checkedText={t('开')}
+                    uncheckedText={t('关')}
+                    onChange={(value) =>
+                      handleInputChange('rpm_protection_enabled', value)
+                    }
+                    extraText={t(
+                      '限制渠道最近 60 秒内的真实上游调用次数，并在上游返回 429 时动态降载',
+                    )}
+                  />
+                  <Row gutter={12}>
+                    <Col xs={24} sm={8}>
+                      <Form.InputNumber
+                        field='rpm_limit'
+                        label={t('RPM 上限')}
+                        min={0}
+                        precision={0}
+                        disabled={!inputs.rpm_protection_enabled}
+                        onNumberChange={(value) =>
+                          handleInputChange(
+                            'rpm_limit',
+                            value === undefined ||
+                              value === null ||
+                              value === ''
+                              ? 0
+                              : Math.max(0, Math.trunc(value)),
+                          )
+                        }
+                        style={{ width: '100%' }}
+                        extraText={t('填 0 表示不限制')}
+                      />
+                    </Col>
+                    <Col xs={24} sm={8}>
+                      <Form.InputNumber
+                        field='rpm_protection_threshold_percent'
+                        label={t('保护阈值（%）')}
+                        min={1}
+                        max={100}
+                        precision={0}
+                        disabled={!inputs.rpm_protection_enabled}
+                        onNumberChange={(value) =>
+                          handleInputChange(
+                            'rpm_protection_threshold_percent',
+                            value === undefined ||
+                              value === null ||
+                              value === ''
+                              ? 60
+                              : Math.min(100, Math.max(1, Math.trunc(value))),
+                          )
+                        }
+                        style={{ width: '100%' }}
+                        extraText={t('收到上游 429 时的起始限额比例')}
+                      />
+                    </Col>
+                    <Col xs={24} sm={8}>
+                      <Form.InputNumber
+                        field='rpm_ramp_minutes'
+                        label={t('爬坡时间（分钟）')}
+                        min={1}
+                        precision={0}
+                        disabled={!inputs.rpm_protection_enabled}
+                        onNumberChange={(value) =>
+                          handleInputChange(
+                            'rpm_ramp_minutes',
+                            value === undefined ||
+                              value === null ||
+                              value === ''
+                              ? 5
+                              : Math.max(1, Math.trunc(value)),
+                          )
+                        }
+                        style={{ width: '100%' }}
+                        extraText={t('动态降载后恢复到 RPM 上限所需时间')}
+                      />
+                    </Col>
+                  </Row>
+
                   {inputs.type === 1 && (
                     <>
                       <div className='mt-4 mb-2 text-sm font-medium text-gray-700'>
@@ -2596,11 +2891,87 @@ const EditChannelModal = (props) => {
                     <Form.Switch field='claude_beta_query' label={t('Claude 强制 beta=true')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelOtherSettingsChange('claude_beta_query', value)} extraText={t('开启后，该渠道请求 Claude 时将强制追加 ?beta=true（无需客户端手动传参）')} />
                   )}
 
+                  {inputs.type === 48 && (
+                    <Form.Switch field='xai_codex_compatibility_enabled' label={t('xAI Codex 兼容模式（按 User-Agent 触发）')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelOtherSettingsChange('xai_codex_compatibility_enabled', value)} extraText={t('开启后，仅当入口请求 User-Agent 包含 codex 时，将 Codex Responses 请求映射为 xAI 兼容格式；无法映射的字段会被清除。')} />
+                  )}
+
+                  {inputs.type === 24 && (
+                    <Form.Switch
+                      field='remove_gif_images_enabled'
+                      label={t('移除 image/gif 图片')}
+                      checkedText={t('开')}
+                      uncheckedText={t('关')}
+                      onChange={(value) =>
+                        handleChannelOtherSettingsChange(
+                          'remove_gif_images_enabled',
+                          value,
+                        )
+                      }
+                      extraText={t(
+                        'Gemini 不支持 image/gif 输入。开启后将在发送前移除 GIF；此设置优先于请求体透传。',
+                      )}
+                    />
+                  )}
+
+                  {inputs.type === MISTRAL_CONSOLE_CHANNEL_TYPE && (
+                    <>
+                      <div className='mt-4 mb-2 text-sm font-medium text-gray-700'>
+                        {t('内置工具')}
+                      </div>
+                      <Form.Switch
+                        field='mistral_console_code_interpreter_enabled'
+                        label={t('启用代码解释器')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        onChange={(value) =>
+                          handleChannelOtherSettingsChange(
+                            'mistral_console_code_interpreter_enabled',
+                            value,
+                          )
+                        }
+                        extraText={t(
+                          '允许模型运行代码进行计算、数据处理和文件分析，默认开启。',
+                        )}
+                      />
+                      <Form.Switch
+                        field='mistral_console_image_generation_enabled'
+                        label={t('启用图片生成')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        onChange={(value) =>
+                          handleChannelOtherSettingsChange(
+                            'mistral_console_image_generation_enabled',
+                            value,
+                          )
+                        }
+                        extraText={t(
+                          '允许模型根据提示词生成图片，默认开启。',
+                        )}
+                      />
+                      <Form.Switch
+                        field='mistral_console_web_search_enabled'
+                        label={t('启用高级网页搜索')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        onChange={(value) =>
+                          handleChannelOtherSettingsChange(
+                            'mistral_console_web_search_enabled',
+                            value,
+                          )
+                        }
+                        extraText={t(
+                          '允许模型搜索网页并获取最新信息，默认开启。',
+                        )}
+                      />
+                    </>
+                  )}
+
                   {inputs.type === 1 && (
                     <Form.Switch field='force_format' label={t('强制格式化')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelSettingsChange('force_format', value)} extraText={t('强制将响应格式化为 OpenAI 标准格式（只适用于OpenAI渠道类型）')} />
                   )}
 
                   <Form.Switch field='thinking_to_content' label={t('思考内容转换')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelSettingsChange('thinking_to_content', value)} extraText={t('将 reasoning_content 转换为 <think> 标签拼接到内容中')} />
+                  <Form.Switch field='show_error_details' label={t('显示详细错误信息')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelSettingsChange('show_error_details', value)} extraText={t('默认关闭。关闭后客户端仅收到错误码，避免泄露渠道或上游信息；原始错误仍保留在系统日志中。')} />
                   <Form.Switch field='pass_through_body_enabled' label={t('透传请求体')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelSettingsChange('pass_through_body_enabled', value)} extraText={t('启用请求体透传功能')} />
                   {isRoot() && (
                     <Form.Switch field='conversation_log_enabled' label={t('完整对话采集')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelOtherSettingsChange('conversation_log_enabled', value)} extraText={t('开启后将保存成功文本对话的请求体和响应体，用于蒸馏数据集导出。')} />
@@ -2775,7 +3146,7 @@ const EditChannelModal = (props) => {
                       </>
                     )}
 
-                    {inputs.type === 41 && (
+                    {isVertexChannel(inputs.type) && (
                       <Form.Select
                         field='vertex_key_type'
                         label={t('密钥格式')}
@@ -2811,8 +3182,11 @@ const EditChannelModal = (props) => {
                       />
                     )}
                     {batch ? (
-                      inputs.type === 41 &&
-                      (inputs.vertex_key_type || 'json') === 'json' ? (
+                      isServiceAccountChannel(inputs.type) &&
+                      getServiceAccountKeyType(
+                        inputs.type,
+                        inputs.vertex_key_type,
+                      ) === 'json' ? (
                         <Form.Upload
                           field='vertex_files'
                           label={t('密钥文件 (.json)')}
@@ -2985,8 +3359,11 @@ const EditChannelModal = (props) => {
                               onSuccess={handleCodexOAuthGenerated}
                             />
                           </>
-                        ) : inputs.type === 41 &&
-                          (inputs.vertex_key_type || 'json') === 'json' ? (
+                        ) : isServiceAccountChannel(inputs.type) &&
+                          getServiceAccountKeyType(
+                            inputs.type,
+                            inputs.vertex_key_type,
+                          ) === 'json' ? (
                           <>
                             {!batch && (
                               <div className='flex items-center justify-between mb-3'>
@@ -3590,14 +3967,27 @@ const EditChannelModal = (props) => {
                           >
                             {t('填入相关模型')}
                           </Button>
-                          {MODEL_FETCHABLE_CHANNEL_TYPES.has(inputs.type) && (
+                          {isManualModelFetchSupported(inputs.type, inputs.vertex_key_type, inputs.custom_model_list_url) && (
                             <Button
                               size='small'
                               type='tertiary'
+                              disabled={
+                                !isEdit &&
+                                isVertexChannel(inputs.type) &&
+                                getServiceAccountKeyType(inputs.type, inputs.vertex_key_type) === 'json' &&
+                                !useManualInput &&
+                                vertexKeys.length === 0 &&
+                                vertexFileList.length === 0
+                              }
                               onClick={() => fetchUpstreamModelList('models')}
                             >
                               {t('获取模型列表')}
                             </Button>
+                          )}
+                          {isVertexChannel(inputs.type) && inputs.vertex_key_type === 'api_key' && !String(inputs.custom_model_list_url || '').trim() && (
+                            <Text type='tertiary' size='small'>
+                              {t('Vertex API Key 模式不支持官方模型列表，请使用服务账号 JSON 或配置自定义模型列表 API')}
+                            </Text>
                           )}
                           <Dropdown
                             trigger='click'
@@ -3695,7 +4085,7 @@ const EditChannelModal = (props) => {
                     editorType='keyValue'
                     formApi={formApiRef.current}
                     renderStringValueSuffix={({ pairKey, value }) => {
-                      if (!MODEL_FETCHABLE_CHANNEL_TYPES.has(inputs.type)) {
+                      if (!isManualModelFetchSupported(inputs.type, inputs.vertex_key_type, inputs.custom_model_list_url)) {
                         return null;
                       }
                       const disabled = !String(pairKey ?? '').trim();
@@ -3717,6 +4107,22 @@ const EditChannelModal = (props) => {
                     }}
                     extraText={t(
                       '键为请求中的模型名称，值为要替换的模型名称',
+                    )}
+                  />
+
+                  <Form.Switch
+                    field='model_mapping_full_enabled'
+                    label={t('完全重定向')}
+                    checkedText={t('开')}
+                    uncheckedText={t('关')}
+                    onChange={(value) =>
+                      handleChannelSettingsChange(
+                        'model_mapping_full_enabled',
+                        value,
+                      )
+                    }
+                    extraText={t(
+                      '开启后，响应体及所有对外日志中的模型名称将统一显示为重定向前的请求模型，真实上游模型仅用于内部请求和计费',
                     )}
                   />
 
@@ -3743,118 +4149,11 @@ const EditChannelModal = (props) => {
                     }
                     showClear
                   />
-                </Card>
 
-                {/* Advanced Settings Toggle / Collapse */}
-                {isMobile ? (
-                <Collapse
-                  activeKey={advancedSettingsOpen ? ['advanced'] : []}
-                  onChange={(keys) => toggleAdvancedSettings(keys.includes('advanced'))}
-                >
-                  <Collapse.Panel
-                    header={
-                      <div className='flex items-center gap-2'>
-                        <IconSetting size={16} />
-                        <Text className='font-medium'>{t('高级设置')}</Text>
-                      </div>
-                    }
-                    itemKey='advanced'
-                  >
-                    {advancedSettingsContent}
-                  </Collapse.Panel>
-                </Collapse>
-                ) : (
-                  /* Desktop: toggle button to open side panel */
-                  <div
-                    className='flex items-center justify-between p-3 rounded-xl cursor-pointer transition-colors hover:bg-gray-50'
-                    style={{
-                      backgroundColor: advancedSettingsOpen ? 'var(--semi-color-primary-light-default)' : 'var(--semi-color-fill-0)',
-                      border: '1px solid var(--semi-color-fill-2)',
-                    }}
-                    onClick={() => toggleAdvancedSettings(!advancedSettingsOpen)}
-                  >
-                    <div className='flex items-center gap-2'>
-                      <IconSetting size={16} />
-                      <Text className='font-medium'>{t('高级设置')}</Text>
-                    </div>
-                    <div className='flex items-center gap-1 text-sm' style={{ color: 'var(--semi-color-primary)' }}>
-                      <Text size='small' style={{ color: 'var(--semi-color-primary)' }}>
-                        {advancedSettingsOpen ? t('收起') : isEdit ? t('向左展开') : t('向右展开')}
-                      </Text>
-                      <IconChevronDown
-                        size={14}
-                        style={{
-                          transform: advancedSettingsOpen
-                            ? 'rotate(180deg)'
-                            : isEdit ? 'rotate(90deg)' : 'rotate(-90deg)',
-                          transition: 'transform 0.2s',
-                        }}
-                      />
-                    </div>
-                  </div>
-                )}
+                  {advancedSettingsContent}
+                </Card>
               </div>
             </Spin>
-
-            {/* Desktop: Advanced Settings Side Panel - rendered inside Form tree */}
-            {!isMobile && advancedSettingsOpen && (
-              <div
-                className='fixed top-0 h-full overflow-y-auto z-[999] semi-sidesheet-inner'
-                style={{
-                  width: 600,
-                  [isEdit ? 'right' : 'left']: 600,
-                  backgroundColor: 'var(--semi-color-bg-0)',
-                  borderLeft: isEdit ? 'none' : '1px solid var(--semi-color-border)',
-                  borderRight: isEdit ? '1px solid var(--semi-color-border)' : 'none',
-                  animation: `slideIn${isEdit ? 'Left' : 'Right'} 0.3s ease-out`,
-                }}
-              >
-                <div className='semi-sidesheet-header'>
-                  <div className='semi-sidesheet-title'>
-                    <Space>
-                      <Tag color='cyan' shape='circle'>
-                        {t('高级')}
-                      </Tag>
-                      <Title heading={4} className='m-0'>
-                        {t('高级设置')}
-                      </Title>
-                    </Space>
-                  </div>
-                  <Button
-                    className='semi-sidesheet-close'
-                    type='tertiary'
-                    theme='borderless'
-                    icon={<IconClose />}
-                    size='small'
-                    onClick={() => setAdvancedSettingsOpen(false)}
-                  />
-                </div>
-                <div className='semi-sidesheet-body' style={{ padding: 0 }}>
-                  <div className='p-2 space-y-3'>
-                    <Card className='!rounded-2xl shadow-sm border-0'>
-                      <div className='flex items-center mb-4'>
-                        <Avatar
-                          size='small'
-                          color='orange'
-                          className='mr-2 shadow-md'
-                        >
-                          <IconSetting size={16} />
-                        </Avatar>
-                        <div>
-                          <Text className='text-lg font-medium'>
-                            {t('高级设置')}
-                          </Text>
-                          <div className='text-xs text-gray-600'>
-                            {t('渠道的高级配置选项')}
-                          </div>
-                        </div>
-                      </div>
-                      {advancedSettingsContent}
-                    </Card>
-                  </div>
-                </div>
-              </div>
-            )}
             </>
           );
           }}

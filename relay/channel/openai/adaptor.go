@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"path/filepath"
 	"strings"
 
@@ -18,10 +19,14 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/ai360"
+	"github.com/QuantumNous/new-api/relay/channel/gmicloud"
 	"github.com/QuantumNous/new-api/relay/channel/lingyiwanwu"
 
 	//"github.com/QuantumNous/new-api/relay/channel/minimax"
+	"github.com/QuantumNous/new-api/relay/channel/openailocal"
 	"github.com/QuantumNous/new-api/relay/channel/openrouter"
+	"github.com/QuantumNous/new-api/relay/channel/poe"
+	"github.com/QuantumNous/new-api/relay/channel/vercel"
 	"github.com/QuantumNous/new-api/relay/channel/xinference"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/common_handler"
@@ -95,6 +100,9 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 }
 
 func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
+	if info.ChannelType == constant.ChannelTypeGMICloud && gmicloud.IsBatchModel(info.UpstreamModelName) {
+		return "", fmt.Errorf("model %s is asynchronous; use POST /v1/batch/generations", info.UpstreamModelName)
+	}
 	if info.RelayMode == relayconstant.RelayModeRealtime {
 		if strings.HasPrefix(info.ChannelBaseUrl, "https://") {
 			baseUrl := strings.TrimPrefix(info.ChannelBaseUrl, "https://")
@@ -168,8 +176,23 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 			info.RelayMode != relayconstant.RelayModeResponsesCompact {
 			return fmt.Sprintf("%s/v1/chat/completions", info.ChannelBaseUrl), nil
 		}
-		return relaycommon.GetFullRequestURL(info.ChannelBaseUrl, info.RequestURLPath, info.ChannelType), nil
+		requestPath := info.RequestURLPath
+		if info.RelayMode == relayconstant.RelayModeRealtime && info.IsModelMapped {
+			requestPath = realtimeRequestPathWithModel(requestPath, info.UpstreamModelName)
+		}
+		return relaycommon.GetFullRequestURL(info.ChannelBaseUrl, requestPath, info.ChannelType), nil
 	}
+}
+
+func realtimeRequestPathWithModel(requestPath string, modelName string) string {
+	parsed, err := url.Parse(requestPath)
+	if err != nil || strings.TrimSpace(modelName) == "" {
+		return requestPath
+	}
+	query := parsed.Query()
+	query.Set("model", modelName)
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *relaycommon.RelayInfo) error {
@@ -230,7 +253,7 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if request == nil {
 		return nil, errors.New("request is nil")
 	}
-	if info.ChannelType != constant.ChannelTypeOpenAI && info.ChannelType != constant.ChannelTypeAzure {
+	if !info.SupportStreamOptions {
 		request.StreamOptions = nil
 	}
 	if info.ChannelType == constant.ChannelTypeOpenRouter {
@@ -646,6 +669,14 @@ func (a *Adaptor) GetModelList() []string {
 		return xinference.ModelList
 	case constant.ChannelTypeOpenRouter:
 		return openrouter.ModelList
+	case constant.ChannelTypeOpenAILocal:
+		return openailocal.ModelList
+	case constant.ChannelTypePoe:
+		return poe.ModelList
+	case constant.ChannelTypeVercel:
+		return vercel.ModelList
+	case constant.ChannelTypeGMICloud:
+		return gmicloud.ModelList
 	default:
 		return ModelList
 	}
@@ -663,6 +694,14 @@ func (a *Adaptor) GetChannelName() string {
 		return xinference.ChannelName
 	case constant.ChannelTypeOpenRouter:
 		return openrouter.ChannelName
+	case constant.ChannelTypeOpenAILocal:
+		return openailocal.ChannelName
+	case constant.ChannelTypePoe:
+		return poe.ChannelName
+	case constant.ChannelTypeVercel:
+		return vercel.ChannelName
+	case constant.ChannelTypeGMICloud:
+		return gmicloud.ChannelName
 	default:
 		return ChannelName
 	}

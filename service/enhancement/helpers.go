@@ -81,12 +81,8 @@ func maskedKey(key string) string {
 }
 
 func userToSummary(user model.User) UserSummary {
-	linuxDOId := ""
-	if user.LinuxDOId != "" {
-		linuxDOId = "***masked***"
-	}
-	email := common.MaskEmail(user.Email)
-	if strings.TrimSpace(user.Email) == "" || email == "***masked***" {
+	email := strings.TrimSpace(user.Email)
+	if email == "" {
 		email = "未绑定"
 	}
 	return UserSummary{
@@ -97,13 +93,15 @@ func userToSummary(user model.User) UserSummary {
 		Status:        user.Status,
 		DisableReason: user.DisableReason,
 		Email:         email,
+		GitHubId:      user.GitHubId,
 		Quota:         user.Quota,
 		UsedQuota:     user.UsedQuota,
 		RequestCount:  user.RequestCount,
 		Group:         user.Group,
 		InviterId:     user.InviterId,
+		AffCode:       user.AffCode,
 		AffCount:      user.AffCount,
-		LinuxDOId:     linuxDOId,
+		LinuxDOId:     user.LinuxDOId,
 	}
 }
 
@@ -116,9 +114,10 @@ func tokenToSummary(token model.Token) TokenSummary {
 		Id:                 token.Id,
 		UserId:             token.UserId,
 		Name:               token.Name,
-		Key:                token.GetMaskedKey(),
+		Key:                token.GetFullKey(),
 		Status:             token.Status,
 		Group:              token.Group,
+		Groups:             token.GetGroups(),
 		CreatedTime:        token.CreatedTime,
 		AccessedTime:       token.AccessedTime,
 		ExpiredTime:        token.ExpiredTime,

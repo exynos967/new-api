@@ -53,6 +53,7 @@ var RegisterEnabled = true
 
 var EmailDomainRestrictionEnabled = false // 是否启用邮箱域名限制
 var EmailAliasRestrictionEnabled = false  // 是否启用邮箱别名限制
+var EmailCaseInsensitiveEnabled = true    // 是否将邮箱大小写变体视为同一身份
 var EmailDomainWhitelist = []string{
 	"gmail.com",
 	"163.com",
@@ -89,6 +90,7 @@ var SMTPToken = ""
 
 var GitHubClientId = ""
 var GitHubClientSecret = ""
+var GitHubMinimumAccountAgeSeconds int64 = 0
 var LinuxDOClientId = ""
 var LinuxDOClientSecret = ""
 var LinuxDOMinimumTrustLevel = 0
@@ -208,6 +210,11 @@ const (
 	RedemptionCodeStatusEnabled  = 1 // don't use 0, 0 is the default value!
 	RedemptionCodeStatusDisabled = 2 // also don't use 0
 	RedemptionCodeStatusUsed     = 3 // also don't use 0
+)
+
+const (
+	RegistrationCodeStatusEnabled  = 1 // don't use 0, 0 is the default value!
+	RegistrationCodeStatusDisabled = 2 // also don't use 0
 )
 
 const (

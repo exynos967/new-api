@@ -1,9 +1,9 @@
 package controller
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -23,6 +23,7 @@ import (
 
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type LoginRequest struct {
@@ -60,6 +61,8 @@ func Login(c *gin.Context) {
 			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		case errors.Is(err, model.ErrUserDisabled):
 			common.ApiErrorMsg(c, userDisabledMessage(c, &user))
+		case errors.Is(err, model.ErrEmailIdentityAmbiguous):
+			common.ApiErrorI18n(c, i18n.MsgUserEmailAmbiguous)
 		default:
 			common.ApiErrorI18n(c, i18n.MsgUserUsernameOrPasswordError)
 		}
@@ -168,11 +171,12 @@ func Register(c *gin.Context) {
 		return
 	}
 	var user model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&user)
+	err := common.DecodeJson(c.Request.Body, &user)
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
+	user.Email = strings.TrimSpace(user.Email)
 	if err := common.Validate.Struct(&user); err != nil {
 		common.ApiErrorI18n(c, i18n.MsgUserInputInvalid, map[string]any{"Error": err.Error()})
 		return
@@ -182,7 +186,7 @@ func Register(c *gin.Context) {
 			common.ApiErrorI18n(c, i18n.MsgUserEmailVerificationRequired)
 			return
 		}
-		if !common.VerifyCodeWithKey(user.Email, user.VerificationCode, common.EmailVerificationPurpose) {
+		if !common.VerifyCodeWithKey(common.NormalizeEmailIdentity(user.Email), user.VerificationCode, common.EmailVerificationPurpose) {
 			common.ApiErrorI18n(c, i18n.MsgUserVerificationCodeError)
 			return
 		}
@@ -198,7 +202,11 @@ func Register(c *gin.Context) {
 		return
 	}
 	affCode := user.AffCode // this code is the inviter's code, not the user's own code
-	inviterId, _ := model.GetUserIdByAffCode(affCode)
+	inviterId, err := model.ResolveInviterIdByAffCode(affCode, setting.IsInviteCodeRequired())
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	cleanUser := model.User{
 		Username:    user.Username,
 		Password:    user.Password,
@@ -209,45 +217,24 @@ func Register(c *gin.Context) {
 	if common.EmailVerificationEnabled {
 		cleanUser.Email = user.Email
 	}
-	if err := cleanUser.Insert(inviterId); err != nil {
+	if err := model.DB.Transaction(func(tx *gorm.DB) error {
+		if err := cleanUser.InsertWithTx(tx, inviterId); err != nil {
+			return err
+		}
+		if err := model.ConsumeRegistrationCodeTx(tx, user.RegistrationCode, cleanUser.Id, cleanUser.Username, "password", setting.IsRegistrationCodeRequired()); err != nil {
+			return err
+		}
+		if constant.GenerateDefaultToken {
+			if err := createDefaultTokenForNewUserTx(tx, cleanUser.Id, cleanUser.Username); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
 		common.ApiError(c, err)
 		return
 	}
-
-	// 获取插入后的用户ID
-	var insertedUser model.User
-	if err := model.DB.Where("username = ?", cleanUser.Username).First(&insertedUser).Error; err != nil {
-		common.ApiErrorI18n(c, i18n.MsgUserRegisterFailed)
-		return
-	}
-	// 生成默认令牌
-	if constant.GenerateDefaultToken {
-		key, err := common.GenerateKey()
-		if err != nil {
-			common.ApiErrorI18n(c, i18n.MsgUserDefaultTokenFailed)
-			common.SysLog("failed to generate token key: " + err.Error())
-			return
-		}
-		// 生成默认令牌
-		token := model.Token{
-			UserId:             insertedUser.Id, // 使用插入后的用户ID
-			Name:               cleanUser.Username + "的初始令牌",
-			Key:                key,
-			CreatedTime:        common.GetTimestamp(),
-			AccessedTime:       common.GetTimestamp(),
-			ExpiredTime:        -1,     // 永不过期
-			RemainQuota:        500000, // 示例额度
-			UnlimitedQuota:     true,
-			ModelLimitsEnabled: false,
-		}
-		if setting.DefaultUseAutoGroup {
-			token.Group = "auto"
-		}
-		if err := token.Insert(); err != nil {
-			common.ApiErrorI18n(c, i18n.MsgCreateDefaultTokenErr)
-			return
-		}
-	}
+	cleanUser.FinalizeOAuthUserCreation(inviterId)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
@@ -256,9 +243,32 @@ func Register(c *gin.Context) {
 	return
 }
 
+func createDefaultTokenForNewUserTx(tx *gorm.DB, userId int, username string) error {
+	key, err := common.GenerateKey()
+	if err != nil {
+		common.SysLog("failed to generate token key: " + err.Error())
+		return err
+	}
+	token := model.Token{
+		UserId:             userId,
+		Name:               username + "的初始令牌",
+		Key:                key,
+		CreatedTime:        common.GetTimestamp(),
+		AccessedTime:       common.GetTimestamp(),
+		ExpiredTime:        -1,
+		RemainQuota:        500000,
+		UnlimitedQuota:     true,
+		ModelLimitsEnabled: false,
+	}
+	if setting.DefaultUseAutoGroup {
+		token.Group = "auto"
+	}
+	return tx.Create(&token).Error
+}
+
 func GetAllUsers(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.GetAllUsers(pageInfo)
+	users, total, err := model.GetAllUsers(pageInfo, getUserListQuery(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -272,10 +282,8 @@ func GetAllUsers(c *gin.Context) {
 }
 
 func SearchUsers(c *gin.Context) {
-	keyword := c.Query("keyword")
-	group := c.Query("group")
 	pageInfo := common.GetPageQuery(c)
-	users, total, err := model.SearchUsers(keyword, group, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	users, total, err := model.SearchUsers(getUserListQuery(c), pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -285,6 +293,15 @@ func SearchUsers(c *gin.Context) {
 	pageInfo.SetItems(users)
 	common.ApiSuccess(c, pageInfo)
 	return
+}
+
+func getUserListQuery(c *gin.Context) model.UserListQuery {
+	return model.UserListQuery{
+		Keyword:    c.Query("keyword"),
+		Group:      c.Query("group"),
+		Status:     c.Query("status"),
+		QuotaOrder: c.Query("quota_order"),
+	}
 }
 
 func GetUser(c *gin.Context) {
@@ -309,6 +326,34 @@ func GetUser(c *gin.Context) {
 		"data":    user,
 	})
 	return
+}
+
+func GetUserInviteRelations(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	var requestedDepth *int
+	if rawDepth, exists := c.GetQuery("depth"); exists {
+		depth, err := strconv.Atoi(rawDepth)
+		if err != nil {
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
+		requestedDepth = &depth
+	}
+	depth, err := service.NormalizeUserInviteRelationDepth(requestedDepth)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	relations, err := service.GetUserInviteRelations(id, depth, c.GetInt("id"), c.GetInt("role"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, relations)
 }
 
 func GenerateAccessToken(c *gin.Context) {
@@ -469,7 +514,6 @@ func calculateUserPermissions(userRole int) map[string]interface{} {
 		permissions["sidebar_modules"] = map[string]interface{}{
 			"admin": map[string]interface{}{
 				"setting": false, // 管理员不能访问系统设置
-				"site":    false,
 			},
 		}
 	} else {
@@ -515,30 +559,36 @@ func generateDefaultSidebarConfig(userRole int) string {
 	if userRole == common.RoleAdminUser {
 		// 管理员可以访问管理员区域，但不能访问系统设置
 		defaultConfig["admin"] = map[string]interface{}{
-			"enabled":    true,
-			"channel":    true,
-			"models":     true,
-			"redemption": true,
-			"user":       true,
-			"setting":    false, // 管理员不能访问系统设置
-			"site":       false,
+			"enabled":      true,
+			"ip_ban":       true,
+			"channel":      true,
+			"models":       true,
+			"deployment":   true,
+			"subscription": true,
+			"redemption":   true,
+			"user":         true,
+			"enhancements": true,
+			"setting":      false, // 管理员不能访问系统设置
 		}
 	} else if userRole == common.RoleRootUser {
 		// 超级管理员可以访问所有功能
 		defaultConfig["admin"] = map[string]interface{}{
-			"enabled":    true,
-			"channel":    true,
-			"models":     true,
-			"redemption": true,
-			"user":       true,
-			"setting":    true,
-			"site":       true,
+			"enabled":      true,
+			"ip_ban":       true,
+			"channel":      true,
+			"models":       true,
+			"deployment":   true,
+			"subscription": true,
+			"redemption":   true,
+			"user":         true,
+			"enhancements": true,
+			"setting":      true,
 		}
 	}
 	// 普通用户不包含admin区域
 
 	// 转换为JSON字符串
-	configBytes, err := json.Marshal(defaultConfig)
+	configBytes, err := common.Marshal(defaultConfig)
 	if err != nil {
 		common.SysLog("生成默认边栏配置失败: " + err.Error())
 		return ""
@@ -557,10 +607,59 @@ func GetUserModels(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	groups := service.GetUserUsableGroups(user.Group)
-	var models []string
+	requestedGroup := c.Query("group")
+	groupsParam, groupsProvided := c.Request.URL.Query()["groups"]
+	var requestedGroups []string
+	if groupsProvided {
+		groupsJSON := ""
+		if len(groupsParam) > 0 {
+			groupsJSON = groupsParam[0]
+		}
+		if groupsJSON != "" {
+			if err := common.UnmarshalJsonStr(groupsJSON, &requestedGroups); err != nil {
+				common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+				return
+			}
+		}
+		requestedGroups = model.NormalizeTokenGroups(requestedGroups)
+		if err := validateUserTokenGroups(user.Group, requestedGroups); err != nil {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": i18n.T(c, i18n.MsgDistributorGroupAccessDenied)})
+			return
+		}
+	} else if requestedGroup != "" {
+		requestedGroups = []string{requestedGroup}
+		if err := validateUserTokenGroups(user.Group, requestedGroups); err != nil {
+			c.JSON(http.StatusForbidden, gin.H{"success": false, "message": i18n.T(c, i18n.MsgDistributorGroupAccessDenied)})
+			return
+		}
+	}
+
+	groups := make([]string, 0)
+	if groupsProvided {
+		switch {
+		case len(requestedGroups) == 0:
+			groups = append(groups, user.Group)
+		case len(requestedGroups) == 1 && requestedGroups[0] == "auto":
+			groups = append(groups, service.GetUserAutoGroup(user.Group)...)
+		default:
+			groups = append(groups, requestedGroups...)
+		}
+	} else if requestedGroup != "" {
+		if requestedGroup == "auto" {
+			groups = append(groups, service.GetUserAutoGroup(user.Group)...)
+		} else {
+			groups = append(groups, requestedGroup)
+		}
+	} else {
+		for group := range service.GetUserUsableGroups(user.Group) {
+			if group != "auto" {
+				groups = append(groups, group)
+			}
+		}
+	}
+	models := make([]string, 0)
 	for group := range groups {
-		for _, g := range model.GetGroupEnabledModels(group) {
+		for _, g := range model.GetGroupEnabledModels(groups[group]) {
 			if !common.StringsContains(models, g) {
 				models = append(models, g)
 			}
@@ -575,15 +674,27 @@ func GetUserModels(c *gin.Context) {
 }
 
 func UpdateUser(c *gin.Context) {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
 	var updatedUser model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&updatedUser)
+	err = common.Unmarshal(body, &updatedUser)
 	if err != nil || updatedUser.Id == 0 {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
+	var requestData map[string]interface{}
+	if err := common.Unmarshal(body, &requestData); err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	_, updateDisableReason := requestData["disable_reason"]
 	if updatedUser.Password == "" {
 		updatedUser.Password = "$I_LOVE_U" // make Validator happy :)
 	}
+	updatedUser.DisableReason = normalizeDisableReason(updatedUser.DisableReason)
 	if err := common.Validate.Struct(&updatedUser); err != nil {
 		common.ApiErrorI18n(c, i18n.MsgUserInputInvalid, map[string]any{"Error": err.Error()})
 		return
@@ -605,8 +716,11 @@ func UpdateUser(c *gin.Context) {
 	if updatedUser.Password == "$I_LOVE_U" {
 		updatedUser.Password = "" // rollback to what it should be
 	}
+	if originUser.Status != common.UserStatusDisabled {
+		updateDisableReason = false
+	}
 	updatePassword := updatedUser.Password != ""
-	if err := updatedUser.Edit(updatePassword); err != nil {
+	if err := updatedUser.Edit(updatePassword, updateDisableReason); err != nil {
 		common.ApiError(c, err)
 		return
 	}
@@ -657,7 +771,7 @@ func AdminClearUserBinding(c *gin.Context) {
 
 func UpdateSelf(c *gin.Context) {
 	var requestData map[string]interface{}
-	err := json.NewDecoder(c.Request.Body).Decode(&requestData)
+	err := common.DecodeJson(c.Request.Body, &requestData)
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
@@ -721,12 +835,12 @@ func UpdateSelf(c *gin.Context) {
 
 	// 原有的用户信息更新逻辑
 	var user model.User
-	requestDataBytes, err := json.Marshal(requestData)
+	requestDataBytes, err := common.Marshal(requestData)
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
-	err = json.Unmarshal(requestDataBytes, &user)
+	err = common.Unmarshal(requestDataBytes, &user)
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
@@ -845,7 +959,7 @@ func PurgeSoftDeletedUsers(c *gin.Context) {
 
 func CreateUser(c *gin.Context) {
 	var user model.User
-	err := json.NewDecoder(c.Request.Body).Decode(&user)
+	err := common.DecodeJson(c.Request.Body, &user)
 	user.Username = strings.TrimSpace(user.Username)
 	if err != nil || user.Username == "" || user.Password == "" {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
@@ -888,6 +1002,41 @@ type ManageRequest struct {
 	Value  int    `json:"value"`
 	Mode   string `json:"mode"`
 	Reason string `json:"reason,omitempty"`
+}
+
+type BatchDisableRelatedUsersRequest struct {
+	Id               int    `json:"id"`
+	RelatedUserIds   []int  `json:"related_user_ids"`
+	Reason           string `json:"reason"`
+	Depth            *int   `json:"depth,omitempty"`
+	SelectAllRelated *bool  `json:"select_all_related,omitempty"`
+}
+
+func BatchDisableRelatedUsers(c *gin.Context) {
+	var req BatchDisableRelatedUsersRequest
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	depth, err := service.NormalizeUserInviteRelationDepth(req.Depth)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	result, err := service.BatchDisableRelatedUsers(
+		req.Id,
+		req.RelatedUserIds,
+		req.Reason,
+		depth,
+		req.SelectAllRelated != nil && *req.SelectAllRelated,
+		c.GetInt("id"),
+		c.GetInt("role"),
+	)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, result)
 }
 
 // ManageUser Only admin user can do this
@@ -1066,9 +1215,9 @@ func EmailBind(c *gin.Context) {
 		common.ApiError(c, errors.New("invalid request body"))
 		return
 	}
-	email := req.Email
+	email := strings.TrimSpace(req.Email)
 	code := req.Code
-	if !common.VerifyCodeWithKey(email, code, common.EmailVerificationPurpose) {
+	if !common.VerifyCodeWithKey(common.NormalizeEmailIdentity(email), code, common.EmailVerificationPurpose) {
 		common.ApiErrorI18n(c, i18n.MsgUserVerificationCodeError)
 		return
 	}
@@ -1082,8 +1231,16 @@ func EmailBind(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	taken, err := model.EmailIdentityExists(model.DB, email, user.Id, true)
+	if err != nil {
+		common.ApiErrorI18n(c, i18n.MsgDatabaseError)
+		return
+	}
+	if taken {
+		common.ApiErrorI18n(c, i18n.MsgUserEmailTaken)
+		return
+	}
 	user.Email = email
-	// no need to check if this email already taken, because we have used verification code to check it
 	err = user.Update(false)
 	if err != nil {
 		common.ApiError(c, err)
@@ -1155,7 +1312,7 @@ func TopUp(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	quota, err := model.Redeem(req.Key, id)
+	quota, redemptionId, err := model.Redeem(req.Key, id)
 	if err != nil {
 		if errors.Is(err, model.ErrRedeemFailed) {
 			common.ApiErrorI18n(c, i18n.MsgRedeemFailed)
@@ -1164,6 +1321,7 @@ func TopUp(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	model.RecordLogWithContext(c, id, model.LogTypeTopup, fmt.Sprintf("通过兑换码充值 %s，兑换码ID %d", logger.LogQuota(quota), redemptionId))
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",

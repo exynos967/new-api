@@ -7,11 +7,11 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/setting"
 	"github.com/gin-gonic/gin"
 )
 
 const channelDailySuccessLimitSkippedIDsKey = "channel_daily_success_limit_skipped_ids"
+const channelRPMLimitSkippedIDsKey = "channel_rpm_limit_skipped_ids"
 
 type RetryParam struct {
 	Ctx                 *gin.Context
@@ -44,10 +44,45 @@ func HasChannelDailySuccessLimitSkipped(c *gin.Context) bool {
 }
 
 func GetChannelDailySuccessLimitSkippedIDs(c *gin.Context) map[int]bool {
+	return getChannelSkippedIDs(c, channelDailySuccessLimitSkippedIDsKey)
+}
+
+func MarkChannelRPMLimitSkipped(c *gin.Context, channelId int) {
+	if c == nil || channelId <= 0 {
+		return
+	}
+	skipped := GetChannelRPMLimitSkippedIDs(c)
+	skipped[channelId] = true
+	c.Set(channelRPMLimitSkippedIDsKey, skipped)
+}
+
+func IsChannelRPMLimitSkipped(c *gin.Context, channelId int) bool {
+	return GetChannelRPMLimitSkippedIDs(c)[channelId]
+}
+
+func HasChannelRPMLimitSkipped(c *gin.Context) bool {
+	return len(GetChannelRPMLimitSkippedIDs(c)) > 0
+}
+
+func GetChannelRPMLimitSkippedIDs(c *gin.Context) map[int]bool {
+	return getChannelSkippedIDs(c, channelRPMLimitSkippedIDsKey)
+}
+
+func GetChannelSelectionExcludedIDs(c *gin.Context) map[int]bool {
+	excluded := GetChannelDailySuccessLimitSkippedIDs(c)
+	for id, skipped := range GetChannelRPMLimitSkippedIDs(c) {
+		if skipped {
+			excluded[id] = true
+		}
+	}
+	return excluded
+}
+
+func getChannelSkippedIDs(c *gin.Context, key string) map[int]bool {
 	if c == nil {
 		return map[int]bool{}
 	}
-	value, ok := c.Get(channelDailySuccessLimitSkippedIDsKey)
+	value, ok := c.Get(key)
 	if !ok {
 		return map[int]bool{}
 	}
@@ -156,13 +191,13 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 	var err error
 	selectGroup := param.TokenGroup
 	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
-	excludedChannelIDs := GetChannelDailySuccessLimitSkippedIDs(param.Ctx)
+	excludedChannelIDs := GetChannelSelectionExcludedIDs(param.Ctx)
 
 	if param.TokenGroup == "auto" {
-		if len(setting.GetAutoGroups()) == 0 {
+		candidateGroups := GetRequestGroupCandidates(param.Ctx, userGroup, param.TokenGroup)
+		if len(candidateGroups) == 0 {
 			return nil, selectGroup, errors.New("auto groups is not enabled")
 		}
-		autoGroups := GetUserAutoGroup(userGroup)
 
 		// startGroupIndex: the group index to start searching from
 		// startGroupIndex: 开始搜索的分组索引
@@ -174,9 +209,18 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 				startGroupIndex = idx
 			}
 		}
+		selectedGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyAutoGroup)
+		if selectedGroup != "" && !crossGroupRetry {
+			for i, group := range candidateGroups {
+				if group == selectedGroup {
+					startGroupIndex = i
+					break
+				}
+			}
+		}
 
-		for i := startGroupIndex; i < len(autoGroups); i++ {
-			autoGroup := autoGroups[i]
+		for i := startGroupIndex; i < len(candidateGroups); i++ {
+			autoGroup := candidateGroups[i]
 			// Calculate priorityRetry for current group
 			// 计算当前分组的 priorityRetry
 			priorityRetry := param.GetRetry()
@@ -189,6 +233,13 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 
 			channel, _ = model.GetRandomSatisfiedChannelWithExclusions(autoGroup, param.ModelName, priorityRetry, excludedChannelIDs)
 			if channel == nil {
+				// Before the first channel is chosen, unsupported groups may be
+				// skipped regardless of the retry switch. Once a group has handled
+				// the request, disabled cross-group retry keeps subsequent retries
+				// pinned to that group.
+				if selectedGroup != "" && !crossGroupRetry {
+					break
+				}
 				// Current group has no available channel for this model, try next group
 				// 当前分组没有该模型的可用渠道，尝试下一个分组
 				logger.LogDebug(param.Ctx, "No available channel in group %s for model %s at priorityRetry %d, trying next group", autoGroup, param.ModelName, priorityRetry)

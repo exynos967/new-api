@@ -239,6 +239,7 @@ export const useChannelsData = () => {
     for (let i = 0; i < channels.length; i++) {
       channels[i].upstreamUpdateMeta = parseUpstreamUpdateMeta(
         channels[i].settings,
+        channels[i].type,
       );
       channels[i].key = '' + channels[i].id;
       if (!enableTagMode) {
@@ -301,8 +302,10 @@ export const useChannelsData = () => {
           tagChannelDates.status = 1;
         }
         tagChannelDates.used_quota += channels[i].used_quota;
-        tagChannelDates.daily_success_count += channels[i].daily_success_count || 0;
-        tagChannelDates.daily_success_limit += channels[i].daily_success_limit || 0;
+        tagChannelDates.daily_success_count +=
+          channels[i].daily_success_count || 0;
+        tagChannelDates.daily_success_limit +=
+          channels[i].daily_success_limit || 0;
         tagChannelDates.response_time += channels[i].response_time;
         tagChannelDates.response_time = tagChannelDates.response_time / 2;
       }
@@ -894,7 +897,7 @@ export const useChannelsData = () => {
         return Promise.resolve();
       }
 
-      const { success, message, time, error_code } = res.data;
+      const { success, message, time, error_code, rate_limit } = res.data;
 
       // 更新测试结果
       setModelTestResults((prev) => ({
@@ -905,6 +908,7 @@ export const useChannelsData = () => {
           time: time || 0,
           timestamp: Date.now(),
           errorCode: error_code || null,
+          rateLimit: rate_limit || null,
         },
       }));
 
@@ -945,6 +949,7 @@ export const useChannelsData = () => {
           time: 0,
           timestamp: Date.now(),
           errorCode: null,
+          rateLimit: null,
         },
       }));
       showError(error.message || t('测试失败'));

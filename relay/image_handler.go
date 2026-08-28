@@ -5,13 +5,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
@@ -46,12 +50,26 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 
 	var requestBody io.Reader
 
-	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled {
+	if shouldPassThroughImageRequest(info) {
+		info.MarkModelMappingBypassed()
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
-		requestBody = common.ReaderOnly(storage)
+		if shouldApplyImageEditParamOverride(info) {
+			body, err := storage.Bytes()
+			if err != nil {
+				return types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+			overriddenBody, contentType, err := applyImageEditParamOverride(body, c.Request.Header.Get("Content-Type"), info)
+			if err != nil {
+				return newAPIErrorFromParamOverride(err)
+			}
+			c.Request.Header.Set("Content-Type", contentType)
+			requestBody = overriddenBody
+		} else {
+			requestBody = common.ReaderOnly(storage)
+		}
 	} else {
 		convertedRequest, err := adaptor.ConvertImageRequest(c, info, *request)
 		if err != nil {
@@ -59,9 +77,18 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 		}
 		relaycommon.AppendRequestConversionFromRequest(info, convertedRequest)
 
-		switch convertedRequest.(type) {
+		switch convertedRequest := convertedRequest.(type) {
 		case *bytes.Buffer:
-			requestBody = convertedRequest.(io.Reader)
+			if shouldApplyImageEditParamOverride(info) {
+				overriddenBody, contentType, err := applyImageEditParamOverride(convertedRequest.Bytes(), c.Request.Header.Get("Content-Type"), info)
+				if err != nil {
+					return newAPIErrorFromParamOverride(err)
+				}
+				c.Request.Header.Set("Content-Type", contentType)
+				requestBody = overriddenBody
+			} else {
+				requestBody = convertedRequest
+			}
 		default:
 			jsonData, err := common.Marshal(convertedRequest)
 			if err != nil {
@@ -85,7 +112,9 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 
 	statusCodeMappingStr := c.GetString("status_code_mapping")
 
-	resp, err := adaptor.DoRequest(c, info, requestBody)
+	resp, err := doChannelRPMGuardedRequest(c, info, func() (any, error) {
+		return adaptor.DoRequest(c, info, requestBody)
+	})
 	if err != nil {
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}
@@ -114,7 +143,7 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	}
 
 	imageN := uint(1)
-	if request.N != nil {
+	if request.N != nil && info.ChannelType != constant.ChannelTypeVyceAI {
 		imageN = *request.N
 	}
 
@@ -153,5 +182,114 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	}
 
 	service.PostTextConsumeQuota(c, info, usage.(*dto.Usage), logContent)
+	recordOpenAILocalImageTask(c, info, request, imageN)
 	return nil
+}
+
+type openAILocalImageTaskResult struct {
+	URL           string `json:"url,omitempty"`
+	B64JSON       string `json:"b64_json,omitempty"`
+	HasB64JSON    bool   `json:"has_b64_json,omitempty"`
+	RevisedPrompt string `json:"revised_prompt,omitempty"`
+}
+
+type openAILocalImageTaskData struct {
+	ID             string                       `json:"id,omitempty"`
+	Model          string                       `json:"model,omitempty"`
+	Prompt         string                       `json:"prompt,omitempty"`
+	Size           string                       `json:"size,omitempty"`
+	Quality        string                       `json:"quality,omitempty"`
+	N              uint                         `json:"n,omitempty"`
+	ResponseFormat string                       `json:"response_format,omitempty"`
+	Data           []openAILocalImageTaskResult `json:"data,omitempty"`
+}
+
+func recordOpenAILocalImageTask(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ImageRequest, imageN uint) {
+	if info == nil || request == nil || info.ChannelType != constant.ChannelTypeOpenAILocal {
+		return
+	}
+	raw, ok := c.Get("openai_response_body")
+	if !ok {
+		return
+	}
+	responseBody, ok := raw.([]byte)
+	if !ok || len(responseBody) == 0 {
+		return
+	}
+
+	var payload struct {
+		ID   string `json:"id"`
+		Data []struct {
+			URL           string `json:"url"`
+			B64JSON       string `json:"b64_json"`
+			RevisedPrompt string `json:"revised_prompt"`
+		} `json:"data"`
+	}
+	_ = common.Unmarshal(responseBody, &payload)
+
+	taskData := openAILocalImageTaskData{
+		ID:             payload.ID,
+		Model:          request.Model,
+		Prompt:         request.Prompt,
+		Size:           request.Size,
+		Quality:        request.Quality,
+		N:              imageN,
+		ResponseFormat: request.ResponseFormat,
+		Data:           make([]openAILocalImageTaskResult, 0, len(payload.Data)),
+	}
+
+	resultURL := ""
+	for _, item := range payload.Data {
+		if resultURL == "" && item.URL != "" {
+			resultURL = item.URL
+		}
+		b64JSON := ""
+		if item.URL == "" {
+			b64JSON = item.B64JSON
+		}
+		taskData.Data = append(taskData.Data, openAILocalImageTaskResult{
+			URL:           item.URL,
+			B64JSON:       b64JSON,
+			HasB64JSON:    item.B64JSON != "",
+			RevisedPrompt: item.RevisedPrompt,
+		})
+	}
+
+	task := model.InitTask(constant.TaskPlatform(strconv.Itoa(constant.ChannelTypeOpenAILocal)), info)
+	finishTime := time.Now()
+	startTime := common.GetContextKeyTime(c, constant.ContextKeyRequestStartTime)
+	if startTime.IsZero() && !info.StartTime.IsZero() {
+		startTime = info.StartTime
+	}
+	if startTime.IsZero() {
+		startTime = finishTime
+	}
+	task.Action = constant.TaskActionImageGeneration
+	if info.RelayMode == relayconstant.RelayModeImagesEdits {
+		task.Action = constant.TaskActionImageEdit
+	}
+	task.Status = model.TaskStatusSuccess
+	task.Progress = "100%"
+	task.SubmitTime = startTime.Unix()
+	task.StartTime = startTime.Unix()
+	task.FinishTime = finishTime.Unix()
+	task.Quota = info.PriceData.Quota
+	task.PrivateData.ResultURL = resultURL
+	task.SetData(taskData)
+	if err := task.Insert(); err != nil {
+		common.SysError("insert OpenAI-local image task error: " + err.Error())
+	}
+}
+
+func shouldPassThroughImageRequest(info *relaycommon.RelayInfo) bool {
+	if info != nil && info.ChannelMeta != nil {
+		switch info.ChannelType {
+		case constant.ChannelTypeAgnesAI, constant.ChannelTypeVyceAI:
+			return false
+		}
+	}
+	if model_setting.GetGlobalSettings().PassThroughRequestEnabled {
+		return true
+	}
+	return info != nil && info.ChannelSetting.PassThroughBodyEnabled
 }

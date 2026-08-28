@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -141,6 +142,15 @@ func UpdateOption(c *gin.Context) {
 			})
 			return
 		}
+	case "GitHubMinimumAccountAgeSeconds":
+		minimumAgeSeconds, parseErr := strconv.ParseInt(option.Value.(string), 10, 64)
+		if parseErr != nil || minimumAgeSeconds < 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": "GitHub 账号年龄限制必须是非负整数秒",
+			})
+			return
+		}
 	case "discord.enabled":
 		if option.Value == "true" && system_setting.GetDiscordSettings().ClientId == "" {
 			c.JSON(http.StatusOK, gin.H{
@@ -200,6 +210,15 @@ func UpdateOption(c *gin.Context) {
 		}
 	case "GroupRatio":
 		err = ratio_setting.CheckGroupRatio(option.Value.(string))
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
+	case "GroupDescriptions":
+		err = setting.CheckGroupDescriptions(option.Value.(string))
 		if err != nil {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
@@ -270,6 +289,24 @@ func UpdateOption(c *gin.Context) {
 			})
 			return
 		}
+	case "probe_guard_setting.enabled",
+		"probe_guard_setting.dry_run",
+		"probe_guard_setting.window_seconds",
+		"probe_guard_setting.distinct_model_count",
+		"probe_guard_setting.first_ip_ban_minutes",
+		"probe_guard_setting.second_ip_ban_minutes",
+		"probe_guard_setting.permanent_offense_count",
+		"probe_guard_setting.offense_dedupe_seconds",
+		"probe_guard_setting.max_ips_per_offense",
+		"probe_guard_setting.whitelist_user_ids":
+		err = setting.CheckProbeGuardOption(option.Key, option.Value.(string))
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
 	case "AutomaticDisableStatusCodes":
 		_, err = operation_setting.ParseHTTPStatusCodeRanges(option.Value.(string))
 		if err != nil {
@@ -317,6 +354,15 @@ func UpdateOption(c *gin.Context) {
 		}
 	case "console_setting.uptime_kuma_groups":
 		err = console_setting.ValidateConsoleSettings(option.Value.(string), "UptimeKumaGroups")
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
+	case "site_background.config":
+		err = system_setting.ValidateSiteBackgroundConfig(option.Value.(string))
 		if err != nil {
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,

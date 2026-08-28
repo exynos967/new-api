@@ -43,8 +43,22 @@ import { ITEMS_PER_PAGE } from '../../constants';
 import { useTableCompactMode } from '../common/useTableCompactMode';
 import ParamOverrideEntry from '../../components/table/usage-logs/components/ParamOverrideEntry';
 
-export const useLogsData = () => {
+export const useLogsData = ({
+  defaultLogType = 0,
+  fixedLogType = null,
+} = {}) => {
   const { t } = useTranslation();
+
+  const normalizeLogType = (value, fallback = 0) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  const initialLogType = normalizeLogType(defaultLogType);
+  const enforcedLogType =
+    fixedLogType === null || fixedLogType === undefined
+      ? null
+      : normalizeLogType(fixedLogType, initialLogType);
+  const effectiveDefaultLogType = enforcedLogType ?? initialLogType;
 
   // Define column keys for selection
   const COLUMN_KEYS = {
@@ -61,6 +75,7 @@ export const useLogsData = () => {
     COST: 'cost',
     RETRY: 'retry',
     IP: 'ip',
+    USER_AGENT: 'user_agent',
     DETAILS: 'details',
   };
 
@@ -73,7 +88,7 @@ export const useLogsData = () => {
   const [activePage, setActivePage] = useState(1);
   const [logCount, setLogCount] = useState(0);
   const [pageSize, setPageSize] = useState(ITEMS_PER_PAGE);
-  const [logType, setLogType] = useState(0);
+  const [logType, setLogType] = useState(effectiveDefaultLogType);
 
   // User and admin
   const isAdminUser = isAdmin();
@@ -89,6 +104,10 @@ export const useLogsData = () => {
   const [stat, setStat] = useState({
     quota: 0,
     token: 0,
+    rpm: 0,
+    rpm_total: 0,
+    rpm_success_rate: 0,
+    tpm: 0,
   });
 
   // Form state
@@ -102,11 +121,12 @@ export const useLogsData = () => {
     group: '',
     request_id: '',
     ip: '',
+    user_agent: '',
     dateRange: [
       timestamp2string(getTodayStartTimestamp()),
       timestamp2string(now.getTime() / 1000 + 3600),
     ],
-    logType: '0',
+    logType: String(effectiveDefaultLogType),
   };
 
   // Get default column visibility based on user role
@@ -125,6 +145,7 @@ export const useLogsData = () => {
       [COLUMN_KEYS.COST]: true,
       [COLUMN_KEYS.RETRY]: isAdminUser,
       [COLUMN_KEYS.IP]: true,
+      [COLUMN_KEYS.USER_AGENT]: true,
       [COLUMN_KEYS.DETAILS]: true,
     };
   };
@@ -177,6 +198,7 @@ export const useLogsData = () => {
   // User info modal state
   const [showUserInfo, setShowUserInfoModal] = useState(false);
   const [userInfoData, setUserInfoData] = useState(null);
+  const [showDisableUserModal, setShowDisableUserModal] = useState(false);
 
   // Channel affinity usage cache stats modal state (admin only)
   const [
@@ -259,7 +281,12 @@ export const useLogsData = () => {
       group: formValues.group || '',
       request_id: formValues.request_id || '',
       ip: formValues.ip || '',
-      logType: formValues.logType ? parseInt(formValues.logType) : 0,
+      user_agent: formValues.user_agent || '',
+      logType:
+        enforcedLogType ??
+        (formValues.logType
+          ? parseInt(formValues.logType)
+          : effectiveDefaultLogType),
     };
   };
 
@@ -272,13 +299,16 @@ export const useLogsData = () => {
       end_timestamp,
       group,
       ip,
+      user_agent,
       logType: formLogType,
     } = getFormValues();
-    const currentLogType = formLogType !== undefined ? formLogType : logType;
+    const currentLogType =
+      enforcedLogType ?? (formLogType !== undefined ? formLogType : logType);
     let localStartTimestamp = Date.parse(start_timestamp) / 1000;
     let localEndTimestamp = Date.parse(end_timestamp) / 1000;
     let url = `/api/log/self/stat?type=${currentLogType}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&group=${group}&ip=${ip}`;
     url = encodeURI(url);
+    url += `&user_agent=${encodeURIComponent(user_agent)}`;
     let res = await API.get(url);
     const { success, message, data } = res.data;
     if (success) {
@@ -298,13 +328,16 @@ export const useLogsData = () => {
       channel,
       group,
       ip,
+      user_agent,
       logType: formLogType,
     } = getFormValues();
-    const currentLogType = formLogType !== undefined ? formLogType : logType;
+    const currentLogType =
+      enforcedLogType ?? (formLogType !== undefined ? formLogType : logType);
     let localStartTimestamp = Date.parse(start_timestamp) / 1000;
     let localEndTimestamp = Date.parse(end_timestamp) / 1000;
     let url = `/api/log/stat?type=${currentLogType}&username=${username}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&channel=${channel}&group=${group}&ip=${ip}`;
     url = encodeURI(url);
+    url += `&user_agent=${encodeURIComponent(user_agent)}`;
     let res = await API.get(url);
     const { success, message, data } = res.data;
     if (success) {
@@ -319,6 +352,19 @@ export const useLogsData = () => {
       return;
     }
     setLoadingStat(true);
+    if (getFormValues().logType === 7) {
+      setStat({
+        quota: 0,
+        token: 0,
+        rpm: 0,
+        rpm_total: 0,
+        rpm_success_rate: 0,
+        tpm: 0,
+      });
+      setShowStat(true);
+      setLoadingStat(false);
+      return;
+    }
     if (isAdminUser) {
       await getLogStat();
     } else {
@@ -333,6 +379,7 @@ export const useLogsData = () => {
     if (!isAdminUser) {
       return;
     }
+    setShowDisableUserModal(false);
     const res = await API.get(`/api/user/${userId}`);
     const { success, message, data } = res.data;
     if (success) {
@@ -340,6 +387,48 @@ export const useLogsData = () => {
       setShowUserInfoModal(true);
     } else {
       showError(message);
+    }
+  };
+
+  const openDisableUserModal = () => {
+    if (!isAdminUser || !userInfoData?.id) {
+      return;
+    }
+    setShowDisableUserModal(true);
+  };
+
+  const closeDisableUserModal = () => {
+    setShowDisableUserModal(false);
+  };
+
+  const disableUserFromInfoModal = async (reason) => {
+    if (!isAdminUser || !userInfoData?.id) {
+      return;
+    }
+    try {
+      const res = await API.post('/api/user/manage', {
+        id: userInfoData.id,
+        action: 'disable',
+        reason,
+      });
+      const { success, message, data } = res.data;
+      if (success) {
+        showSuccess(t('操作成功完成！'));
+        setUserInfoData((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: data?.status ?? 2,
+                disable_reason: data?.disable_reason || reason || '',
+              }
+            : prev,
+        );
+        setShowDisableUserModal(false);
+      } else {
+        showError(message);
+      }
+    } catch (error) {
+      showError(error.message || t('操作失败，请重试'));
     }
   };
 
@@ -379,6 +468,7 @@ export const useLogsData = () => {
       }
       return `${chain.join(' -> ')}`;
     };
+    const isRequestLogType = (type) => type === 0 || type === 2 || type === 5;
 
     let expandDatesLocal = {};
     for (let i = 0; i < logs.length; i++) {
@@ -398,6 +488,34 @@ export const useLogsData = () => {
           key: t('Request ID'),
           value: logs[i].request_id,
         });
+      }
+      if (logs[i].type === 7) {
+        expandDataLocal.push({
+          key: t('收件人'),
+          value: other?.receiver || '',
+        });
+        expandDataLocal.push({
+          key: t('主题'),
+          value: other?.subject || '',
+        });
+        expandDataLocal.push({
+          key: t('来源'),
+          value: other?.source || '',
+        });
+        expandDataLocal.push({
+          key: t('发送结果'),
+          value: other?.success === false ? t('失败') : t('成功'),
+        });
+        if (other?.error) {
+          expandDataLocal.push({
+            key: t('错误'),
+            value: (
+              <div style={{ maxWidth: 600, whiteSpace: 'normal', wordBreak: 'break-word', lineHeight: 1.6 }}>
+                {other.error}
+              </div>
+            ),
+          });
+        }
       }
       if (other?.ws || other?.audio) {
         expandDataLocal.push({
@@ -627,13 +745,13 @@ export const useLogsData = () => {
           ),
         });
       }
-      if (isAdminUser && logs[i].type !== 6 && logs[i].type !== 1) {
+      if (isAdminUser && isRequestLogType(logs[i].type)) {
         expandDataLocal.push({
           key: t('请求转换'),
           value: requestConversionDisplayValue(other?.request_conversion),
         });
       }
-      if (isAdminUser && logs[i].type !== 6 && logs[i].type !== 1) {
+      if (isAdminUser && isRequestLogType(logs[i].type)) {
         let localCountMode = '';
         if (other?.admin_info?.local_count_tokens) {
           localCountMode = t('本地计费');
@@ -744,11 +862,14 @@ export const useLogsData = () => {
       group,
       request_id,
       ip,
+      user_agent,
       logType: formLogType,
     } = getFormValues();
 
     const currentLogType =
-      customLogType !== null
+      enforcedLogType !== null
+        ? enforcedLogType
+        : customLogType !== null
         ? customLogType
         : formLogType !== undefined
           ? formLogType
@@ -762,6 +883,7 @@ export const useLogsData = () => {
       url = `/api/log/self/?p=${startIdx}&page_size=${pageSize}&type=${currentLogType}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&group=${group}&request_id=${request_id}&ip=${ip}`;
     }
     url = encodeURI(url);
+    url += `&user_agent=${encodeURIComponent(user_agent)}`;
     const res = await API.get(url);
     const { success, message, data } = res.data;
     if (success) {
@@ -799,6 +921,14 @@ export const useLogsData = () => {
     setActivePage(1);
     handleEyeClick();
     await loadLogs(1, pageSize);
+  };
+
+  const updateLogType = (nextType) => {
+    if (enforcedLogType !== null) {
+      setLogType(enforcedLogType);
+      return;
+    }
+    setLogType(nextType);
   };
 
   // Copy text function
@@ -848,6 +978,8 @@ export const useLogsData = () => {
     logCount,
     pageSize,
     logType,
+    defaultLogType: effectiveDefaultLogType,
+    fixedLogType: enforcedLogType,
     stat,
     isAdminUser,
 
@@ -877,6 +1009,10 @@ export const useLogsData = () => {
     setShowUserInfoModal,
     userInfoData,
     showUserInfoFunc,
+    showDisableUserModal,
+    openDisableUserModal,
+    closeDisableUserModal,
+    disableUserFromInfoModal,
 
     // Channel affinity usage cache stats modal
     showChannelAffinityUsageCacheModal,
@@ -896,7 +1032,7 @@ export const useLogsData = () => {
     handleEyeClick,
     setLogsFormat,
     hasExpandableRows,
-    setLogType,
+    setLogType: updateLogType,
     openParamOverrideModal,
 
     // Translation

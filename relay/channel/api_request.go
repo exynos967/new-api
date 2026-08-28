@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 
@@ -118,6 +119,9 @@ func isHeaderPassthroughRuleKey(key string) bool {
 func shouldSkipPassthroughHeader(name string) bool {
 	name = strings.TrimSpace(name)
 	if name == "" {
+		return true
+	}
+	if model_setting.ShouldRemoveClaudeCodeBillingHeader(name) {
 		return true
 	}
 	lower := strings.ToLower(name)
@@ -351,6 +355,27 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 	return resp, nil
 }
 
+type wssDialError struct {
+	url        string
+	statusCode int
+	err        error
+}
+
+func (e *wssDialError) Error() string {
+	if e.statusCode > 0 {
+		return fmt.Sprintf("dial failed to %s with status %d: %v", e.url, e.statusCode, e.err)
+	}
+	return fmt.Sprintf("dial failed to %s: %v", e.url, e.err)
+}
+
+func (e *wssDialError) Unwrap() error {
+	return e.err
+}
+
+func (e *wssDialError) HTTPStatusCode() int {
+	return e.statusCode
+}
+
 func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
 	fullRequestURL, err := a.GetRequestURL(info)
 	if err != nil {
@@ -371,9 +396,16 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		targetHeader.Set(key, value)
 	}
 	targetHeader.Set("Content-Type", c.Request.Header.Get("Content-Type"))
-	targetConn, _, err := websocket.DefaultDialer.Dial(fullRequestURL, targetHeader)
+	targetConn, resp, err := websocket.DefaultDialer.Dial(fullRequestURL, targetHeader)
 	if err != nil {
-		return nil, fmt.Errorf("dial failed to %s: %w", fullRequestURL, err)
+		statusCode := 0
+		if resp != nil {
+			statusCode = resp.StatusCode
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+		}
+		return nil, &wssDialError{url: fullRequestURL, statusCode: statusCode, err: err}
 	}
 	// send request body
 	//all, err := io.ReadAll(requestBody)

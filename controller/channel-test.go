@@ -22,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel/gmicloud"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -41,6 +42,215 @@ type testResult struct {
 	context     *gin.Context
 	localErr    error
 	newAPIError *types.NewAPIError
+	rateLimit   *channelRateLimitInfo
+}
+
+type channelRateLimitInfo struct {
+	Provider                      string `json:"provider"`
+	Model                         string `json:"model"`
+	Tier                          string `json:"tier,omitempty"`
+	LimitRequests                 string `json:"limit_requests,omitempty"`
+	LimitTokens                   string `json:"limit_tokens,omitempty"`
+	RemainingRequests             string `json:"remaining_requests,omitempty"`
+	RemainingTokens               string `json:"remaining_tokens,omitempty"`
+	ResetRequests                 string `json:"reset_requests,omitempty"`
+	ResetTokens                   string `json:"reset_tokens,omitempty"`
+	LimitProjectTokens            string `json:"limit_project_tokens,omitempty"`
+	RemainingProjectTokens        string `json:"remaining_project_tokens,omitempty"`
+	ResetProjectTokens            string `json:"reset_project_tokens,omitempty"`
+	LimitInputTokens              string `json:"limit_input_tokens,omitempty"`
+	RemainingInputTokens          string `json:"remaining_input_tokens,omitempty"`
+	ResetInputTokens              string `json:"reset_input_tokens,omitempty"`
+	LimitOutputTokens             string `json:"limit_output_tokens,omitempty"`
+	RemainingOutputTokens         string `json:"remaining_output_tokens,omitempty"`
+	ResetOutputTokens             string `json:"reset_output_tokens,omitempty"`
+	LimitPriorityInputTokens      string `json:"limit_priority_input_tokens,omitempty"`
+	RemainingPriorityInputTokens  string `json:"remaining_priority_input_tokens,omitempty"`
+	ResetPriorityInputTokens      string `json:"reset_priority_input_tokens,omitempty"`
+	LimitPriorityOutputTokens     string `json:"limit_priority_output_tokens,omitempty"`
+	RemainingPriorityOutputTokens string `json:"remaining_priority_output_tokens,omitempty"`
+	ResetPriorityOutputTokens     string `json:"reset_priority_output_tokens,omitempty"`
+}
+
+type openAIRateLimitTierRule struct {
+	Model              string
+	LimitRequests      string
+	LimitTokens        string
+	LimitProjectTokens string
+	Tier               string
+}
+
+// Keep this table conservative: only add model-specific entries when OpenAI
+// exposes a stable public mapping from limits to usage tiers.
+var openAIRateLimitTierRules = []openAIRateLimitTierRule{}
+
+func isOfficialProviderChannel(channel *model.Channel, channelType int, host string) bool {
+	if channel == nil || channel.Type != channelType {
+		return false
+	}
+	baseURL := strings.TrimSpace(channel.GetBaseURL())
+	if baseURL == "" && channel.Type >= 0 && channel.Type < len(constant.ChannelBaseURLs) {
+		baseURL = strings.TrimSpace(constant.ChannelBaseURLs[channel.Type])
+	}
+	if baseURL == "" {
+		return false
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Hostname(), host)
+}
+
+func isOfficialOpenAIChannel(channel *model.Channel) bool {
+	return isOfficialProviderChannel(channel, constant.ChannelTypeOpenAI, "api.openai.com")
+}
+
+func isOfficialAnthropicChannel(channel *model.Channel) bool {
+	return isOfficialProviderChannel(channel, constant.ChannelTypeAnthropic, "api.anthropic.com")
+}
+
+func rateLimitHeaderValue(headers http.Header, name string) string {
+	return strings.TrimSpace(headers.Get(name))
+}
+
+func normalizeOpenAIRateLimitValue(value string) string {
+	return strings.ReplaceAll(strings.TrimSpace(value), ",", "")
+}
+
+func inferOpenAIRateLimitTier(modelName string, info *channelRateLimitInfo) string {
+	if info == nil {
+		return ""
+	}
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" {
+		modelName = strings.TrimSpace(info.Model)
+	}
+	for _, rule := range openAIRateLimitTierRules {
+		if !strings.EqualFold(strings.TrimSpace(rule.Model), modelName) {
+			continue
+		}
+		matched := false
+		if rule.LimitRequests != "" {
+			matched = true
+			if normalizeOpenAIRateLimitValue(rule.LimitRequests) != normalizeOpenAIRateLimitValue(info.LimitRequests) {
+				continue
+			}
+		}
+		if rule.LimitTokens != "" {
+			matched = true
+			if normalizeOpenAIRateLimitValue(rule.LimitTokens) != normalizeOpenAIRateLimitValue(info.LimitTokens) {
+				continue
+			}
+		}
+		if rule.LimitProjectTokens != "" {
+			matched = true
+			if normalizeOpenAIRateLimitValue(rule.LimitProjectTokens) != normalizeOpenAIRateLimitValue(info.LimitProjectTokens) {
+				continue
+			}
+		}
+		if matched {
+			return strings.TrimSpace(rule.Tier)
+		}
+	}
+	return ""
+}
+
+func hasChannelRateLimitInfo(info *channelRateLimitInfo) bool {
+	if info == nil {
+		return false
+	}
+	return info.LimitRequests != "" ||
+		info.LimitTokens != "" ||
+		info.RemainingRequests != "" ||
+		info.RemainingTokens != "" ||
+		info.ResetRequests != "" ||
+		info.ResetTokens != "" ||
+		info.LimitProjectTokens != "" ||
+		info.RemainingProjectTokens != "" ||
+		info.ResetProjectTokens != "" ||
+		info.LimitInputTokens != "" ||
+		info.RemainingInputTokens != "" ||
+		info.ResetInputTokens != "" ||
+		info.LimitOutputTokens != "" ||
+		info.RemainingOutputTokens != "" ||
+		info.ResetOutputTokens != "" ||
+		info.LimitPriorityInputTokens != "" ||
+		info.RemainingPriorityInputTokens != "" ||
+		info.ResetPriorityInputTokens != "" ||
+		info.LimitPriorityOutputTokens != "" ||
+		info.RemainingPriorityOutputTokens != "" ||
+		info.ResetPriorityOutputTokens != ""
+}
+
+func extractOpenAIRateLimitInfo(channel *model.Channel, modelName string, headers http.Header) *channelRateLimitInfo {
+	if !isOfficialOpenAIChannel(channel) || headers == nil {
+		return nil
+	}
+
+	info := &channelRateLimitInfo{
+		Provider:               "openai",
+		Model:                  strings.TrimSpace(modelName),
+		LimitRequests:          rateLimitHeaderValue(headers, "x-ratelimit-limit-requests"),
+		LimitTokens:            rateLimitHeaderValue(headers, "x-ratelimit-limit-tokens"),
+		RemainingRequests:      rateLimitHeaderValue(headers, "x-ratelimit-remaining-requests"),
+		RemainingTokens:        rateLimitHeaderValue(headers, "x-ratelimit-remaining-tokens"),
+		ResetRequests:          rateLimitHeaderValue(headers, "x-ratelimit-reset-requests"),
+		ResetTokens:            rateLimitHeaderValue(headers, "x-ratelimit-reset-tokens"),
+		LimitProjectTokens:     rateLimitHeaderValue(headers, "x-ratelimit-limit-project-tokens"),
+		RemainingProjectTokens: rateLimitHeaderValue(headers, "x-ratelimit-remaining-project-tokens"),
+		ResetProjectTokens:     rateLimitHeaderValue(headers, "x-ratelimit-reset-project-tokens"),
+	}
+
+	if !hasChannelRateLimitInfo(info) {
+		return nil
+	}
+	info.Tier = inferOpenAIRateLimitTier(modelName, info)
+	return info
+}
+
+func extractAnthropicRateLimitInfo(channel *model.Channel, modelName string, headers http.Header) *channelRateLimitInfo {
+	if !isOfficialAnthropicChannel(channel) || headers == nil {
+		return nil
+	}
+
+	info := &channelRateLimitInfo{
+		Provider:                      "anthropic",
+		Model:                         strings.TrimSpace(modelName),
+		LimitRequests:                 rateLimitHeaderValue(headers, "anthropic-ratelimit-requests-limit"),
+		RemainingRequests:             rateLimitHeaderValue(headers, "anthropic-ratelimit-requests-remaining"),
+		ResetRequests:                 rateLimitHeaderValue(headers, "anthropic-ratelimit-requests-reset"),
+		LimitTokens:                   rateLimitHeaderValue(headers, "anthropic-ratelimit-tokens-limit"),
+		RemainingTokens:               rateLimitHeaderValue(headers, "anthropic-ratelimit-tokens-remaining"),
+		ResetTokens:                   rateLimitHeaderValue(headers, "anthropic-ratelimit-tokens-reset"),
+		LimitInputTokens:              rateLimitHeaderValue(headers, "anthropic-ratelimit-input-tokens-limit"),
+		RemainingInputTokens:          rateLimitHeaderValue(headers, "anthropic-ratelimit-input-tokens-remaining"),
+		ResetInputTokens:              rateLimitHeaderValue(headers, "anthropic-ratelimit-input-tokens-reset"),
+		LimitOutputTokens:             rateLimitHeaderValue(headers, "anthropic-ratelimit-output-tokens-limit"),
+		RemainingOutputTokens:         rateLimitHeaderValue(headers, "anthropic-ratelimit-output-tokens-remaining"),
+		ResetOutputTokens:             rateLimitHeaderValue(headers, "anthropic-ratelimit-output-tokens-reset"),
+		LimitPriorityInputTokens:      rateLimitHeaderValue(headers, "anthropic-priority-input-tokens-limit"),
+		RemainingPriorityInputTokens:  rateLimitHeaderValue(headers, "anthropic-priority-input-tokens-remaining"),
+		ResetPriorityInputTokens:      rateLimitHeaderValue(headers, "anthropic-priority-input-tokens-reset"),
+		LimitPriorityOutputTokens:     rateLimitHeaderValue(headers, "anthropic-priority-output-tokens-limit"),
+		RemainingPriorityOutputTokens: rateLimitHeaderValue(headers, "anthropic-priority-output-tokens-remaining"),
+		ResetPriorityOutputTokens:     rateLimitHeaderValue(headers, "anthropic-priority-output-tokens-reset"),
+	}
+
+	if !hasChannelRateLimitInfo(info) {
+		return nil
+	}
+	return info
+}
+
+func extractChannelRateLimitInfo(channel *model.Channel, modelName string, headers http.Header) *channelRateLimitInfo {
+	if info := extractOpenAIRateLimitInfo(channel, modelName, headers); info != nil {
+		return info
+	}
+	if info := extractAnthropicRateLimitInfo(channel, modelName, headers); info != nil {
+		return info
+	}
+	return nil
 }
 
 func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointType string) string {
@@ -56,6 +266,56 @@ func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointTyp
 			return string(constant.EndpointTypeCohereEmbeddings)
 		}
 		return string(constant.EndpointTypeCohereChat)
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeVolcEngine {
+		if common.IsVolcEngineContentGenerationTaskModel(modelName) {
+			return string(constant.EndpointTypeOpenAIVideo)
+		}
+		if common.IsVolcEngineImageGenerationModel(modelName) {
+			return string(constant.EndpointTypeImageGeneration)
+		}
+		if common.IsVolcEngineEmbeddingModel(modelName) {
+			return string(constant.EndpointTypeEmbeddings)
+		}
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeGCP {
+		if common.IsGCPSpeechModel(modelName) {
+			return string(constant.EndpointTypeAudioSpeech)
+		}
+		if common.IsGCPTranscriptionModel(modelName) {
+			return string(constant.EndpointTypeAudioTranscription)
+		}
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeGMICloud && gmicloud.IsBatchModel(modelName) {
+		return string(constant.EndpointTypeBatchGeneration)
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeVyceAI {
+		return string(constant.EndpointTypeImageGeneration)
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeOpenCode {
+		switch constant.GetOpenCodeEndpoint(modelName) {
+		case constant.OpenCodeEndpointResponses:
+			return string(constant.EndpointTypeOpenAIResponse)
+		case constant.OpenCodeEndpointMessages:
+			return string(constant.EndpointTypeAnthropic)
+		case constant.OpenCodeEndpointGemini:
+			return string(constant.EndpointTypeGemini)
+		default:
+			return string(constant.EndpointTypeOpenAI)
+		}
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeOpenCodeGo {
+		switch constant.GetOpenCodeGoEndpoint(modelName) {
+		case constant.OpenCodeEndpointResponses:
+			return string(constant.EndpointTypeOpenAIResponse)
+		case constant.OpenCodeEndpointMessages:
+			return string(constant.EndpointTypeAnthropic)
+		default:
+			return string(constant.EndpointTypeOpenAI)
+		}
+	}
+	if (channel == nil || channel.Type != constant.ChannelTypePoe) && common.IsVideoGenerationModel(modelName) {
+		return string(constant.EndpointTypeOpenAIVideo)
 	}
 	if strings.HasSuffix(modelName, ratio_setting.CompactModelSuffix) {
 		return string(constant.EndpointTypeOpenAIResponseCompact)
@@ -126,9 +386,14 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 			requestPath = "/v1/embeddings" // 修改请求路径
 		}
 
-		// VolcEngine 图像生成模型
-		if channel.Type == constant.ChannelTypeVolcEngine && strings.Contains(testModel, "seedream") {
+		if (channel.Type != constant.ChannelTypePoe && common.IsImageGenerationModel(testModel)) ||
+			(channel.Type == constant.ChannelTypeVolcEngine && common.IsVolcEngineImageGenerationModel(testModel)) {
 			requestPath = "/v1/images/generations"
+		}
+
+		if (channel.Type != constant.ChannelTypePoe && common.IsVideoGenerationModel(testModel)) ||
+			(channel.Type == constant.ChannelTypeVolcEngine && common.IsVolcEngineContentGenerationTaskModel(testModel)) {
+			requestPath = "/v1/videos"
 		}
 
 		// responses-only models
@@ -180,8 +445,8 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 
 	// Determine relay format based on endpoint type or request path
 	var relayFormat types.RelayFormat
+	// 根据指定的端点类型设置 relayFormat
 	if endpointType != "" {
-		// 根据指定的端点类型设置 relayFormat
 		switch constant.EndpointType(endpointType) {
 		case constant.EndpointTypeOpenAI, constant.EndpointTypeCohereChat:
 			relayFormat = types.RelayFormatOpenAI
@@ -199,6 +464,10 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 			relayFormat = types.RelayFormatOpenAIImage
 		case constant.EndpointTypeEmbeddings, constant.EndpointTypeCohereEmbeddings:
 			relayFormat = types.RelayFormatEmbedding
+		case constant.EndpointTypeOpenAIVideo, constant.EndpointTypeBatchGeneration:
+			relayFormat = types.RelayFormatTask
+		case constant.EndpointTypeAudioSpeech, constant.EndpointTypeAudioTranscription:
+			relayFormat = types.RelayFormatOpenAIAudio
 		default:
 			relayFormat = types.RelayFormatOpenAI
 		}
@@ -226,6 +495,14 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 		if strings.HasPrefix(c.Request.URL.Path, "/v1/responses/compact") {
 			relayFormat = types.RelayFormatOpenAIResponsesCompaction
 		}
+		if c.Request.URL.Path == "/v1/videos" {
+			relayFormat = types.RelayFormatTask
+		}
+	}
+
+	if constant.EndpointType(endpointType) == constant.EndpointTypeOpenAIVideo ||
+		constant.EndpointType(endpointType) == constant.EndpointTypeBatchGeneration {
+		return testTaskChannel(c, channel, testModel, tik)
 	}
 
 	request := buildTestRequest(testModel, endpointType, channel, isStream)
@@ -301,8 +578,19 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 	adaptor.Init(info)
 
 	var convertedRequest any
+	var convertedAudioReader io.Reader
 	// 根据 RelayMode 选择正确的转换函数
 	switch info.RelayMode {
+	case relayconstant.RelayModeAudioSpeech, relayconstant.RelayModeAudioTranscription, relayconstant.RelayModeAudioTranslation:
+		if audioReq, ok := request.(*dto.AudioRequest); ok {
+			convertedAudioReader, err = adaptor.ConvertAudioRequest(c, info, *audioReq)
+		} else {
+			return testResult{
+				context:     c,
+				localErr:    errors.New("invalid audio request type"),
+				newAPIError: types.NewError(errors.New("invalid audio request type"), types.ErrorCodeConvertRequestFailed),
+			}
+		}
 	case relayconstant.RelayModeEmbeddings:
 		// Embedding 请求 - request 已经是正确的类型
 		if embeddingReq, ok := request.(*dto.EmbeddingRequest); ok {
@@ -386,12 +674,24 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 			newAPIError: types.NewError(err, types.ErrorCodeConvertRequestFailed),
 		}
 	}
-	jsonData, err := common.Marshal(convertedRequest)
-	if err != nil {
-		return testResult{
-			context:     c,
-			localErr:    err,
-			newAPIError: types.NewError(err, types.ErrorCodeJsonMarshalFailed),
+	var jsonData []byte
+	if convertedAudioReader != nil {
+		jsonData, err = io.ReadAll(convertedAudioReader)
+		if err != nil {
+			return testResult{
+				context:     c,
+				localErr:    err,
+				newAPIError: types.NewError(err, types.ErrorCodeReadRequestBodyFailed),
+			}
+		}
+	} else {
+		jsonData, err = common.Marshal(convertedRequest)
+		if err != nil {
+			return testResult{
+				context:     c,
+				localErr:    err,
+				newAPIError: types.NewError(err, types.ErrorCodeJsonMarshalFailed),
+			}
 		}
 	}
 
@@ -469,6 +769,10 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 			}
 		}
 	}
+	var rateLimit *channelRateLimitInfo
+	if httpResp != nil {
+		rateLimit = extractChannelRateLimitInfo(channel, info.UpstreamModelName, httpResp.Header)
+	}
 	usageA, respErr := adaptor.DoResponse(c, httpResp, info)
 	if respErr != nil {
 		return testResult{
@@ -512,7 +816,7 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 		ChannelId:        channel.Id,
 		PromptTokens:     usage.PromptTokens,
 		CompletionTokens: usage.CompletionTokens,
-		ModelName:        info.OriginModelName,
+		ModelName:        info.GetDisplayModelName(),
 		TokenName:        "模型测试",
 		Quota:            quota,
 		Content:          "模型测试",
@@ -527,6 +831,267 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 		context:     c,
 		localErr:    nil,
 		newAPIError: nil,
+		rateLimit:   rateLimit,
+	}
+}
+
+func buildTestVideoRequestBody(modelName string) ([]byte, error) {
+	body := map[string]any{
+		"model":  modelName,
+		"prompt": "A short cinematic video of a cat walking through a garden.",
+	}
+
+	lowerModel := strings.ToLower(strings.TrimSpace(modelName))
+	if common.IsVolcEngine3DGenerationModel(modelName) {
+		body["prompt"] = "Create a simple 3D model from the reference image."
+		body["image_url"] = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/JPEG_example_flower.jpg/320px-JPEG_example_flower.jpg"
+	} else if strings.Contains(lowerModel, "i2v") {
+		body["image_url"] = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/JPEG_example_flower.jpg/320px-JPEG_example_flower.jpg"
+	} else if strings.Contains(lowerModel, "flf2v") {
+		body["images"] = []string{
+			"https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/JPEG_example_flower.jpg/320px-JPEG_example_flower.jpg",
+			"https://upload.wikimedia.org/wikipedia/commons/thumb/a/a9/Example.jpg/320px-Example.jpg",
+		}
+	}
+	switch {
+	case strings.HasPrefix(lowerModel, "sora-"):
+		body["seconds"] = "4"
+		body["size"] = "720x1280"
+	case strings.HasPrefix(lowerModel, "veo-"):
+		body["duration"] = 8
+		body["size"] = "1280x720"
+	}
+
+	return common.Marshal(body)
+}
+
+func taskErrorToTestResult(c *gin.Context, taskErr *dto.TaskError) testResult {
+	if taskErr == nil {
+		return testResult{context: c}
+	}
+	message := taskErr.Message
+	if message == "" && taskErr.Error != nil {
+		message = taskErr.Error.Error()
+	}
+	if message == "" {
+		message = taskErr.Code
+	}
+	if message == "" {
+		message = "task request failed"
+	}
+	return testResult{
+		context:     c,
+		localErr:    errors.New(message),
+		newAPIError: service.TaskErrorToAPIError(taskErr),
+	}
+}
+
+func applyTaskTestOtherRatios(info *relaycommon.RelayInfo, ratios map[string]float64) {
+	if info == nil || len(ratios) == 0 {
+		return
+	}
+	for key, ratio := range ratios {
+		info.PriceData.AddOtherRatio(key, ratio)
+	}
+	if common.StringsContains(constant.TaskPricePatches, info.OriginModelName) {
+		return
+	}
+	for _, ratio := range info.PriceData.OtherRatios {
+		if ratio != 1.0 {
+			info.PriceData.Quota = int(float64(info.PriceData.Quota) * ratio)
+		}
+	}
+}
+
+func buildTaskTestLogOther(info *relaycommon.RelayInfo, taskID, requestPath string) map[string]interface{} {
+	other := map[string]interface{}{
+		"is_task":      true,
+		"request_path": requestPath,
+		"task_id":      taskID,
+		"model_price":  info.PriceData.ModelPrice,
+	}
+	if info.PriceData.ModelRatio > 0 {
+		other["model_ratio"] = info.PriceData.ModelRatio
+	}
+	other["group_ratio"] = info.PriceData.GroupRatioInfo.GroupRatio
+	if info.PriceData.GroupRatioInfo.HasSpecialRatio {
+		other["user_group_ratio"] = info.PriceData.GroupRatioInfo.GroupSpecialRatio
+	}
+	for key, ratio := range info.PriceData.OtherRatios {
+		other[key] = ratio
+	}
+	if info.ShouldExposeModelMapping() {
+		other["is_model_mapped"] = true
+		other["upstream_model_name"] = info.UpstreamModelName
+	}
+	return other
+}
+
+func testTaskChannel(c *gin.Context, channel *model.Channel, testModel string, tik time.Time) testResult {
+	taskEndpointType := constant.EndpointTypeOpenAIVideo
+	var jsonData []byte
+	var err error
+	if channel.Type == constant.ChannelTypeGMICloud && gmicloud.IsBatchModel(testModel) {
+		taskEndpointType = constant.EndpointTypeBatchGeneration
+		jsonData, err = common.Marshal(map[string]any{
+			"model": testModel,
+			"payload": map[string]any{
+				"model":      "gemini-3-flash-preview",
+				"input_data": `{"request":{"contents":[{"role":"user","parts":[{"text":"Reply only with the number 4."}]}]}}`,
+			},
+		})
+	} else {
+		jsonData, err = buildTestVideoRequestBody(testModel)
+	}
+	if err != nil {
+		return testResult{
+			context:     c,
+			localErr:    err,
+			newAPIError: types.NewError(err, types.ErrorCodeJsonMarshalFailed),
+		}
+	}
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(jsonData))
+	c.Request.ContentLength = int64(len(jsonData))
+
+	info, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
+	if err != nil {
+		return testResult{
+			context:     c,
+			localErr:    err,
+			newAPIError: types.NewError(err, types.ErrorCodeGenRelayInfoFailed),
+		}
+	}
+	info.IsChannelTest = true
+	info.InitChannelMeta(c)
+	if info.TaskRelayInfo == nil {
+		info.TaskRelayInfo = &relaycommon.TaskRelayInfo{}
+	}
+	if info.PublicTaskID == "" {
+		info.PublicTaskID = model.GenerateTaskID()
+	}
+
+	platform := relay.GetTaskPlatform(c)
+	adaptor := relay.GetTaskAdaptor(platform)
+	if adaptor == nil {
+		err := fmt.Errorf("invalid api platform: %s", platform)
+		taskErr := service.TaskErrorWrapperLocal(err, "invalid_api_platform", http.StatusBadRequest)
+		return taskErrorToTestResult(c, taskErr)
+	}
+	adaptor.Init(info)
+	if taskErr := adaptor.ValidateRequestAndSetAction(c, info); taskErr != nil {
+		return taskErrorToTestResult(c, taskErr)
+	}
+
+	modelName := info.OriginModelName
+	if modelName == "" {
+		modelName = service.CoverTaskActionToModelName(platform, info.Action)
+	}
+	info.OriginModelName = modelName
+	info.UpstreamModelName = modelName
+	if err := helper.ModelMappedHelper(c, info, nil); err != nil {
+		taskErr := service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
+		return taskErrorToTestResult(c, taskErr)
+	}
+
+	priceData, err := helper.ModelPriceHelperPerCall(c, info)
+	if err != nil {
+		return testResult{
+			context:     c,
+			localErr:    err,
+			newAPIError: types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest)),
+		}
+	}
+	info.PriceData = priceData
+	applyTaskTestOtherRatios(info, adaptor.EstimateBilling(c, info))
+
+	requestBody, err := adaptor.BuildRequestBody(c, info)
+	if err != nil {
+		taskErr := service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
+		return taskErrorToTestResult(c, taskErr)
+	}
+
+	reservation, reserveErr := reserveChannelDailySuccess(channel)
+	if reserveErr != nil {
+		return testResult{
+			context:     c,
+			localErr:    reserveErr.Err,
+			newAPIError: reserveErr,
+		}
+	}
+	testSucceeded := false
+	defer func() {
+		if !testSucceeded {
+			model.ReleaseChannelDailySuccess(reservation)
+		}
+	}()
+
+	resp, err := adaptor.DoRequest(c, info, requestBody)
+	if err != nil {
+		return testResult{
+			context:     c,
+			localErr:    err,
+			newAPIError: types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError),
+		}
+	}
+	if resp == nil {
+		err := errors.New("empty upstream response")
+		return testResult{
+			context:     c,
+			localErr:    err,
+			newAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
+		}
+	}
+	if resp != nil && resp.StatusCode != http.StatusOK {
+		err := service.RelayErrorHandler(c.Request.Context(), resp, false)
+		common.SysError(fmt.Sprintf(
+			"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
+			channel.Id,
+			channel.Name,
+			channel.Type,
+			testModel,
+			taskEndpointType,
+			resp.StatusCode,
+			err,
+		))
+		return testResult{
+			context:     c,
+			localErr:    err,
+			newAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
+		}
+	}
+
+	rateLimit := extractChannelRateLimitInfo(channel, info.UpstreamModelName, resp.Header)
+	taskID, _, taskErr := adaptor.DoResponse(c, resp, info)
+	if taskErr != nil {
+		return taskErrorToTestResult(c, taskErr)
+	}
+
+	tok := time.Now()
+	milliseconds := tok.Sub(tik).Milliseconds()
+	consumedTime := float64(milliseconds) / 1000.0
+	userID := info.UserId
+	if userID == 0 {
+		userID = 1
+	}
+	model.RecordConsumeLog(c, userID, model.RecordConsumeLogParams{
+		ChannelId:      channel.Id,
+		ModelName:      info.GetDisplayModelName(),
+		TokenName:      "模型测试",
+		Quota:          info.PriceData.Quota,
+		Content:        "模型测试",
+		TokenId:        info.TokenId,
+		UseTimeSeconds: int(consumedTime),
+		IsStream:       false,
+		Group:          info.UsingGroup,
+		Other:          buildTaskTestLogOther(info, taskID, c.Request.URL.Path),
+	})
+	common.SysLog(fmt.Sprintf("testing channel #%d, task id: %s", channel.Id, taskID))
+	testSucceeded = true
+	return testResult{
+		context:     c,
+		localErr:    nil,
+		newAPIError: nil,
+		rateLimit:   rateLimit,
 	}
 }
 
@@ -715,12 +1280,19 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 			return buildTestEmbeddingRequest(model, channel)
 		case constant.EndpointTypeImageGeneration:
 			// 返回 ImageRequest
-			return &dto.ImageRequest{
+			imageRequest := &dto.ImageRequest{
 				Model:  model,
 				Prompt: "a cute cat",
 				N:      lo.ToPtr(uint(1)),
 				Size:   "1024x1024",
 			}
+			if channel != nil && channel.Type == constant.ChannelTypeVolcEngine && common.IsVolcEngineImageGenerationModel(model) {
+				imageRequest.Size = "2K"
+				if strings.Contains(strings.ToLower(model), "seededit") {
+					imageRequest.Image = json.RawMessage(`"https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/JPEG_example_flower.jpg/320px-JPEG_example_flower.jpg"`)
+				}
+			}
+			return imageRequest
 		case constant.EndpointTypeJinaRerank, constant.EndpointTypeCohereRerank:
 			// 返回 RerankRequest
 			return &dto.RerankRequest{
@@ -741,6 +1313,19 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 			return &dto.OpenAIResponsesCompactionRequest{
 				Model: model,
 				Input: testResponsesInput,
+			}
+		case constant.EndpointTypeAudioSpeech:
+			return &dto.AudioRequest{
+				Model:          model,
+				Input:          "你好，这是一次渠道测试。",
+				Voice:          "cmn-CN-Wavenet-A",
+				ResponseFormat: "mp3",
+			}
+		case constant.EndpointTypeAudioTranscription:
+			return &dto.AudioRequest{
+				Model:          model,
+				ResponseFormat: "json",
+				Metadata:       json.RawMessage(`{"gcp":{"audio":{"content":"UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA="},"config":{"encoding":"LINEAR16","languageCode":"cmn-Hans-CN"},"native_response":false}}`),
 			}
 		case constant.EndpointTypeAnthropic, constant.EndpointTypeGemini, constant.EndpointTypeOpenAI, constant.EndpointTypeCohereChat:
 			// 返回 GeneralOpenAIRequest
@@ -783,6 +1368,15 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 		strings.Contains(strings.ToLower(model), "embed") {
 		// 返回 EmbeddingRequest
 		return buildTestEmbeddingRequest(model, channel)
+	}
+
+	if common.IsImageGenerationModel(model) {
+		return &dto.ImageRequest{
+			Model:  model,
+			Prompt: "a cute cat",
+			N:      lo.ToPtr(uint(1)),
+			Size:   "1024x1024",
+		}
 	}
 
 	// Responses compaction models (must use /v1/responses/compact)
@@ -901,11 +1495,15 @@ func TestChannel(c *gin.Context) {
 		})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"success": true,
 		"message": "",
 		"time":    consumedTime,
-	})
+	}
+	if result.rateLimit != nil {
+		resp["rate_limit"] = result.rateLimit
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 var testAllChannelsLock sync.Mutex

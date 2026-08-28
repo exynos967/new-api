@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import {
   Button,
@@ -44,11 +44,13 @@ import {
 import {
   Activity,
   AlertTriangle,
+  Ban,
   Bot,
   CheckCircle2,
   Copy as CopyIcon,
   CreditCard,
   Database,
+  Eye,
   ExternalLink,
   Gift,
   Globe2,
@@ -59,11 +61,10 @@ import {
   Save,
   Search,
   ShieldCheck,
-  Sparkles,
+  Trash2,
   UserCog,
   X,
 } from 'lucide-react';
-import { VChart } from '@visactor/react-vchart';
 import dayjs from 'dayjs';
 import {
   API,
@@ -71,6 +72,7 @@ import {
   getCurrencyConfig,
   getModelCategories,
   getServerAddress,
+  isRoot,
   renderGroupOption,
   selectFilter,
   showError,
@@ -80,12 +82,16 @@ import {
   displayAmountToQuota,
   quotaToDisplayAmount,
 } from '../../helpers/quota';
+import {
+  GroupBalanceCard,
+  GroupTransferCard,
+} from './components/SiteGroupTools';
 
 const { Title, Text } = Typography;
 
 const SECTIONS = [
-  { id: 'dashboard', label: '增强仪表盘', icon: Sparkles },
-  { id: 'redemptions', label: '兑换码增强', icon: Gift },
+  { id: 'redemptions', label: '兑换码管理', icon: Gift },
+  { id: 'registration-codes', label: '注册码管理', icon: KeyRound },
   { id: 'users', label: '用户增强', icon: UserCog },
   { id: 'tokens', label: '令牌审计', icon: ShieldCheck },
   { id: 'risk', label: '风控中心', icon: ShieldCheck },
@@ -96,7 +102,12 @@ const SECTIONS = [
 ];
 
 const ENHANCEMENTS_BASE_PATH = '/console/enhancements';
+const DEFAULT_SECTION = 'redemptions';
 const sectionIds = new Set(SECTIONS.map((section) => section.id));
+const getSectionFromSearch = (search) => {
+  const tab = new URLSearchParams(search).get('tab');
+  return sectionIds.has(tab) ? tab : DEFAULT_SECTION;
+};
 const MODEL_STATUS_PUBLIC_PATH = '/model-status';
 const MODEL_STATUS_WINDOWS = [
   { label: '今日', value: 'today' },
@@ -108,6 +119,7 @@ const MODEL_STATUS_SORT_OPTIONS = [
   { label: '请求次数降序', value: 'requests_desc' },
   { label: '成功率升序', value: 'success_rate_asc' },
 ];
+const DEFAULT_TABLE_QUERY = { sort: '', order: 'desc', filters: {} };
 
 const MODEL_STATUS_META = {
   green: {
@@ -145,9 +157,19 @@ const FIELD_LABELS = {
   status: '状态',
   disable_reason: '禁用原因',
   email: '邮箱',
+  github_id: 'GitHub ID',
+  github_login: 'GitHub 用户名',
+  github_account_created_at: 'GitHub 账号注册时间',
+  github_account_age_seconds: 'GitHub 账号年龄（秒）',
+  minimum_age_seconds: '账号年龄阈值（秒）',
+  user_id_start: '用户 ID 起始',
+  user_id_end: '用户 ID 结束',
   group: '分组',
   key: '密钥',
+  code: '注册码',
   name: '名称',
+  message: '消息',
+  reason: '原因',
   total: '总数',
   total_count: '总数',
   enabled: '启用',
@@ -176,13 +198,28 @@ const FIELD_LABELS = {
   used_user_id: '使用用户 ID',
   used_username: '兑换用户名',
   inviter_id: '邀请人 ID',
+  aff_code: '邀请码',
   aff_count: '邀请数',
+  redemption_count: '兑换码数',
+  redemption_codes: '兑换码',
   linux_do_id: 'LinuxDO ID',
   model_name: '模型',
   models: '模型',
   channels: '渠道数',
   tokens: '令牌数',
   redemptions: '兑换码数',
+  registration_codes: '注册码数',
+  max_uses: '总成功注册上限',
+  used_count: '成功注册人数',
+  open_time: '开启时间',
+  end_time: '结束时间',
+  last_used_time: '最后使用时间',
+  registration_code_required: '强制注册码注册',
+  invite_code_required: '强制邀请码注册',
+  force_active: '强制已生效',
+  not_open: '未开启',
+  expired: '已结束',
+  exhausted: '已用尽',
   users: '用户',
   last_24h: '最近 24 小时',
   generated_at: '生成时间',
@@ -195,14 +232,22 @@ const FIELD_LABELS = {
   site_title: '站点标题',
   theme: '主题',
   public_embed_enabled: '公开嵌入',
-  show_zero_request_models: '展示0请求次数的模型',
+  model_status_request_count_hide_threshold: '低请求隐藏阈值',
   public: '公开',
   window: '时间窗口',
   start: '开始时间',
   end: '结束时间',
   total_users: '用户总数',
+  total_candidates: '候选账号数',
   active_users: '活跃用户',
   disabled_users: '禁用用户',
+  checked: '已检查',
+  matched: '命中',
+  banned: '已封禁',
+  skipped: '跳过',
+  failures: '失败',
+  rate_limited: '限流',
+  rate_limit_reset: '限流重置时间',
   token_id: '令牌 ID',
   token_name: '令牌名称',
   model_limits_enabled: '模型限制',
@@ -262,6 +307,16 @@ const REDEMPTION_STATUS_META = {
   [REDEMPTION_STATUS.USED]: { color: 'grey', text: '已兑换' },
 };
 
+const REGISTRATION_CODE_STATUS = {
+  ENABLED: 1,
+  DISABLED: 2,
+};
+
+const REGISTRATION_CODE_STATUS_META = {
+  [REGISTRATION_CODE_STATUS.ENABLED]: { color: 'green', text: '已启用' },
+  [REGISTRATION_CODE_STATUS.DISABLED]: { color: 'red', text: '已禁用' },
+};
+
 const TOKEN_STATUS = {
   ENABLED: 1,
   DISABLED: 2,
@@ -276,22 +331,51 @@ const TOKEN_STATUS_META = {
   [TOKEN_STATUS.EXHAUSTED]: { color: 'grey', text: '已耗尽' },
 };
 
+const USER_STATUS = {
+  ENABLED: 1,
+  DISABLED: 2,
+  DELETED: 3,
+};
+
+const USER_STATUS_TEXT = {
+  [USER_STATUS.ENABLED]: '已启用',
+  [USER_STATUS.DISABLED]: '已禁用',
+  [USER_STATUS.DELETED]: '已注销',
+};
+
 const USER_PREVIEW_KEYS = [
   'id',
   'username',
   'display_name',
   'status',
   'email',
+  'github_id',
   'quota',
   'used_quota',
   'today_request_count',
   'today_used_tokens',
   'request_count',
   'group',
+  'aff_code',
   'inviter_id',
   'aff_count',
+  'redemption_count',
+  'redemption_codes',
   'linux_do_id',
 ];
+
+const GITHUB_AGE_BAN_PREVIEW_KEYS = [
+  'id',
+  'username',
+  'github_id',
+  'github_login',
+  'github_account_created_at',
+  'github_account_age_seconds',
+  'email',
+];
+
+const GITHUB_AGE_BAN_ISSUE_KEYS = ['id', 'username', 'github_id', 'reason'];
+const GITHUB_AGE_BAN_FAILURE_KEYS = ['id', 'username', 'github_id', 'message'];
 
 function unwrap(res) {
   if (!res?.data?.success) {
@@ -325,6 +409,24 @@ function formatStatusPercent(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return '100.0%';
   return `${number.toFixed(1)}%`;
+}
+
+function formatRecentFirstResponseTime(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return '-';
+  return `${(number / 1000).toFixed(1)} s`;
+}
+
+function formatRecentOutputTokenSpeed(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return '-';
+  if (number >= 10) {
+    return `${Math.round(number)}t/s`;
+  }
+  if (number >= 1) {
+    return `${number.toFixed(1).replace(/\.0$/, '')}t/s`;
+  }
+  return `${number.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')}t/s`;
 }
 
 function getModelStatusMeta(status) {
@@ -363,6 +465,29 @@ function getModelStatusThreshold(config = {}, key, fallback) {
   const value = Number(config[key]);
   if (!Number.isFinite(value)) return fallback;
   return Math.min(100, Math.max(1, value));
+}
+
+function getModelStatusRequestCountHideThreshold(config = {}) {
+  const value = Number(
+    config.model_status_request_count_hide_threshold ??
+      config.request_count_hide_threshold ??
+      2,
+  );
+  if (!Number.isFinite(value)) return 2;
+  return Math.min(1000000, Math.max(0, Math.round(value)));
+}
+
+function formatModelStatusIgnoredErrorKeywords(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => String(item || '').trim())
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  return '';
 }
 
 function modelStatusWindowToMinutes(windowValue) {
@@ -449,11 +574,228 @@ function formatValue(value, key = '', t = (text) => text) {
   return String(value);
 }
 
+function hasDeletedAt(record = {}) {
+  const deletedAt = record?.DeletedAt ?? record?.deleted_at;
+  if (!deletedAt) return false;
+  if (typeof deletedAt === 'object' && 'Valid' in deletedAt) {
+    return Boolean(deletedAt.Valid);
+  }
+  return true;
+}
+
+function formatUserStatus(value, t = (text) => text, record = {}) {
+  if (hasDeletedAt(record)) {
+    return t('已注销');
+  }
+  return t(USER_STATUS_TEXT[value] || '未知状态');
+}
+
+function formatGitHubAgeBanUserIDRange(start, end, t = (text) => text) {
+  if (start > 0 && end > 0) {
+    return `${formatNumber(start)} - ${formatNumber(end)}`;
+  }
+  if (start > 0) {
+    return `>= ${formatNumber(start)}`;
+  }
+  if (end > 0) {
+    return `<= ${formatNumber(end)}`;
+  }
+  return t('不限制');
+}
+
 function pickItems(data) {
   if (Array.isArray(data)) return data;
   if (Array.isArray(data?.items)) return data.items;
   if (Array.isArray(data?.candidates)) return data.candidates;
   return [];
+}
+
+async function copyCellValue(value, t = (text) => text) {
+  const text =
+    value === null || typeof value === 'undefined' ? '' : String(value);
+  if (!text) return;
+  if (await copy(text)) {
+    showSuccess(t('复制成功'));
+  } else {
+    showError(t('无法复制到剪贴板，请手动复制'));
+  }
+}
+
+function copyableCell(content, value, t, className = '') {
+  return (
+    <button
+      type='button'
+      className={`max-w-full cursor-pointer rounded px-1 py-0.5 text-left break-words transition-colors hover:bg-semi-color-fill-0 active:bg-semi-color-fill-1 ${className}`}
+      style={{ background: 'transparent', border: 0, color: 'inherit' }}
+      title={String(value ?? '')}
+      onClick={(event) => {
+        event.stopPropagation();
+        copyCellValue(value, t);
+      }}
+    >
+      {content}
+    </button>
+  );
+}
+
+function tableTextValue(
+  value,
+  key = '',
+  t = (text) => text,
+  formatter,
+  record,
+) {
+  const formatted = formatter
+    ? formatter(value, key, t, record)
+    : formatValue(value, key, t);
+  if (React.isValidElement(formatted)) {
+    return value === null || typeof value === 'undefined' ? '' : String(value);
+  }
+  return formatted === null || typeof formatted === 'undefined'
+    ? ''
+    : String(formatted);
+}
+
+function appendTableQueryParams(params, tableQuery = {}) {
+  if (tableQuery.keyword?.trim()) {
+    params.set('keyword', tableQuery.keyword.trim());
+  }
+  if (tableQuery.sort) {
+    params.set('sort', tableQuery.sort);
+    params.set('order', tableQuery.order || 'desc');
+  }
+  Object.entries(tableQuery.filters || {}).forEach(([key, value]) => {
+    const text = String(value || '').trim();
+    if (text) {
+      params.set(`filter_${key}`, text);
+    }
+  });
+}
+
+function appendObjectTableQueryParams(params, tableQuery = {}) {
+  if (tableQuery.keyword?.trim()) {
+    params.keyword = tableQuery.keyword.trim();
+  }
+  if (tableQuery.sort) {
+    params.sort = tableQuery.sort;
+    params.order = tableQuery.order || 'desc';
+  }
+  Object.entries(tableQuery.filters || {}).forEach(([key, value]) => {
+    const text = String(value || '').trim();
+    if (text) {
+      params[`filter_${key}`] = text;
+    }
+  });
+}
+
+function queryFromTableChange(changeInfo, currentQuery = {}) {
+  const nextQuery = {
+    ...currentQuery,
+    filters: { ...(currentQuery.filters || {}) },
+  };
+  const sorter = changeInfo?.sorter;
+  if (sorter?.dataIndex) {
+    if (sorter.sortOrder) {
+      nextQuery.sort = sorter.dataIndex;
+      nextQuery.order = sorter.sortOrder === 'ascend' ? 'asc' : 'desc';
+    } else if (nextQuery.sort === sorter.dataIndex) {
+      nextQuery.sort = '';
+      nextQuery.order = 'desc';
+    }
+  }
+  (changeInfo?.filters || []).forEach((filter) => {
+    const key = filter?.dataIndex;
+    if (!key) return;
+    const value = filter.filteredValue?.[0];
+    if (value === null || typeof value === 'undefined' || value === '') {
+      delete nextQuery.filters[key];
+      return;
+    }
+    nextQuery.filters[key] = String(value);
+  });
+  return nextQuery;
+}
+
+function renderTableFilterDropdown(t) {
+  return ({ tempFilteredValue, setTempFilteredValue, confirm, clear }) => (
+    <div className='p-3 w-56' onClick={(event) => event.stopPropagation()}>
+      <Input
+        size='small'
+        value={tempFilteredValue?.[0] || ''}
+        placeholder={t('输入筛选值')}
+        showClear
+        onChange={(value) => setTempFilteredValue(value ? [value] : [])}
+        onEnterPress={() => confirm({ closeDropdown: true })}
+      />
+      <Space className='mt-2'>
+        <Button
+          size='small'
+          type='primary'
+          onClick={() => confirm({ closeDropdown: true })}
+        >
+          {t('筛选')}
+        </Button>
+        <Button size='small' onClick={() => clear({ closeDropdown: true })}>
+          {t('重置')}
+        </Button>
+      </Space>
+    </div>
+  );
+}
+
+function enhanceTableColumns(columns, options = {}) {
+  const {
+    t = (text) => text,
+    tableQuery = {},
+    valueFormatter,
+    copyable = true,
+  } = options;
+  const activeFilters = tableQuery.filters || {};
+  return columns.map((column) => {
+    if (column.children) {
+      return {
+        ...column,
+        children: enhanceTableColumns(column.children, options),
+      };
+    }
+    const key = column.dataIndex || column.key;
+    if (!key || key === 'operate') {
+      return column;
+    }
+    return {
+      ...column,
+      key,
+      sorter: column.sorter || true,
+      sortOrder:
+        tableQuery.sort === key
+          ? tableQuery.order === 'asc'
+            ? 'ascend'
+            : 'descend'
+          : false,
+      filteredValue: activeFilters[key] ? [activeFilters[key]] : [],
+      renderFilterDropdown: renderTableFilterDropdown(t),
+      onFilter: (filteredValue, record) =>
+        tableTextValue(record?.[key], key, t, valueFormatter, record)
+          .toLowerCase()
+          .includes(String(filteredValue || '').toLowerCase()),
+      render: (value, record, index, renderOptions) => {
+        const rendered = column.render
+          ? column.render(value, record, index, renderOptions)
+          : tableTextValue(value, key, t, valueFormatter, record);
+        if (!copyable || column.copyable === false) {
+          return rendered;
+        }
+        if (React.isValidElement(rendered) && rendered.type === 'button') {
+          return rendered;
+        }
+        const copyValue =
+          typeof column.copyValue === 'function'
+            ? column.copyValue(value, record)
+            : tableTextValue(value, key, t, valueFormatter, record);
+        return copyableCell(rendered, copyValue, t, column.copyClassName || '');
+      },
+    };
+  });
 }
 
 function SummaryGrid({ data }) {
@@ -480,9 +822,17 @@ function SummaryGrid({ data }) {
           <Text type='secondary' size='small'>
             {formatFieldLabel(key, t)}
           </Text>
-          <div className='text-2xl font-semibold mt-2 text-semi-color-text-0 break-words'>
-            {formatValue(value, key, t)}
-          </div>
+          <button
+            type='button'
+            className='block w-full cursor-pointer rounded text-left transition-colors hover:bg-semi-color-fill-0'
+            style={{ background: 'transparent', border: 0, padding: 0 }}
+            title={tableTextValue(value, key, t)}
+            onClick={() => copyCellValue(tableTextValue(value, key, t), t)}
+          >
+            <div className='text-2xl font-semibold mt-2 text-semi-color-text-0 break-words'>
+              {formatValue(value, key, t)}
+            </div>
+          </button>
         </Card>
       ))}
     </div>
@@ -496,13 +846,18 @@ function DataPreview({
   valueFormatter,
   pagination = false,
   loading = false,
+  tableQuery,
+  onTableQueryChange,
 }) {
   const { t } = useTranslation();
+  const [localQuery, setLocalQuery] = useState({
+    sort: '',
+    order: 'desc',
+    filters: {},
+  });
+  const activeQuery = tableQuery || localQuery;
   const rawRows = pickItems(data);
   const rows = typeof limit === 'number' ? rawRows.slice(0, limit) : rawRows;
-  if (rows.length === 0) {
-    return <Empty image={<></>} title={t('暂无数据')} />;
-  }
 
   const keys =
     preferredKeys ||
@@ -514,78 +869,84 @@ function DataPreview({
     ).slice(0, 8);
   const renderValue = valueFormatter || formatValue;
 
+  const processedRows = useMemo(() => {
+    const filters = activeQuery.filters || {};
+    const filtered = rows.filter((row) =>
+      Object.entries(filters).every(([key, value]) => {
+        const text = String(value || '')
+          .trim()
+          .toLowerCase();
+        if (!text) return true;
+        return tableTextValue(row?.[key], key, t, renderValue, row)
+          .toLowerCase()
+          .includes(text);
+      }),
+    );
+    if (!activeQuery.sort) return filtered;
+    const sortKey = activeQuery.sort;
+    const desc = activeQuery.order !== 'asc';
+    return [...filtered].sort((a, b) => {
+      const left = a?.[sortKey];
+      const right = b?.[sortKey];
+      const leftNumber = Number(left);
+      const rightNumber = Number(right);
+      let result = 0;
+      if (
+        Number.isFinite(leftNumber) &&
+        Number.isFinite(rightNumber) &&
+        left !== '' &&
+        right !== ''
+      ) {
+        result =
+          leftNumber === rightNumber ? 0 : leftNumber > rightNumber ? 1 : -1;
+      } else {
+        result = String(left ?? '').localeCompare(String(right ?? ''));
+      }
+      return desc ? -result : result;
+    });
+  }, [activeQuery, renderValue, rows, t]);
+
   const columns = keys.map((key) => ({
     title: formatFieldLabel(key, t),
     dataIndex: key,
     key,
-    render: (value) => (
-      <span className='break-words text-sm'>{renderValue(value, key, t)}</span>
+    render: (value, record) => (
+      <span className='break-words text-sm'>
+        {renderValue(value, key, t, record)}
+      </span>
     ),
   }));
+  const tableColumns = enhanceTableColumns(columns, {
+    t,
+    tableQuery: activeQuery,
+    valueFormatter: renderValue,
+  });
+  const handleTableChange = (changeInfo) => {
+    const nextQuery = queryFromTableChange(changeInfo, activeQuery);
+    if (onTableQueryChange) {
+      onTableQueryChange(nextQuery);
+    } else {
+      setLocalQuery(nextQuery);
+    }
+  };
+  if (rows.length === 0) {
+    return <Empty image={<></>} title={t('暂无数据')} />;
+  }
 
   return (
     <Table
       size='small'
-      columns={columns}
-      dataSource={rows.map((row, index) => ({ ...row, _rowKey: index }))}
+      columns={tableColumns}
+      dataSource={processedRows.map((row, index) => ({
+        ...row,
+        _rowKey: index,
+      }))}
       rowKey='_rowKey'
       pagination={pagination}
       loading={loading}
       scroll={{ x: 'max-content' }}
+      onChange={handleTableChange}
     />
-  );
-}
-
-function DashboardPanel({ data }) {
-  const overview = data?.overview || {};
-  const trend = data?.trend || [];
-  const topUsers = data?.topUsers || [];
-  const modelUsage = data?.models || [];
-
-  const spec = useMemo(
-    () => ({
-      type: 'line',
-      data: {
-        values: trend.map((item) => ({
-          time: item.time,
-          requests: item.requests,
-          quota: item.quota,
-        })),
-      },
-      xField: 'time',
-      yField: 'requests',
-      point: { visible: true },
-      line: { style: { curveType: 'monotone' } },
-      axes: [
-        { orient: 'bottom', label: { autoHide: true } },
-        { orient: 'left' },
-      ],
-      tooltip: { visible: true },
-    }),
-    [trend],
-  );
-
-  return (
-    <div className='space-y-4'>
-      <SummaryGrid data={overview.last_24h || overview} />
-      <Card title='调用趋势' className='!rounded-lg'>
-        <div className='h-72'>
-          {trend.length > 0 ? (
-            <VChart spec={spec} />
-          ) : (
-            <Empty title='暂无趋势数据' />
-          )}
-        </div>
-      </Card>
-      <div className='grid grid-cols-1 xl:grid-cols-2 gap-4'>
-        <Card title='高用量用户' className='!rounded-lg'>
-          <DataPreview data={topUsers} />
-        </Card>
-        <Card title='模型用量' className='!rounded-lg'>
-          <DataPreview data={modelUsage} />
-        </Card>
-      </div>
-    </div>
   );
 }
 
@@ -608,10 +969,84 @@ function renderRedemptionStatus(record, t) {
   return <Tag color={meta.color}>{t(meta.text)}</Tag>;
 }
 
+function redemptionStatusText(record, t) {
+  if (isRedemptionExpired(record)) {
+    return t('已过期');
+  }
+  const meta = REDEMPTION_STATUS_META[record?.status] || {
+    text: '未知',
+  };
+  return t(meta.text);
+}
+
 function redemptionUserText(record) {
   if (!record?.used_user_id) return '-';
   const username = record.used_username || '-';
   return `${username} (#${record.used_user_id})`;
+}
+
+function timestampToDateValue(timestamp) {
+  const value = Number(timestamp || 0);
+  return value > 0 ? dayjs.unix(value).toDate() : undefined;
+}
+
+function dateValueToTimestamp(value) {
+  if (!value) return 0;
+  const parsed = dayjs(value);
+  return parsed.isValid() ? parsed.unix() : 0;
+}
+
+function isRegistrationCodeNotOpen(record) {
+  return (
+    record?.status === REGISTRATION_CODE_STATUS.ENABLED &&
+    Number(record.open_time || 0) > Math.floor(Date.now() / 1000)
+  );
+}
+
+function isRegistrationCodeEnded(record) {
+  return (
+    record?.status === REGISTRATION_CODE_STATUS.ENABLED &&
+    Number(record.end_time || 0) > 0 &&
+    Number(record.end_time || 0) < Math.floor(Date.now() / 1000)
+  );
+}
+
+function isRegistrationCodeExhausted(record) {
+  return (
+    Number(record?.max_uses || 0) > 0 &&
+    Number(record?.used_count || 0) >= Number(record?.max_uses || 0)
+  );
+}
+
+function renderRegistrationCodeStatus(record, t) {
+  if (record?.status === REGISTRATION_CODE_STATUS.ENABLED) {
+    if (isRegistrationCodeEnded(record)) {
+      return <Tag color='orange'>{t('已结束')}</Tag>;
+    }
+    if (isRegistrationCodeNotOpen(record)) {
+      return <Tag color='orange'>{t('未开启')}</Tag>;
+    }
+    if (isRegistrationCodeExhausted(record)) {
+      return <Tag color='grey'>{t('已用尽')}</Tag>;
+    }
+  }
+  const meta = REGISTRATION_CODE_STATUS_META[record?.status] || {
+    color: 'black',
+    text: '未知',
+  };
+  return <Tag color={meta.color}>{t(meta.text)}</Tag>;
+}
+
+function registrationCodeStatusText(record, t) {
+  if (record?.status === REGISTRATION_CODE_STATUS.ENABLED) {
+    if (isRegistrationCodeEnded(record)) return t('已结束');
+    if (isRegistrationCodeNotOpen(record)) return t('未开启');
+    if (isRegistrationCodeExhausted(record)) return t('已用尽');
+  }
+  const meta = REGISTRATION_CODE_STATUS_META[record?.status] || {
+    text: '未知',
+  };
+  return t(meta.text);
 }
 
 function renderTokenStatus(status, t) {
@@ -647,6 +1082,7 @@ function RedemptionsPanel({ data }) {
     data?.list || { items: [], total: 0, page: 1, page_size: 20 },
   );
   const [filters, setFilters] = useState({ status: '0', keyword: '' });
+  const [tableQuery, setTableQuery] = useState(DEFAULT_TABLE_QUERY);
   const [pageSize, setPageSize] = useState(data?.list?.page_size || 20);
   const [listLoading, setListLoading] = useState(false);
   const [generated, setGenerated] = useState([]);
@@ -679,6 +1115,7 @@ function RedemptionsPanel({ data }) {
     page = 1,
     size = pageSize,
     nextFilters = filters,
+    nextTableQuery = tableQuery,
   ) => {
     setListLoading(true);
     try {
@@ -693,6 +1130,7 @@ function RedemptionsPanel({ data }) {
       if (keyword) {
         params.set('keyword', keyword);
       }
+      appendTableQueryParams(params, nextTableQuery);
       const nextList = await API.get(
         `/api/enhancements/redemptions?${params.toString()}`,
       ).then(unwrap);
@@ -739,6 +1177,32 @@ function RedemptionsPanel({ data }) {
     }
   };
 
+  const copyCellValue = async (value) => {
+    const text =
+      value === null || typeof value === 'undefined' ? '' : String(value);
+    if (!text) return;
+    if (await copy(text)) {
+      showSuccess(t('复制成功'));
+    } else {
+      showError(t('无法复制到剪贴板，请手动复制'));
+    }
+  };
+
+  const renderCopyableCell = (content, value, className = '') => (
+    <button
+      type='button'
+      className={`max-w-full cursor-pointer rounded px-1 py-0.5 text-left break-words transition-colors hover:bg-semi-color-fill-0 active:bg-semi-color-fill-1 ${className}`}
+      style={{ background: 'transparent', border: 0, color: 'inherit' }}
+      title={String(value ?? '')}
+      onClick={(event) => {
+        event.stopPropagation();
+        copyCellValue(value);
+      }}
+    >
+      {content}
+    </button>
+  );
+
   const generate = () => {
     Modal.confirm({
       title: t('生成兑换码'),
@@ -770,58 +1234,85 @@ function RedemptionsPanel({ data }) {
       title: t('ID'),
       dataIndex: 'id',
       width: 80,
+      render: (value) => renderCopyableCell(value, value),
     },
     {
       title: t('名称'),
       dataIndex: 'name',
       width: 160,
+      render: (value) => renderCopyableCell(value || '-', value || '-'),
     },
     {
       title: t('兑换码'),
       dataIndex: 'key',
-      width: 180,
-      render: (value) => <span className='font-mono text-xs'>{value}</span>,
+      width: 260,
+      render: (value) =>
+        renderCopyableCell(
+          value || '-',
+          value || '-',
+          'font-mono text-xs break-all',
+        ),
     },
     {
       title: t('状态'),
       dataIndex: 'status',
       width: 110,
-      render: (_, record) => renderRedemptionStatus(record, t),
+      render: (_, record) =>
+        renderCopyableCell(
+          renderRedemptionStatus(record, t),
+          redemptionStatusText(record, t),
+        ),
     },
     {
       title: t('金额'),
       dataIndex: 'quota',
       width: 130,
-      render: (value) => (
-        <Tag color='blue' shape='circle'>
-          {formatDisplayAmount(value, currency)}
-        </Tag>
-      ),
+      render: (value) => {
+        const amountText = formatDisplayAmount(value, currency);
+        return renderCopyableCell(
+          <Tag color='blue' shape='circle'>
+            {amountText}
+          </Tag>,
+          amountText,
+        );
+      },
     },
     {
       title: t('兑换用户'),
       dataIndex: 'used_username',
       width: 180,
-      render: (_, record) => redemptionUserText(record),
+      render: (_, record) => {
+        const text = redemptionUserText(record);
+        return renderCopyableCell(text, text);
+      },
     },
     {
       title: t('兑换时间'),
       dataIndex: 'redeemed_time',
       width: 180,
-      render: (value) => formatValue(value, 'redeemed_time', t),
+      render: (value) => {
+        const text = formatValue(value, 'redeemed_time', t);
+        return renderCopyableCell(text, text);
+      },
     },
     {
       title: t('创建时间'),
       dataIndex: 'created_time',
       width: 180,
-      render: (value) => formatValue(value, 'created_time', t),
+      render: (value) => {
+        const text = formatValue(value, 'created_time', t);
+        return renderCopyableCell(text, text);
+      },
     },
     {
       title: t('过期时间'),
       dataIndex: 'expired_time',
       width: 180,
-      render: (value) =>
-        value === 0 ? t('永不过期') : formatValue(value, 'expired_time', t),
+      render: (value) => {
+        const text =
+          value === 0 ? t('永不过期') : formatValue(value, 'expired_time', t);
+        return renderCopyableCell(text, text);
+      },
     },
     {
       title: t('操作'),
@@ -929,7 +1420,7 @@ function RedemptionsPanel({ data }) {
           </Select>
           <Input
             value={filters.keyword}
-            placeholder={t('搜索兑换用户名或用户 ID')}
+            placeholder={t('搜索兑换码、名称、兑换用户名或用户 ID')}
             onChange={(value) =>
               setFilters((prev) => ({ ...prev, keyword: value }))
             }
@@ -943,8 +1434,10 @@ function RedemptionsPanel({ data }) {
             <Button
               onClick={() => {
                 const nextFilters = { status: '0', keyword: '' };
+                const nextTableQuery = DEFAULT_TABLE_QUERY;
                 setFilters(nextFilters);
-                loadRedemptions(1, pageSize, nextFilters);
+                setTableQuery(nextTableQuery);
+                loadRedemptions(1, pageSize, nextFilters, nextTableQuery);
               }}
             >
               {t('重置')}
@@ -953,7 +1446,7 @@ function RedemptionsPanel({ data }) {
         </div>
         <Table
           size='small'
-          columns={columns}
+          columns={enhanceTableColumns(columns, { t, tableQuery })}
           dataSource={(list?.items || []).map((row) => ({
             ...row,
             _rowKey: row.id,
@@ -961,6 +1454,11 @@ function RedemptionsPanel({ data }) {
           rowKey='_rowKey'
           loading={listLoading}
           scroll={{ x: 'max-content' }}
+          onChange={(changeInfo) => {
+            const nextTableQuery = queryFromTableChange(changeInfo, tableQuery);
+            setTableQuery(nextTableQuery);
+            loadRedemptions(1, pageSize, filters, nextTableQuery);
+          }}
           pagination={{
             currentPage: list?.page || 1,
             pageSize,
@@ -979,11 +1477,886 @@ function RedemptionsPanel({ data }) {
   );
 }
 
-function UsersPanel({ data }) {
-  const currency = getCurrencyConfig();
+function RegistrationCodesPanel({ data }) {
+  const { t } = useTranslation();
+  const defaultConfig = {
+    registration_code_required: false,
+    invite_code_required: false,
+  };
+  const [config, setConfig] = useState(data?.config || defaultConfig);
+  const [configForm, setConfigForm] = useState(data?.config || defaultConfig);
+  const [form, setForm] = useState({
+    name: '薄荷鸡鸡大',
+    count: 2,
+    max_uses: 1,
+    open_time: 0,
+    end_time: 0,
+    code: '',
+  });
+  const [statistics, setStatistics] = useState(data?.statistics || {});
   const [list, setList] = useState(
     data?.list || { items: [], total: 0, page: 1, page_size: 20 },
   );
+  const [filters, setFilters] = useState({ status: '0', keyword: '' });
+  const [tableQuery, setTableQuery] = useState(DEFAULT_TABLE_QUERY);
+  const [pageSize, setPageSize] = useState(data?.list?.page_size || 20);
+  const [listLoading, setListLoading] = useState(false);
+  const [generated, setGenerated] = useState([]);
+  const [generating, setGenerating] = useState(false);
+  const [savingConfig, setSavingConfig] = useState(false);
+
+  useEffect(() => {
+    const nextConfig = data?.config || defaultConfig;
+    setConfig(nextConfig);
+    setConfigForm(nextConfig);
+  }, [data?.config]);
+
+  useEffect(() => {
+    setStatistics(data?.statistics || {});
+  }, [data?.statistics]);
+
+  useEffect(() => {
+    if (data?.list) {
+      setList(data.list);
+      setPageSize(data.list.page_size || 20);
+    }
+  }, [data?.list]);
+
+  const loadConfig = async () => {
+    const nextConfig = await API.get(
+      '/api/enhancements/registration-codes/config',
+    ).then(unwrap);
+    setConfig(nextConfig || defaultConfig);
+    setConfigForm(nextConfig || defaultConfig);
+  };
+
+  const loadStatistics = async () => {
+    const nextStatistics = await API.get(
+      '/api/enhancements/registration-codes/statistics',
+    ).then(unwrap);
+    setStatistics(nextStatistics || {});
+  };
+
+  const loadRegistrationCodes = async (
+    page = 1,
+    size = pageSize,
+    nextFilters = filters,
+    nextTableQuery = tableQuery,
+  ) => {
+    setListLoading(true);
+    try {
+      const params = new URLSearchParams({
+        p: String(page),
+        page_size: String(size),
+      });
+      if (nextFilters.status !== '0') {
+        params.set('status', nextFilters.status);
+      }
+      const keyword = nextFilters.keyword.trim();
+      if (keyword) {
+        params.set('keyword', keyword);
+      }
+      appendTableQueryParams(params, nextTableQuery);
+      const nextList = await API.get(
+        `/api/enhancements/registration-codes?${params.toString()}`,
+      ).then(unwrap);
+      setList(nextList || { items: [], total: 0, page, page_size: size });
+    } catch (error) {
+      showError(error.message || error);
+    } finally {
+      setListLoading(false);
+    }
+  };
+
+  const saveConfig = async () => {
+    setSavingConfig(true);
+    try {
+      await API.put('/api/enhancements/registration-codes/config', {
+        registration_code_required: !!configForm.registration_code_required,
+        invite_code_required: !!configForm.invite_code_required,
+      }).then(unwrap);
+      showSuccess(t('配置已保存'));
+      await Promise.all([loadConfig(), loadStatistics()]);
+    } catch (error) {
+      showError(error.message || error);
+    } finally {
+      setSavingConfig(false);
+    }
+  };
+
+  const generate = () => {
+    if (Number(form.end_time || 0) > 0) {
+      if (Number(form.end_time || 0) < Math.floor(Date.now() / 1000)) {
+        showError(t('结束时间必须晚于当前时间'));
+        return;
+      }
+      if (
+        Number(form.open_time || 0) > 0 &&
+        Number(form.end_time || 0) < Number(form.open_time || 0)
+      ) {
+        showError(t('结束时间必须晚于开启时间'));
+        return;
+      }
+    }
+    Modal.confirm({
+      title: t('生成注册码'),
+      content: t('确认生成注册码？'),
+      okText: t('确认'),
+      cancelText: t('取消'),
+      onOk: async () => {
+        setGenerating(true);
+        try {
+          const res = await API.post(
+            '/api/enhancements/registration-codes/generate',
+            {
+              ...form,
+              code: form.code.trim(),
+              count: Number(form.count || 1),
+              max_uses: Number(form.max_uses || 1),
+              open_time: Number(form.open_time || 0),
+              end_time: Number(form.end_time || 0),
+            },
+          );
+          const rows = unwrap(res);
+          setGenerated(rows || []);
+          showSuccess(t('生成成功'));
+          await Promise.all([
+            loadStatistics(),
+            loadRegistrationCodes(1, pageSize),
+          ]);
+        } catch (error) {
+          showError(error.message || error);
+        } finally {
+          setGenerating(false);
+        }
+      },
+    });
+  };
+
+  const copyGeneratedCodes = async () => {
+    const codes = generated.map((item) => item.code).filter(Boolean);
+    if (codes.length === 0) return;
+    if (await copy(codes.join('\n'))) {
+      showSuccess(t('复制成功'));
+    } else {
+      showError(t('复制失败'));
+    }
+  };
+
+  const updateRegistrationCodeEnabled = (record, enabled) => {
+    Modal.confirm({
+      title: enabled ? t('启用注册码') : t('禁用注册码'),
+      content: enabled ? t('确认启用这个注册码？') : t('确认禁用这个注册码？'),
+      okText: enabled ? t('启用') : t('禁用'),
+      cancelText: t('取消'),
+      onOk: async () => {
+        try {
+          await API.post(
+            `/api/enhancements/registration-codes/${record.id}/${enabled ? 'enable' : 'disable'}`,
+          ).then(unwrap);
+          showSuccess(t('操作成功'));
+          await Promise.all([
+            loadStatistics(),
+            loadRegistrationCodes(list?.page || 1, pageSize),
+          ]);
+        } catch (error) {
+          showError(error.message || error);
+        }
+      },
+    });
+  };
+
+  const deleteRegistrationCode = (record) => {
+    Modal.confirm({
+      title: t('删除注册码'),
+      content: t('确认删除这个注册码？'),
+      okText: t('删除'),
+      cancelText: t('取消'),
+      type: 'warning',
+      onOk: async () => {
+        try {
+          await API.delete(
+            `/api/enhancements/registration-codes/${record.id}`,
+          ).then(unwrap);
+          showSuccess(t('删除成功'));
+          await Promise.all([
+            loadStatistics(),
+            loadRegistrationCodes(list?.page || 1, pageSize),
+          ]);
+        } catch (error) {
+          showError(error.message || error);
+        }
+      },
+    });
+  };
+
+  const renderTimeCell = (value, emptyText = t('立即可用')) => {
+    const text =
+      Number(value || 0) > 0 ? formatValue(value, 'open_time', t) : emptyText;
+    return copyableCell(text, text, t);
+  };
+
+  const columns = [
+    {
+      title: t('ID'),
+      dataIndex: 'id',
+      width: 80,
+      render: (value) => copyableCell(value, value, t),
+    },
+    {
+      title: t('名称'),
+      dataIndex: 'name',
+      width: 160,
+      render: (value) => copyableCell(value || '-', value || '-', t),
+    },
+    {
+      title: t('注册码'),
+      dataIndex: 'code',
+      width: 260,
+      render: (value) =>
+        copyableCell(
+          value || '-',
+          value || '-',
+          t,
+          'font-mono text-xs break-all',
+        ),
+    },
+    {
+      title: t('状态'),
+      dataIndex: 'status',
+      width: 130,
+      render: (_, record) =>
+        copyableCell(
+          renderRegistrationCodeStatus(record, t),
+          registrationCodeStatusText(record, t),
+          t,
+        ),
+    },
+    {
+      title: t('总成功注册上限'),
+      dataIndex: 'max_uses',
+      width: 120,
+      render: (value) => copyableCell(value, value, t),
+    },
+    {
+      title: t('已注册次数'),
+      dataIndex: 'used_count',
+      width: 120,
+      render: (value) => copyableCell(value, value, t),
+    },
+    {
+      title: t('开启时间'),
+      dataIndex: 'open_time',
+      width: 180,
+      render: (value) => renderTimeCell(value),
+    },
+    {
+      title: t('结束时间'),
+      dataIndex: 'end_time',
+      width: 180,
+      render: (value) => renderTimeCell(value, t('永不结束')),
+    },
+    {
+      title: t('创建时间'),
+      dataIndex: 'created_time',
+      width: 180,
+      render: (value) => {
+        const text = formatValue(value, 'created_time', t);
+        return copyableCell(text, text, t);
+      },
+    },
+    {
+      title: t('最后使用时间'),
+      dataIndex: 'last_used_time',
+      width: 180,
+      render: (value) => renderTimeCell(value, t('暂无')),
+    },
+    {
+      title: t('操作'),
+      dataIndex: 'operate',
+      fixed: 'right',
+      width: 190,
+      render: (_, record) => (
+        <Space>
+          {record.status === REGISTRATION_CODE_STATUS.DISABLED ? (
+            <Button
+              size='small'
+              type='primary'
+              onClick={() => updateRegistrationCodeEnabled(record, true)}
+            >
+              {t('启用')}
+            </Button>
+          ) : (
+            <Button
+              size='small'
+              type='danger'
+              onClick={() => updateRegistrationCodeEnabled(record, false)}
+            >
+              {t('禁用')}
+            </Button>
+          )}
+          <Button
+            size='small'
+            type='danger'
+            theme='borderless'
+            icon={<Trash2 size={14} />}
+            disabled={record.used_count > 0 && !isRoot()}
+            onClick={() => deleteRegistrationCode(record)}
+          />
+        </Space>
+      ),
+    },
+  ];
+
+  return (
+    <div className='space-y-4'>
+      <SummaryGrid data={{ ...statistics, ...config }} />
+
+      <Card title={t('全局配置')} className='!rounded-lg'>
+        <div className='grid grid-cols-1 gap-3 lg:grid-cols-[1fr_1fr_auto] lg:items-end'>
+          <label className='space-y-1'>
+            <Text type='secondary'>{t('强制注册码注册')}</Text>
+            <div className='h-8 flex items-center'>
+              <Switch
+                checked={!!configForm.registration_code_required}
+                onChange={(checked) =>
+                  setConfigForm((prev) => ({
+                    ...prev,
+                    registration_code_required: checked,
+                  }))
+                }
+              />
+            </div>
+          </label>
+          <label className='space-y-1'>
+            <Text type='secondary'>{t('强制邀请码注册')}</Text>
+            <div className='h-8 flex items-center'>
+              <Switch
+                checked={!!configForm.invite_code_required}
+                onChange={(checked) =>
+                  setConfigForm((prev) => ({
+                    ...prev,
+                    invite_code_required: checked,
+                  }))
+                }
+              />
+            </div>
+          </label>
+          <Button
+            type='primary'
+            icon={<Save size={16} />}
+            loading={savingConfig}
+            disabled={!isRoot()}
+            onClick={saveConfig}
+          >
+            {t('保存')}
+          </Button>
+        </div>
+      </Card>
+
+      <Card title={t('生成注册码')} className='!rounded-lg'>
+        <div className='grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-7 xl:items-end'>
+          <label className='space-y-1'>
+            <Text type='secondary'>{t('名称')}</Text>
+            <Input
+              value={form.name}
+              onChange={(value) =>
+                setForm((prev) => ({ ...prev, name: value }))
+              }
+            />
+          </label>
+          <label className='space-y-1'>
+            <Text type='secondary'>{t('生成数量')}</Text>
+            <InputNumber
+              min={1}
+              max={100}
+              value={form.count}
+              onChange={(value) =>
+                setForm((prev) => ({
+                  ...prev,
+                  count: value || 1,
+                  code: Number(value || 1) > 1 ? '' : prev.code,
+                }))
+              }
+            />
+          </label>
+          <label className='space-y-1'>
+            <Text type='secondary'>{t('总成功注册上限')}</Text>
+            <InputNumber
+              min={1}
+              value={form.max_uses}
+              onChange={(value) =>
+                setForm((prev) => ({ ...prev, max_uses: value || 1 }))
+              }
+            />
+          </label>
+          <label className='space-y-1'>
+            <Text type='secondary'>{t('注册码')}</Text>
+            <Input
+              value={form.code}
+              placeholder={t('留空自动生成')}
+              disabled={Number(form.count || 1) > 1}
+              onChange={(value) =>
+                setForm((prev) => ({ ...prev, code: value }))
+              }
+            />
+          </label>
+          <label className='space-y-1'>
+            <Text type='secondary'>{t('开启时间')}</Text>
+            <DatePicker
+              type='dateTime'
+              className='w-full'
+              inputReadOnly
+              showClear
+              value={timestampToDateValue(form.open_time)}
+              placeholder={t('立即可用')}
+              onChange={(value) =>
+                setForm((prev) => ({
+                  ...prev,
+                  open_time: dateValueToTimestamp(value),
+                }))
+              }
+            />
+          </label>
+          <label className='space-y-1'>
+            <Text type='secondary'>{t('结束时间')}</Text>
+            <DatePicker
+              type='dateTime'
+              className='w-full'
+              inputReadOnly
+              showClear
+              value={timestampToDateValue(form.end_time)}
+              placeholder={t('永不结束')}
+              onChange={(value) =>
+                setForm((prev) => ({
+                  ...prev,
+                  end_time: dateValueToTimestamp(value),
+                }))
+              }
+            />
+          </label>
+          <Button
+            type='primary'
+            icon={<KeyRound size={16} />}
+            loading={generating}
+            onClick={generate}
+          >
+            {t('生成')}
+          </Button>
+        </div>
+      </Card>
+
+      {generated.length > 0 && (
+        <Card title={t('本次生成结果')} className='!rounded-lg'>
+          <div className='mb-3'>
+            <Button type='primary' onClick={copyGeneratedCodes}>
+              {t('一键复制注册码')}
+            </Button>
+          </div>
+          <DataPreview data={generated} />
+        </Card>
+      )}
+
+      <Card title={t('注册码列表')} className='!rounded-lg'>
+        <div className='flex flex-col gap-3 mb-4 lg:flex-row'>
+          <Select
+            value={filters.status}
+            style={{ width: 160 }}
+            onChange={(value) => {
+              const nextFilters = { ...filters, status: String(value) };
+              setFilters(nextFilters);
+              loadRegistrationCodes(1, pageSize, nextFilters);
+            }}
+          >
+            <Select.Option value='0'>{t('全部')}</Select.Option>
+            <Select.Option value='1'>{t('已启用')}</Select.Option>
+            <Select.Option value='2'>{t('已禁用')}</Select.Option>
+          </Select>
+          <Input
+            value={filters.keyword}
+            placeholder={t('搜索注册码、名称或用户 ID')}
+            onChange={(value) =>
+              setFilters((prev) => ({ ...prev, keyword: value }))
+            }
+            onEnterPress={() => loadRegistrationCodes(1, pageSize)}
+            className='lg:max-w-sm'
+          />
+          <Space>
+            <Button
+              type='primary'
+              onClick={() => loadRegistrationCodes(1, pageSize)}
+            >
+              {t('搜索')}
+            </Button>
+            <Button
+              onClick={() => {
+                const nextFilters = { status: '0', keyword: '' };
+                const nextTableQuery = DEFAULT_TABLE_QUERY;
+                setFilters(nextFilters);
+                setTableQuery(nextTableQuery);
+                loadRegistrationCodes(1, pageSize, nextFilters, nextTableQuery);
+              }}
+            >
+              {t('重置')}
+            </Button>
+          </Space>
+        </div>
+        <Table
+          size='small'
+          columns={enhanceTableColumns(columns, { t, tableQuery })}
+          dataSource={(list?.items || []).map((row) => ({
+            ...row,
+            _rowKey: row.id,
+          }))}
+          rowKey='_rowKey'
+          loading={listLoading}
+          scroll={{ x: 'max-content' }}
+          onChange={(changeInfo) => {
+            const nextTableQuery = queryFromTableChange(changeInfo, tableQuery);
+            setTableQuery(nextTableQuery);
+            loadRegistrationCodes(1, pageSize, filters, nextTableQuery);
+          }}
+          pagination={{
+            currentPage: list?.page || 1,
+            pageSize,
+            total: list?.total || 0,
+            showSizeChanger: true,
+            pageSizeOptions: [10, 20, 50, 100],
+            onPageChange: (page) => loadRegistrationCodes(page, pageSize),
+            onPageSizeChange: (size) => {
+              setPageSize(size);
+              loadRegistrationCodes(1, size);
+            },
+          }}
+        />
+      </Card>
+    </div>
+  );
+}
+
+function GitHubAgeBanCard({ onApplied }) {
+  const { t } = useTranslation();
+  const defaultForm = {
+    minimum_age_seconds: 31536000,
+    user_id_start: 0,
+    user_id_end: 0,
+    reason: '',
+  };
+  const [form, setForm] = useState(defaultForm);
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [selectedBanIds, setSelectedBanIds] = useState([]);
+
+  const patchForm = (patch) => setForm((prev) => ({ ...prev, ...patch }));
+  const threshold = Number(form.minimum_age_seconds || 0);
+  const normalizedThreshold = Math.trunc(threshold);
+  const normalizedUserIdStart = Math.trunc(Number(form.user_id_start || 0));
+  const normalizedUserIdEnd = Math.trunc(Number(form.user_id_end || 0));
+
+  const runGitHubAgeBan = async (dryRun, userIds = undefined) => {
+    if (!Number.isFinite(threshold) || normalizedThreshold <= 0) {
+      showError(t('GitHub 账号年龄阈值必须大于 0'));
+      return;
+    }
+    if (!Number.isFinite(normalizedUserIdStart) || normalizedUserIdStart < 0) {
+      showError(t('用户 ID 起始必须为非负整数'));
+      return;
+    }
+    if (!Number.isFinite(normalizedUserIdEnd) || normalizedUserIdEnd < 0) {
+      showError(t('用户 ID 结束必须为非负整数'));
+      return;
+    }
+    if (
+      normalizedUserIdStart > 0 &&
+      normalizedUserIdEnd > 0 &&
+      normalizedUserIdEnd < normalizedUserIdStart
+    ) {
+      showError(t('用户 ID 结束不能小于起始'));
+      return;
+    }
+    setLoading(true);
+    try {
+      const nextResult = await API.post(
+        '/api/enhancements/users/github-age-ban',
+        {
+          minimum_age_seconds: normalizedThreshold,
+          user_id_start: normalizedUserIdStart,
+          user_id_end: normalizedUserIdEnd,
+          reason: form.reason,
+          dry_run: dryRun,
+          ...(Array.isArray(userIds) ? { user_ids: userIds } : {}),
+        },
+      ).then(unwrap);
+      setResult(nextResult || {});
+      if (dryRun) {
+        const nextMatchedUsers = nextResult?.matched_users || [];
+        setSelectedBanIds(nextMatchedUsers.map((user) => user.id));
+        showSuccess(t('扫描完成，请确认命中列表'));
+      } else {
+        showSuccess(t('批量封禁完成'));
+        setSelectedBanIds([]);
+        onApplied?.();
+      }
+    } catch (error) {
+      showError(error.message || error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const scan = () => {
+    runGitHubAgeBan(true);
+  };
+
+  const executeSelected = () => {
+    if (selectedBanIds.length === 0) {
+      showError(t('请选择至少一个用户'));
+      return;
+    }
+    Modal.confirm({
+      title: t('确认封禁选中的 GitHub 低龄账号？'),
+      content: (
+        <div className='space-y-2'>
+          <div>
+            {t('将封禁选中的用户数')}：{formatNumber(selectedBanIds.length)}
+          </div>
+          <div className='text-semi-color-text-1 break-words'>
+            {t('封禁原因')}：{form.reason?.trim() || t('使用默认封禁原因')}
+          </div>
+          <div className='text-semi-color-text-1 break-words'>
+            {t('用户 ID 范围')}：
+            {formatGitHubAgeBanUserIDRange(
+              normalizedUserIdStart,
+              normalizedUserIdEnd,
+              t,
+            )}
+          </div>
+          <div className='text-semi-color-text-2'>
+            {t('执行前会重新校验账号年龄与用户状态')}
+          </div>
+        </div>
+      ),
+      okText: t('确认封禁'),
+      cancelText: t('取消'),
+      onOk: () => runGitHubAgeBan(false, selectedBanIds),
+    });
+  };
+
+  const matchedUsers = result?.matched_users || [];
+  const skippedUsers = result?.skipped_users || [];
+  const failureUsers = result?.failure_users || [];
+  const statEntries = result
+    ? [
+        ['total_candidates', result.total_candidates || 0],
+        ['checked', result.checked || 0],
+        ['matched', result.matched || 0],
+        ['banned', result.banned || 0],
+        ['skipped', result.skipped || 0],
+        ['failures', result.failures || 0],
+        ['rate_limited', Boolean(result.rate_limited)],
+      ]
+    : [];
+  if (result?.user_id_start) {
+    statEntries.push(['user_id_start', result.user_id_start]);
+  }
+  if (result?.user_id_end) {
+    statEntries.push(['user_id_end', result.user_id_end]);
+  }
+  if (result?.rate_limit_reset) {
+    statEntries.push(['rate_limit_reset', result.rate_limit_reset]);
+  }
+
+  const formatStatValue = (key, value) => {
+    if (key === 'rate_limit_reset' && value) {
+      return dayjs.unix(value).format('YYYY-MM-DD HH:mm:ss');
+    }
+    return formatValue(value, key, t);
+  };
+  const matchedColumns = GITHUB_AGE_BAN_PREVIEW_KEYS.map((key) => ({
+    title: formatFieldLabel(key, t),
+    dataIndex: key,
+    key,
+    render: (value, record) => formatValue(record?.[key] ?? value, key, t),
+  }));
+  const selectedCount = selectedBanIds.length;
+
+  return (
+    <Card title={t('GitHub 账号年龄批量封禁')} className='!rounded-lg'>
+      <div className='grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3'>
+        <label className='space-y-2'>
+          <Text>{t('账号年龄阈值（秒）')}</Text>
+          <InputNumber
+            min={1}
+            step={60}
+            value={form.minimum_age_seconds}
+            placeholder={t('31536000 表示约 1 年')}
+            style={{ width: '100%' }}
+            onChange={(value) =>
+              patchForm({ minimum_age_seconds: Number(value || 0) })
+            }
+          />
+          <div className='text-xs text-semi-color-text-2'>
+            {t('账号年龄必须严格大于该秒数才会通过；小于等于该值将命中')}
+          </div>
+        </label>
+        <label className='space-y-2'>
+          <Text>{t('用户 ID 范围')}</Text>
+          <div className='grid grid-cols-2 gap-2'>
+            <InputNumber
+              min={0}
+              step={1}
+              precision={0}
+              value={form.user_id_start || undefined}
+              placeholder={t('起始 ID')}
+              style={{ width: '100%' }}
+              onChange={(value) =>
+                patchForm({ user_id_start: Number(value || 0) })
+              }
+            />
+            <InputNumber
+              min={0}
+              step={1}
+              precision={0}
+              value={form.user_id_end || undefined}
+              placeholder={t('结束 ID')}
+              style={{ width: '100%' }}
+              onChange={(value) =>
+                patchForm({ user_id_end: Number(value || 0) })
+              }
+            />
+          </div>
+          <div className='text-xs text-semi-color-text-2'>
+            {t('留空表示不限用户 ID 范围')}
+          </div>
+        </label>
+        <label className='space-y-2'>
+          <Text>{t('封禁原因')}</Text>
+          <TextArea
+            rows={3}
+            autosize
+            value={form.reason}
+            placeholder={t('留空使用默认封禁原因')}
+            onChange={(value) => patchForm({ reason: value })}
+          />
+        </label>
+        <div className='rounded-lg border border-semi-color-border px-3 py-2'>
+          <Text>{t('封禁确认')}</Text>
+          <div className='mt-1 text-xs text-semi-color-text-2'>
+            {t('先扫描命中账号，取消勾选不需要封禁的用户后再执行')}
+          </div>
+        </div>
+      </div>
+      <Space className='mt-4'>
+        <Button
+          type='primary'
+          icon={<Search size={16} />}
+          loading={loading}
+          onClick={scan}
+        >
+          {t('扫描低龄账号')}
+        </Button>
+        <Button
+          type='danger'
+          icon={<Ban size={16} />}
+          loading={loading}
+          disabled={matchedUsers.length === 0 || selectedCount === 0}
+          onClick={executeSelected}
+        >
+          {t('封禁选中用户')}
+        </Button>
+        <Button
+          icon={<RefreshCw size={16} />}
+          onClick={() => {
+            setResult(null);
+            setForm(defaultForm);
+            setSelectedBanIds([]);
+          }}
+        >
+          {t('重置')}
+        </Button>
+      </Space>
+
+      {result && (
+        <div className='mt-4 space-y-4'>
+          <div className='grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-3'>
+            {statEntries.map(([key, value]) => (
+              <div
+                key={key}
+                className='rounded-lg border border-semi-color-border px-3 py-2'
+              >
+                <div className='text-xs text-semi-color-text-2'>
+                  {formatFieldLabel(key, t)}
+                </div>
+                <div className='mt-1 text-lg font-semibold text-semi-color-text-0 break-words'>
+                  {formatStatValue(key, value)}
+                </div>
+              </div>
+            ))}
+          </div>
+          {result.rate_limited && (
+            <div className='rounded-lg border border-semi-color-warning bg-semi-color-warning-light-default px-3 py-2 text-semi-color-warning'>
+              {t('GitHub API 已限流，扫描已安全停止')}
+            </div>
+          )}
+          {matchedUsers.length > 0 && (
+            <div className='space-y-2'>
+              <div className='flex flex-col gap-1 md:flex-row md:items-center md:justify-between'>
+                <Text strong>{t('命中用户列表')}</Text>
+                <Text type='secondary'>
+                  {t('已选择')}：{formatNumber(selectedCount)} /{' '}
+                  {formatNumber(matchedUsers.length)}
+                </Text>
+              </div>
+              <Table
+                size='small'
+                rowKey='id'
+                columns={matchedColumns}
+                dataSource={matchedUsers}
+                pagination={false}
+                scroll={{ x: 'max-content', y: 420 }}
+                rowSelection={{
+                  selectedRowKeys: selectedBanIds,
+                  onChange: (keys) =>
+                    setSelectedBanIds(keys.map((key) => Number(key))),
+                }}
+                empty={<Empty description={t('没有命中用户')} />}
+              />
+            </div>
+          )}
+          {skippedUsers.length > 0 && (
+            <div className='space-y-2'>
+              <Text strong>{t('跳过用户')}</Text>
+              <DataPreview
+                data={skippedUsers}
+                limit={100}
+                keys={GITHUB_AGE_BAN_ISSUE_KEYS}
+              />
+            </div>
+          )}
+          {failureUsers.length > 0 && (
+            <div className='space-y-2'>
+              <Text strong>{t('失败用户')}</Text>
+              <DataPreview
+                data={failureUsers}
+                limit={100}
+                keys={GITHUB_AGE_BAN_FAILURE_KEYS}
+              />
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function UsersPanel({ data }) {
+  const { t } = useTranslation();
+  const currency = getCurrencyConfig();
+  const canUseRootTools = isRoot();
+  const [list, setList] = useState(
+    data?.list || { items: [], total: 0, page: 1, page_size: 20 },
+  );
+  const [tableQuery, setTableQuery] = useState(DEFAULT_TABLE_QUERY);
   const [pageSize, setPageSize] = useState(data?.list?.page_size || 20);
   const [listLoading, setListLoading] = useState(false);
 
@@ -994,13 +2367,18 @@ function UsersPanel({ data }) {
     }
   }, [data?.list]);
 
-  const loadUsers = async (page = 1, size = pageSize) => {
+  const loadUsers = async (
+    page = 1,
+    size = pageSize,
+    nextTableQuery = tableQuery,
+  ) => {
     setListLoading(true);
     try {
       const params = new URLSearchParams({
         p: String(page),
         page_size: String(size),
       });
+      appendTableQueryParams(params, nextTableQuery);
       const nextList = await API.get(
         `/api/enhancements/users?${params.toString()}`,
       ).then(unwrap);
@@ -1012,9 +2390,9 @@ function UsersPanel({ data }) {
     }
   };
 
-  const formatUserValue = (value, key, t) => {
-    if (key === 'email' && value === '***masked***') {
-      return t('未绑定');
+  const formatUserValue = (value, key, t, record) => {
+    if (key === 'status') {
+      return formatUserStatus(value, t, record);
     }
     if (key === 'quota' || key === 'used_quota') {
       return formatQuotaAsAmount(value, currency);
@@ -1025,13 +2403,46 @@ function UsersPanel({ data }) {
   return (
     <div className='space-y-4'>
       <SummaryGrid data={data?.summary || {}} />
+      {canUseRootTools && <GroupBalanceCard />}
       <Card title='数据预览' className='!rounded-lg'>
+        <div className='flex flex-col md:flex-row gap-3 mb-4'>
+          <Input
+            value={tableQuery.keyword || ''}
+            prefix={<Search size={16} />}
+            placeholder={t('搜索用户字段')}
+            showClear
+            onChange={(value) =>
+              setTableQuery((prev) => ({ ...prev, keyword: value }))
+            }
+            onEnterPress={() => loadUsers(1, pageSize)}
+            className='md:max-w-sm'
+          />
+          <Space>
+            <Button type='primary' onClick={() => loadUsers(1, pageSize)}>
+              {t('查询')}
+            </Button>
+            <Button
+              onClick={() => {
+                const nextTableQuery = DEFAULT_TABLE_QUERY;
+                setTableQuery(nextTableQuery);
+                loadUsers(1, pageSize, nextTableQuery);
+              }}
+            >
+              {t('重置')}
+            </Button>
+          </Space>
+        </div>
         <DataPreview
           data={list}
           limit={null}
           keys={USER_PREVIEW_KEYS}
           valueFormatter={formatUserValue}
           loading={listLoading}
+          tableQuery={tableQuery}
+          onTableQueryChange={(nextTableQuery) => {
+            setTableQuery(nextTableQuery);
+            loadUsers(1, pageSize, nextTableQuery);
+          }}
           pagination={{
             currentPage: list?.page || 1,
             pageSize,
@@ -1046,6 +2457,34 @@ function UsersPanel({ data }) {
           }}
         />
       </Card>
+      {canUseRootTools && (
+        <GitHubAgeBanCard
+          onApplied={() => loadUsers(list?.page || 1, pageSize)}
+        />
+      )}
+    </div>
+  );
+}
+
+function AutoGroupPanel({ data }) {
+  const canUseRootTools = isRoot();
+  const summary =
+    data?.summary || data?.statistics || data?.config || data?.overview || data;
+  const list =
+    data?.list ||
+    data?.ranking ||
+    data?.models ||
+    data?.statuses ||
+    data?.preview ||
+    data;
+
+  return (
+    <div className='space-y-4'>
+      <SummaryGrid data={summary || {}} />
+      {canUseRootTools && <GroupTransferCard />}
+      <Card title='数据预览' className='!rounded-lg'>
+        <DataPreview data={list} />
+      </Card>
     </div>
   );
 }
@@ -1058,6 +2497,7 @@ function TokensPanel({ data }) {
     data?.list || { items: [], total: 0, page: 1, page_size: 20 },
   );
   const [filters, setFilters] = useState({ status: '0', key: '', group: '' });
+  const [tableQuery, setTableQuery] = useState(DEFAULT_TABLE_QUERY);
   const [pageSize, setPageSize] = useState(data?.list?.page_size || 20);
   const [listLoading, setListLoading] = useState(false);
   const [editingToken, setEditingToken] = useState(null);
@@ -1143,6 +2583,7 @@ function TokensPanel({ data }) {
     page = 1,
     size = pageSize,
     nextFilters = filters,
+    nextTableQuery = tableQuery,
   ) => {
     setListLoading(true);
     try {
@@ -1155,6 +2596,7 @@ function TokensPanel({ data }) {
       if (nextFilters.group.trim()) {
         params.set('group', nextFilters.group.trim());
       }
+      appendTableQueryParams(params, nextTableQuery);
       const nextList = await API.get(
         `/api/enhancements/tokens?${params.toString()}`,
       ).then(unwrap);
@@ -1225,6 +2667,29 @@ function TokensPanel({ data }) {
     } finally {
       setSaving(false);
     }
+  };
+
+  const deleteToken = (record) => {
+    if (!record?.id) return;
+    Modal.confirm({
+      title: t('确认删除令牌'),
+      content: t('删除后该 Key 将立即失效，此操作不可撤销。'),
+      okText: t('删除'),
+      cancelText: t('取消'),
+      okButtonProps: { type: 'danger' },
+      onOk: async () => {
+        try {
+          await API.delete(`/api/enhancements/tokens/${record.id}`);
+          showSuccess(t('删除成功'));
+          await Promise.all([
+            loadStatistics(),
+            loadTokens(list?.page || 1, pageSize),
+          ]);
+        } catch (error) {
+          showError(error.message || error);
+        }
+      },
+    });
   };
 
   const setTokenExpiration = (months, days, hours) => {
@@ -1324,15 +2789,25 @@ function TokensPanel({ data }) {
       title: t('操作'),
       dataIndex: 'operate',
       fixed: 'right',
-      width: 110,
+      width: 170,
       render: (_, record) => (
-        <Button
-          size='small'
-          type='primary'
-          onClick={() => openEditToken(record)}
-        >
-          {t('编辑')}
-        </Button>
+        <Space>
+          <Button
+            size='small'
+            type='primary'
+            onClick={() => openEditToken(record)}
+          >
+            {t('编辑')}
+          </Button>
+          <Button
+            size='small'
+            type='danger'
+            icon={<Trash2 size={14} />}
+            onClick={() => deleteToken(record)}
+          >
+            {t('删除')}
+          </Button>
+        </Space>
       ),
     },
   ];
@@ -1388,8 +2863,10 @@ function TokensPanel({ data }) {
             <Button
               onClick={() => {
                 const nextFilters = { status: '0', key: '', group: '' };
+                const nextTableQuery = DEFAULT_TABLE_QUERY;
                 setFilters(nextFilters);
-                loadTokens(1, pageSize, nextFilters);
+                setTableQuery(nextTableQuery);
+                loadTokens(1, pageSize, nextFilters, nextTableQuery);
               }}
             >
               {t('重置')}
@@ -1398,7 +2875,7 @@ function TokensPanel({ data }) {
         </div>
         <Table
           size='small'
-          columns={columns}
+          columns={enhanceTableColumns(columns, { t, tableQuery })}
           dataSource={(list?.items || []).map((row) => ({
             ...row,
             _rowKey: row.id,
@@ -1406,6 +2883,11 @@ function TokensPanel({ data }) {
           rowKey='_rowKey'
           loading={listLoading}
           scroll={{ x: 'max-content' }}
+          onChange={(changeInfo) => {
+            const nextTableQuery = queryFromTableChange(changeInfo, tableQuery);
+            setTableQuery(nextTableQuery);
+            loadTokens(1, pageSize, filters, nextTableQuery);
+          }}
           pagination={{
             currentPage: list?.page || 1,
             pageSize,
@@ -1698,28 +3180,6 @@ const RISK_WINDOW_OPTIONS = [
   { value: 'custom', label: '自定义' },
 ];
 
-const SHARED_IP_SORT_OPTIONS = [
-  { value: '', label: '默认排序' },
-  { value: 'user_count', label: '用户数' },
-  { value: 'token_count', label: '令牌数' },
-  { value: 'request_count', label: '请求数' },
-  { value: 'error_count', label: '错误数' },
-  { value: 'quota', label: '金额' },
-  { value: 'first_seen_at', label: '首次出现' },
-  { value: 'last_seen_at', label: '最后出现' },
-];
-
-const TOKEN_MULTI_IP_SORT_OPTIONS = [
-  { value: '', label: '默认排序' },
-  { value: 'ip_count', label: 'IP 数' },
-  { value: 'request_count', label: '请求数' },
-  { value: 'error_count', label: '错误数' },
-  { value: 'quota', label: '金额' },
-  { value: 'first_seen_at', label: '首次出现' },
-  { value: 'last_seen_at', label: '最后出现' },
-  { value: 'token_id', label: '令牌 ID' },
-];
-
 const EMPTY_PAGE = { items: [], total: 0, page: 1, page_size: 20 };
 
 function getRiskWindowRange(filters) {
@@ -1756,6 +3216,156 @@ function compactRiskLabels(items, renderLabel, max = 4) {
   );
 }
 
+function riskUserLabel(user) {
+  return `${user?.username || '-'} (#${user?.user_id || '-'})`;
+}
+
+function riskTokenLabel(token) {
+  return `${token?.token_name || '-'} (#${token?.token_id || '-'}, U${token?.user_id || '-'})`;
+}
+
+function RiskUserBanConfirmContent({
+  ip,
+  users,
+  reason,
+  onReasonChange,
+  onSelectedUserIdsChange,
+}) {
+  const { t } = useTranslation();
+  const [selectedUserIds, setSelectedUserIds] = useState(() =>
+    users.map((user) => user.user_id),
+  );
+
+  useEffect(() => {
+    onSelectedUserIdsChange?.(selectedUserIds);
+  }, [onSelectedUserIdsChange, selectedUserIds]);
+
+  return (
+    <div className='space-y-3'>
+      <div>
+        {t('将封禁当前时间范围内使用该 IP 的选中用户')}：{ip}
+      </div>
+      <div className='flex items-center justify-between gap-3 text-semi-color-text-1'>
+        <span>
+          {t('已选择')}：{formatNumber(selectedUserIds.length)} /{' '}
+          {formatNumber(users.length)}
+        </span>
+      </div>
+      <Table
+        size='small'
+        rowKey='user_id'
+        columns={[
+          {
+            title: t('用户 ID'),
+            dataIndex: 'user_id',
+            width: 110,
+          },
+          {
+            title: t('用户名'),
+            dataIndex: 'username',
+            render: (value) => value || '-',
+          },
+          {
+            title: t('请求数'),
+            dataIndex: 'request_count',
+            width: 110,
+            render: (value) => formatNumber(value),
+          },
+        ]}
+        dataSource={users}
+        pagination={false}
+        scroll={{ y: 260 }}
+        rowSelection={{
+          selectedRowKeys: selectedUserIds,
+          onChange: (keys) =>
+            setSelectedUserIds(keys.map((key) => Number(key))),
+        }}
+        empty={<Empty description={t('暂无数据')} />}
+      />
+      <TextArea
+        autosize
+        rows={2}
+        defaultValue={reason}
+        placeholder={t('封禁原因')}
+        onChange={onReasonChange}
+      />
+    </div>
+  );
+}
+
+function RiskSingleIPBanConfirmContent({ ip, reason, onReasonChange }) {
+  const { t } = useTranslation();
+  return (
+    <div className='space-y-3'>
+      <div>
+        {t('将创建永久 IP 封禁规则，并开启命中后封禁账号')}：{ip}
+      </div>
+      <div className='text-semi-color-text-2'>
+        {t('后续命中该 IP 规则的普通用户账号会被同步封禁')}
+      </div>
+      <TextArea
+        autosize
+        rows={2}
+        defaultValue={reason}
+        placeholder={t('封禁原因')}
+        onChange={onReasonChange}
+      />
+    </div>
+  );
+}
+
+function RiskIPSelectionBanConfirmContent({
+  ips,
+  reason,
+  onReasonChange,
+  onSelectedIPsChange,
+}) {
+  const { t } = useTranslation();
+  const [selectedIPs, setSelectedIPs] = useState(() => [...ips]);
+
+  useEffect(() => {
+    onSelectedIPsChange?.(selectedIPs);
+  }, [onSelectedIPsChange, selectedIPs]);
+
+  return (
+    <div className='space-y-3'>
+      <div>{t('选择需要封禁的 IP')}</div>
+      <div className='text-semi-color-text-2'>
+        {t('将创建永久 IP 封禁规则，并开启命中后封禁账号')}
+      </div>
+      <div className='text-semi-color-text-1'>
+        {t('已选择')}：{formatNumber(selectedIPs.length)} /{' '}
+        {formatNumber(ips.length)}
+      </div>
+      <Table
+        size='small'
+        rowKey='ip'
+        columns={[
+          {
+            title: 'IP',
+            dataIndex: 'ip',
+          },
+        ]}
+        dataSource={ips.map((ip) => ({ ip }))}
+        pagination={false}
+        scroll={{ y: 260 }}
+        rowSelection={{
+          selectedRowKeys: selectedIPs,
+          onChange: (keys) => setSelectedIPs(keys.map((key) => String(key))),
+        }}
+        empty={<Empty description={t('暂无数据')} />}
+      />
+      <TextArea
+        autosize
+        rows={2}
+        defaultValue={reason}
+        placeholder={t('封禁原因')}
+        onChange={onReasonChange}
+      />
+    </div>
+  );
+}
+
 function RiskPanel({ data }) {
   const { t } = useTranslation();
   const currency = getCurrencyConfig();
@@ -1769,8 +3379,8 @@ function RiskPanel({ data }) {
     range: [],
     keyword: '',
   });
-  const [sharedSort, setSharedSort] = useState({ sort: '', order: 'desc' });
-  const [tokenSort, setTokenSort] = useState({ sort: '', order: 'desc' });
+  const [sharedSort, setSharedSort] = useState(DEFAULT_TABLE_QUERY);
+  const [tokenSort, setTokenSort] = useState(DEFAULT_TABLE_QUERY);
   const [sharedPageSize, setSharedPageSize] = useState(
     data?.sharedIPs?.page_size || 20,
   );
@@ -1781,6 +3391,10 @@ function RiskPanel({ data }) {
   const [sharedLoading, setSharedLoading] = useState(false);
   const [tokenLoading, setTokenLoading] = useState(false);
   const [applying, setApplying] = useState(false);
+  const [selectedSharedIP, setSelectedSharedIP] = useState(null);
+  const [banLoadingIP, setBanLoadingIP] = useState('');
+  const [ipBanLoadingKey, setIPBanLoadingKey] = useState('');
+  const [tokenActionLoading, setTokenActionLoading] = useState('');
 
   useEffect(() => {
     setCoverage(data?.coverage || {});
@@ -1803,6 +3417,7 @@ function RiskPanel({ data }) {
     if (nextFilters.keyword?.trim()) {
       params.keyword = nextFilters.keyword.trim();
     }
+    appendObjectTableQueryParams(params, nextSort);
     return params;
   };
 
@@ -1892,6 +3507,227 @@ function RiskPanel({ data }) {
     });
   };
 
+  const copyRiskItems = async (items, renderLabel) => {
+    const text = (items || []).map(renderLabel).join('\n');
+    if (!text) return;
+    if (await copy(text)) {
+      showSuccess(t('复制成功'));
+    } else {
+      showError(t('复制失败'));
+    }
+  };
+
+  const handleRiskIPBanResponse = (res, retry) => {
+    if (res?.data?.success) {
+      return false;
+    }
+    const data = res?.data?.data;
+    if (data?.requires_confirmation) {
+      Modal.confirm({
+        title: t('确认封禁当前IP'),
+        content: `${t('该规则会封禁你当前访问后台使用的IP')}：${data.client_ip}`,
+        okText: t('确认封禁'),
+        cancelText: t('取消'),
+        onOk: retry,
+      });
+      return true;
+    }
+    throw new Error(res?.data?.message || '请求失败');
+  };
+
+  const createRiskIPBans = async (
+    { targets, reason, loadingKey, onSuccess },
+    confirmSelfLock = false,
+  ) => {
+    setIPBanLoadingKey(loadingKey);
+    try {
+      const res = await API.post('/api/enhancements/risk/ip-bans', {
+        targets,
+        reason,
+        confirm_self_lock: confirmSelfLock,
+      });
+      if (
+        handleRiskIPBanResponse(res, () =>
+          createRiskIPBans({ targets, reason, loadingKey, onSuccess }, true),
+        )
+      ) {
+        return;
+      }
+      const result = unwrap(res);
+      showSuccess(
+        `${t('IP 封禁完成')}：${t('新增')} ${formatNumber(
+          result?.created || 0,
+        )}，${t('跳过')} ${formatNumber(result?.skipped || 0)}`,
+      );
+      onSuccess?.(result);
+    } catch (error) {
+      showError(error.message || error);
+    } finally {
+      setIPBanLoadingKey('');
+    }
+  };
+
+  const banSharedIPUsers = (record) => {
+    const ip = record?.ip;
+    const users = record?.users || [];
+    if (!ip || users.length === 0) {
+      showError(t('该 IP 下没有可封禁用户'));
+      return;
+    }
+    let reason = `共享 IP 风控封禁：${ip}`;
+    let selectedUserIds = users.map((user) => user.user_id);
+    Modal.confirm({
+      title: t('封禁该 IP 下的用户'),
+      content: (
+        <RiskUserBanConfirmContent
+          ip={ip}
+          users={users}
+          reason={reason}
+          onReasonChange={(value) => {
+            reason = value;
+          }}
+          onSelectedUserIdsChange={(ids) => {
+            selectedUserIds = ids;
+          }}
+        />
+      ),
+      okText: t('确认封禁'),
+      cancelText: t('取消'),
+      onOk: async () => {
+        if (selectedUserIds.length === 0) {
+          showError(t('请选择至少一个用户'));
+          return false;
+        }
+        setBanLoadingIP(ip);
+        try {
+          const res = await API.post(
+            `/api/enhancements/risk/shared-token-ips/${encodeURIComponent(ip)}/ban-users`,
+            { reason, user_ids: selectedUserIds },
+            { params: riskParams(1, sharedPageSize, filters, sharedSort) },
+          );
+          const result = unwrap(res);
+          const success = result?.success || 0;
+          const total = result?.total_users || users.length;
+          if (success > 0) {
+            showSuccess(
+              `${t('已封禁用户')}：${formatNumber(success)} / ${formatNumber(total)}`,
+            );
+          }
+          if (result?.failures?.length) {
+            showError(`${t('部分用户封禁失败')}：${result.failures.length}`);
+          }
+          await loadSharedIPs(sharedIPs?.page || 1, sharedPageSize);
+        } catch (error) {
+          showError(error.message || error);
+        } finally {
+          setBanLoadingIP('');
+        }
+      },
+    });
+  };
+
+  const banSharedIP = (record) => {
+    const ip = record?.ip;
+    if (!ip) {
+      showError(t('请选择需要封禁的 IP'));
+      return;
+    }
+    let reason = `共享 IP 风控封禁：${ip}`;
+    const loadingKey = `shared:${ip}`;
+    Modal.confirm({
+      title: t('封禁该 IP'),
+      content: (
+        <RiskSingleIPBanConfirmContent
+          ip={ip}
+          reason={reason}
+          onReasonChange={(value) => {
+            reason = value;
+          }}
+        />
+      ),
+      okText: t('确认封禁'),
+      cancelText: t('取消'),
+      okButtonProps: { type: 'danger' },
+      onOk: () =>
+        createRiskIPBans({
+          targets: [ip],
+          reason,
+          loadingKey,
+        }),
+    });
+  };
+
+  const banTokenIPs = (record) => {
+    const ips = record?.ips || [];
+    if (ips.length === 0) {
+      showError(t('请选择需要封禁的 IP'));
+      return;
+    }
+    let selectedIPs = [...ips];
+    let reason = `单令牌多 IP 风控封禁：${record?.token_name || record?.token_id || '-'}`;
+    const loadingKey = `token:${record?.token_id}`;
+    Modal.confirm({
+      title: t('封禁令牌使用过的 IP'),
+      content: (
+        <RiskIPSelectionBanConfirmContent
+          ips={ips}
+          reason={reason}
+          onReasonChange={(value) => {
+            reason = value;
+          }}
+          onSelectedIPsChange={(nextIPs) => {
+            selectedIPs = nextIPs;
+          }}
+        />
+      ),
+      okText: t('确认封禁'),
+      cancelText: t('取消'),
+      okButtonProps: { type: 'danger' },
+      onOk: () => {
+        if (selectedIPs.length === 0) {
+          showError(t('请选择至少一个 IP'));
+          return false;
+        }
+        return createRiskIPBans({
+          targets: selectedIPs,
+          reason,
+          loadingKey,
+        });
+      },
+    });
+  };
+
+  const deleteRiskToken = (record) => {
+    const tokenId = record?.token_id;
+    if (!tokenId) return;
+    Modal.confirm({
+      title: t('确认删除令牌'),
+      content: (
+        <div className='space-y-2'>
+          <div>{riskTokenLabel(record)}</div>
+          <div className='text-semi-color-text-2'>
+            {t('删除后该 Key 将立即失效，此操作不可撤销。')}
+          </div>
+        </div>
+      ),
+      okText: t('删除'),
+      cancelText: t('取消'),
+      okButtonProps: { type: 'danger' },
+      onOk: async () => {
+        setTokenActionLoading(`delete:${tokenId}`);
+        try {
+          await API.delete(`/api/enhancements/tokens/${tokenId}`).then(unwrap);
+          showSuccess(t('删除成功'));
+          await loadTokenMultiIPs(tokenMultiIPs?.page || 1, tokenPageSize);
+        } catch (error) {
+          showError(error.message || error);
+        } finally {
+          setTokenActionLoading('');
+        }
+      },
+    });
+  };
+
   const totalUsers = coverage?.total_users || 0;
   const enabledUsers = coverage?.enabled_users || 0;
   const disabledUsers = coverage?.disabled_users || 0;
@@ -1942,24 +3778,54 @@ function RiskPanel({ data }) {
       title: t('用户'),
       dataIndex: 'users',
       width: 260,
-      render: (users) =>
-        compactRiskLabels(
-          users,
-          (user) => `${user.username || '-'} (#${user.user_id})`,
-          3,
-        ),
+      render: (users) => compactRiskLabels(users, riskUserLabel, 3),
     },
     {
       title: t('令牌'),
       dataIndex: 'tokens',
       width: 300,
-      render: (tokens) =>
-        compactRiskLabels(
-          tokens,
-          (token) =>
-            `${token.token_name || '-'} (#${token.token_id}, U${token.user_id})`,
-          3,
-        ),
+      render: (tokens) => compactRiskLabels(tokens, riskTokenLabel, 3),
+    },
+    {
+      title: t('操作'),
+      dataIndex: 'operate',
+      fixed: 'right',
+      width: 280,
+      render: (_, record) => (
+        <Space>
+          <Button
+            size='small'
+            type='primary'
+            theme='borderless'
+            icon={<Eye size={14} />}
+            onClick={() => setSelectedSharedIP(record)}
+          >
+            {t('查看')}
+          </Button>
+          <Button
+            size='small'
+            type='danger'
+            theme='borderless'
+            icon={<Ban size={14} />}
+            loading={banLoadingIP === record.ip}
+            disabled={!record?.users?.length}
+            onClick={() => banSharedIPUsers(record)}
+          >
+            {t('封禁用户')}
+          </Button>
+          <Button
+            size='small'
+            type='danger'
+            theme='borderless'
+            icon={<Ban size={14} />}
+            loading={ipBanLoadingKey === `shared:${record.ip}`}
+            disabled={!record?.ip}
+            onClick={() => banSharedIP(record)}
+          >
+            {t('封禁 IP')}
+          </Button>
+        </Space>
+      ),
     },
   ];
 
@@ -2023,33 +3889,84 @@ function RiskPanel({ data }) {
       width: 300,
       render: (ips) => compactRiskLabels(ips, (ip) => ip, 5),
     },
+    {
+      title: t('操作'),
+      dataIndex: 'operate',
+      fixed: 'right',
+      width: 220,
+      render: (_, record) => (
+        <Space>
+          <Button
+            size='small'
+            type='danger'
+            theme='borderless'
+            icon={<Trash2 size={14} />}
+            loading={tokenActionLoading === `delete:${record.token_id}`}
+            disabled={!record?.token_id}
+            onClick={() => deleteRiskToken(record)}
+          >
+            {t('删除令牌')}
+          </Button>
+          <Button
+            size='small'
+            type='danger'
+            theme='borderless'
+            icon={<Ban size={14} />}
+            loading={ipBanLoadingKey === `token:${record.token_id}`}
+            disabled={!record?.ips?.length}
+            onClick={() => banTokenIPs(record)}
+          >
+            {t('封禁 IP')}
+          </Button>
+        </Space>
+      ),
+    },
   ];
 
-  const renderSortControls = (sortState, options, onChange) => (
-    <Space wrap>
-      <Select
-        value={sortState.sort}
-        size='small'
-        style={{ width: 140 }}
-        onChange={(value) => onChange({ ...sortState, sort: value })}
-      >
-        {options.map((option) => (
-          <Select.Option key={option.value} value={option.value}>
-            {t(option.label)}
-          </Select.Option>
-        ))}
-      </Select>
-      <Select
-        value={sortState.order}
-        size='small'
-        style={{ width: 110 }}
-        onChange={(value) => onChange({ ...sortState, order: value })}
-      >
-        <Select.Option value='desc'>{t('降序')}</Select.Option>
-        <Select.Option value='asc'>{t('升序')}</Select.Option>
-      </Select>
-    </Space>
-  );
+  const selectedSharedUsers = selectedSharedIP?.users || [];
+  const selectedSharedTokens = selectedSharedIP?.tokens || [];
+  const selectedUserColumns = [
+    {
+      title: t('用户 ID'),
+      dataIndex: 'user_id',
+      width: 100,
+    },
+    {
+      title: t('用户名'),
+      dataIndex: 'username',
+      render: (value) => value || '-',
+    },
+    {
+      title: t('请求数'),
+      dataIndex: 'request_count',
+      width: 110,
+      render: (value) => formatNumber(value),
+    },
+  ];
+  const selectedTokenColumns = [
+    {
+      title: t('令牌 ID'),
+      dataIndex: 'token_id',
+      width: 100,
+    },
+    {
+      title: t('令牌名称'),
+      dataIndex: 'token_name',
+      render: (value) => value || '-',
+    },
+    {
+      title: t('用户'),
+      dataIndex: 'username',
+      width: 180,
+      render: (_, record) => riskUserLabel(record),
+    },
+    {
+      title: t('请求数'),
+      dataIndex: 'request_count',
+      width: 110,
+      render: (value) => formatNumber(value),
+    },
+  ];
 
   return (
     <div className='space-y-4'>
@@ -2174,19 +4091,12 @@ function RiskPanel({ data }) {
       </Card>
 
       <Card title={t('多令牌共用 IP')} className='!rounded-lg'>
-        <div className='flex justify-end mb-3'>
-          {renderSortControls(
-            sharedSort,
-            SHARED_IP_SORT_OPTIONS,
-            (nextSort) => {
-              setSharedSort(nextSort);
-              loadSharedIPs(1, sharedPageSize, filters, nextSort);
-            },
-          )}
-        </div>
         <Table
           size='small'
-          columns={sharedColumns}
+          columns={enhanceTableColumns(sharedColumns, {
+            t,
+            tableQuery: sharedSort,
+          })}
           dataSource={(sharedIPs?.items || []).map((row) => ({
             ...row,
             _rowKey: row.ip,
@@ -2195,6 +4105,11 @@ function RiskPanel({ data }) {
           loading={sharedLoading}
           empty={<Empty description={t('暂无数据')} />}
           scroll={{ x: 'max-content' }}
+          onChange={(changeInfo) => {
+            const nextSort = queryFromTableChange(changeInfo, sharedSort);
+            setSharedSort(nextSort);
+            loadSharedIPs(1, sharedPageSize, filters, nextSort);
+          }}
           pagination={{
             currentPage: sharedIPs?.page || 1,
             pageSize: sharedPageSize,
@@ -2211,19 +4126,12 @@ function RiskPanel({ data }) {
       </Card>
 
       <Card title={t('单令牌多 IP')} className='!rounded-lg'>
-        <div className='flex justify-end mb-3'>
-          {renderSortControls(
-            tokenSort,
-            TOKEN_MULTI_IP_SORT_OPTIONS,
-            (nextSort) => {
-              setTokenSort(nextSort);
-              loadTokenMultiIPs(1, tokenPageSize, filters, nextSort);
-            },
-          )}
-        </div>
         <Table
           size='small'
-          columns={tokenColumns}
+          columns={enhanceTableColumns(tokenColumns, {
+            t,
+            tableQuery: tokenSort,
+          })}
           dataSource={(tokenMultiIPs?.items || []).map((row) => ({
             ...row,
             _rowKey: row.token_id,
@@ -2232,6 +4140,11 @@ function RiskPanel({ data }) {
           loading={tokenLoading}
           empty={<Empty description={t('暂无数据')} />}
           scroll={{ x: 'max-content' }}
+          onChange={(changeInfo) => {
+            const nextSort = queryFromTableChange(changeInfo, tokenSort);
+            setTokenSort(nextSort);
+            loadTokenMultiIPs(1, tokenPageSize, filters, nextSort);
+          }}
           pagination={{
             currentPage: tokenMultiIPs?.page || 1,
             pageSize: tokenPageSize,
@@ -2246,6 +4159,153 @@ function RiskPanel({ data }) {
           }}
         />
       </Card>
+
+      <SideSheet
+        placement='right'
+        title={
+          <Space>
+            <Tag color='red' shape='circle'>
+              {t('风控')}
+            </Tag>
+            <Title heading={4} style={{ margin: 0 }}>
+              {selectedSharedIP?.ip || '-'}
+            </Title>
+          </Space>
+        }
+        visible={Boolean(selectedSharedIP)}
+        width={760}
+        closeIcon={null}
+        onCancel={() => setSelectedSharedIP(null)}
+        footer={
+          <div className='flex justify-end bg-semi-color-bg-0'>
+            <Space>
+              <Button
+                type='danger'
+                icon={<Ban size={16} />}
+                loading={banLoadingIP === selectedSharedIP?.ip}
+                disabled={!selectedSharedUsers.length}
+                onClick={() => banSharedIPUsers(selectedSharedIP)}
+              >
+                {t('封禁用户')}
+              </Button>
+              <Button
+                type='danger'
+                icon={<Ban size={16} />}
+                loading={ipBanLoadingKey === `shared:${selectedSharedIP?.ip}`}
+                disabled={!selectedSharedIP?.ip}
+                onClick={() => banSharedIP(selectedSharedIP)}
+              >
+                {t('封禁 IP')}
+              </Button>
+              <Button
+                theme='light'
+                type='primary'
+                icon={<X size={16} />}
+                onClick={() => setSelectedSharedIP(null)}
+              >
+                {t('关闭')}
+              </Button>
+            </Space>
+          </div>
+        }
+      >
+        {selectedSharedIP && (
+          <div className='p-3 space-y-4'>
+            <Card className='!rounded-lg'>
+              <div className='grid grid-cols-2 md:grid-cols-4 gap-3'>
+                <div>
+                  <Text type='secondary' size='small'>
+                    {t('用户数')}
+                  </Text>
+                  <div className='text-lg font-semibold'>
+                    {formatNumber(selectedSharedIP.user_count)}
+                  </div>
+                </div>
+                <div>
+                  <Text type='secondary' size='small'>
+                    {t('令牌数')}
+                  </Text>
+                  <div className='text-lg font-semibold'>
+                    {formatNumber(selectedSharedIP.token_count)}
+                  </div>
+                </div>
+                <div>
+                  <Text type='secondary' size='small'>
+                    {t('请求数')}
+                  </Text>
+                  <div className='text-lg font-semibold'>
+                    {formatNumber(selectedSharedIP.request_count)}
+                  </div>
+                </div>
+                <div>
+                  <Text type='secondary' size='small'>
+                    {t('错误数')}
+                  </Text>
+                  <div className='text-lg font-semibold'>
+                    {formatNumber(selectedSharedIP.error_count)}
+                  </div>
+                </div>
+              </div>
+            </Card>
+
+            <Card className='!rounded-lg'>
+              <div className='flex items-center justify-between gap-3 mb-3'>
+                <Title heading={5} style={{ margin: 0 }}>
+                  {t('完整用户列表')}
+                </Title>
+                <Button
+                  size='small'
+                  icon={<CopyIcon size={14} />}
+                  onClick={() =>
+                    copyRiskItems(selectedSharedUsers, riskUserLabel)
+                  }
+                >
+                  {t('复制')}
+                </Button>
+              </div>
+              <Table
+                size='small'
+                columns={selectedUserColumns}
+                dataSource={selectedSharedUsers.map((row) => ({
+                  ...row,
+                  _rowKey: row.user_id,
+                }))}
+                rowKey='_rowKey'
+                pagination={false}
+                empty={<Empty description={t('暂无数据')} />}
+              />
+            </Card>
+
+            <Card className='!rounded-lg'>
+              <div className='flex items-center justify-between gap-3 mb-3'>
+                <Title heading={5} style={{ margin: 0 }}>
+                  {t('完整令牌列表')}
+                </Title>
+                <Button
+                  size='small'
+                  icon={<CopyIcon size={14} />}
+                  onClick={() =>
+                    copyRiskItems(selectedSharedTokens, riskTokenLabel)
+                  }
+                >
+                  {t('复制')}
+                </Button>
+              </div>
+              <Table
+                size='small'
+                columns={selectedTokenColumns}
+                dataSource={selectedSharedTokens.map((row) => ({
+                  ...row,
+                  _rowKey: row.token_id,
+                }))}
+                rowKey='_rowKey'
+                pagination={false}
+                empty={<Empty description={t('暂无数据')} />}
+              />
+            </Card>
+          </div>
+        )}
+      </SideSheet>
     </div>
   );
 }
@@ -2301,14 +4361,16 @@ function ModelStatusTimeline({ status }) {
             const totalRequests = Number(slot.total_requests || 0);
             const isEmptySlot = totalRequests <= 0;
             const slotBarClass = isEmptySlot
-              ? 'bg-white border border-semi-color-border'
+              ? 'bg-semi-color-bg-2 border border-semi-color-border'
               : slotMeta.barClass;
             const statusText = isEmptySlot
               ? t('无请求')
               : formatStatusPercent(slot.success_rate);
             const title = `${dayjs.unix(slot.start_time).format('MM-DD HH:mm')} - ${dayjs
               .unix(slot.end_time)
-              .format('MM-DD HH:mm')} · ${statusText} · ${formatNumber(totalRequests)}`;
+              .format(
+                'MM-DD HH:mm',
+              )} · ${statusText} · ${formatNumber(totalRequests)}`;
             return (
               <div
                 key={`${groupName}-${modelName}-${slot.slot}`}
@@ -2386,6 +4448,21 @@ function ModelStatusCard({ status }) {
         </div>
 
         <ModelStatusTimeline status={status} />
+
+        <div className='flex flex-col gap-1 text-base font-semibold text-semi-color-text-0 sm:flex-row sm:items-center sm:justify-between'>
+          <div className='text-left'>
+            {t('近期平均首字延迟')}：
+            {formatRecentFirstResponseTime(
+              status?.recent_avg_first_response_time,
+            )}
+          </div>
+          <div className='text-right'>
+            {t('近期平均输出速度')}：
+            {formatRecentOutputTokenSpeed(
+              status?.recent_avg_output_token_speed,
+            )}
+          </div>
+        </div>
       </div>
     </Card>
   );
@@ -2492,8 +4569,16 @@ function ModelStatusPanel({ data }) {
   const [publicEnabled, setPublicEnabled] = useState(
     !!data?.config?.public_embed_enabled,
   );
-  const [showZeroRequestModels, setShowZeroRequestModels] = useState(
-    !!data?.config?.show_zero_request_models,
+  const [requestCountHideThreshold, setRequestCountHideThreshold] = useState(
+    getModelStatusRequestCountHideThreshold(data?.config),
+  );
+  const [ignoreErrorKeywordsEnabled, setIgnoreErrorKeywordsEnabled] = useState(
+    !!data?.config?.model_status_ignore_error_keywords_enabled,
+  );
+  const [ignoredErrorKeywordsText, setIgnoredErrorKeywordsText] = useState(
+    formatModelStatusIgnoredErrorKeywords(
+      data?.config?.model_status_ignored_error_keywords,
+    ),
   );
   const [refreshMinutes, setRefreshMinutes] = useState(
     getModelStatusRefreshMinutes(data?.config),
@@ -2510,23 +4595,21 @@ function ModelStatusPanel({ data }) {
   const [saving, setSaving] = useState(false);
   const publicUrl = getModelStatusPublicUrl(config);
 
-  const loadConfig = async () => {
-    try {
-      const nextConfig = await API.get(
-        '/api/enhancements/model-status/config/time-window',
-      ).then(unwrap);
-      setConfig(nextConfig || {});
-    } catch (error) {
-      showError(error.message);
-    }
-  };
-
-  useEffect(() => {
-    const nextConfig = data?.config || {};
+  const syncConfig = useCallback((nextConfig = {}) => {
     setConfig(nextConfig);
     setWindowValue(getModelStatusConfigWindow(nextConfig));
     setPublicEnabled(!!nextConfig.public_embed_enabled);
-    setShowZeroRequestModels(!!nextConfig.show_zero_request_models);
+    setRequestCountHideThreshold(
+      getModelStatusRequestCountHideThreshold(nextConfig),
+    );
+    setIgnoreErrorKeywordsEnabled(
+      !!nextConfig.model_status_ignore_error_keywords_enabled,
+    );
+    setIgnoredErrorKeywordsText(
+      formatModelStatusIgnoredErrorKeywords(
+        nextConfig.model_status_ignored_error_keywords,
+      ),
+    );
     setRefreshMinutes(getModelStatusRefreshMinutes(nextConfig));
     setSlotMinutes(getModelStatusSlotMinutes(nextConfig));
     setGreenThreshold(
@@ -2535,7 +4618,22 @@ function ModelStatusPanel({ data }) {
     setYellowThreshold(
       getModelStatusThreshold(nextConfig, 'yellow_threshold', 80),
     );
-  }, [data]);
+  }, []);
+
+  const loadConfig = async () => {
+    try {
+      const nextConfig = await API.get(
+        '/api/enhancements/model-status/config/time-window',
+      ).then(unwrap);
+      syncConfig(nextConfig || {});
+    } catch (error) {
+      showError(error.message);
+    }
+  };
+
+  useEffect(() => {
+    syncConfig(data?.config || {});
+  }, [data, syncConfig]);
 
   const handleSaveSettings = async () => {
     setSaving(true);
@@ -2553,6 +4651,10 @@ function ModelStatusPanel({ data }) {
         100,
         Math.max(1, Number(yellowThreshold || 80)),
       );
+      const nextRequestCountHideThreshold =
+        getModelStatusRequestCountHideThreshold({
+          model_status_request_count_hide_threshold: requestCountHideThreshold,
+        });
       if (nextGreenThreshold < nextYellowThreshold) {
         showError(t('绿色阈值不能低于黄色阈值'));
         return;
@@ -2562,9 +4664,21 @@ function ModelStatusPanel({ data }) {
           value: publicEnabled,
         }).then(unwrap),
         API.put(
-          '/api/enhancements/model-status/config/show-zero-request-models',
+          '/api/enhancements/model-status/config/request-count-hide-threshold',
           {
-            value: showZeroRequestModels,
+            value: nextRequestCountHideThreshold,
+          },
+        ).then(unwrap),
+        API.put(
+          '/api/enhancements/model-status/config/ignore-error-keywords-enabled',
+          {
+            value: ignoreErrorKeywordsEnabled,
+          },
+        ).then(unwrap),
+        API.put(
+          '/api/enhancements/model-status/config/ignored-error-keywords',
+          {
+            value: ignoredErrorKeywordsText,
           },
         ).then(unwrap),
         API.put('/api/enhancements/model-status/config/time-window', {
@@ -2605,10 +4719,10 @@ function ModelStatusPanel({ data }) {
           <div className='grid grid-cols-1 gap-3 lg:grid-cols-2'>
             <div className='flex flex-col gap-3 md:flex-row md:items-center md:justify-between'>
               <div className='flex items-center gap-3'>
-                <div className='h-10 w-10 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center'>
+                <div className='h-10 w-10 shrink-0 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center'>
                   <Globe2 size={20} />
                 </div>
-                <div>
+                <div className='min-w-0'>
                   <div className='text-base font-semibold text-semi-color-text-0'>
                     {t('公开嵌入')}
                   </div>
@@ -2617,33 +4731,46 @@ function ModelStatusPanel({ data }) {
                   </div>
                 </div>
               </div>
-              <Switch
-                checked={publicEnabled}
-                onChange={setPublicEnabled}
-                checkedText={t('开启')}
-                uncheckedText={t('关闭')}
-              />
+              <Switch checked={publicEnabled} onChange={setPublicEnabled} />
             </div>
 
             <div className='flex flex-col gap-3 md:flex-row md:items-center md:justify-between'>
               <div className='flex items-center gap-3'>
-                <div className='h-10 w-10 rounded-lg bg-semi-color-fill-0 text-semi-color-text-2 flex items-center justify-center'>
-                  <LineChart size={20} />
+                <div className='h-10 w-10 shrink-0 rounded-lg bg-amber-50 text-amber-600 flex items-center justify-center'>
+                  <AlertTriangle size={20} />
                 </div>
-                <div className='text-base font-semibold text-semi-color-text-0'>
-                  {t('展示0请求次数的模型')}
+                <div className='min-w-0'>
+                  <div className='text-base font-semibold text-semi-color-text-0'>
+                    {t('忽略错误关键词')}
+                  </div>
+                  <div className='text-sm text-semi-color-text-2'>
+                    {t('匹配关键词的错误不计入模型状态')}
+                  </div>
                 </div>
               </div>
               <Switch
-                checked={showZeroRequestModels}
-                onChange={setShowZeroRequestModels}
-                checkedText={t('开启')}
-                uncheckedText={t('关闭')}
+                checked={ignoreErrorKeywordsEnabled}
+                onChange={setIgnoreErrorKeywordsEnabled}
               />
             </div>
           </div>
 
-          <div className='grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-5'>
+          <label className='space-y-1'>
+            <Text type='secondary'>{t('错误关键词')}</Text>
+            <TextArea
+              value={ignoredErrorKeywordsText}
+              onChange={(value) => setIgnoredErrorKeywordsText(value || '')}
+              autosize={{ minRows: 3, maxRows: 8 }}
+              placeholder={t(
+                '一行一个关键词，例如 unsupported_feature_for_model',
+              )}
+            />
+            <div className='text-xs text-semi-color-text-2'>
+              {t('不区分大小写，匹配错误内容或错误详情')}
+            </div>
+          </label>
+
+          <div className='grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-6'>
             <label className='space-y-1'>
               <Text type='secondary'>{t('时间范围')}</Text>
               <ModelStatusWindowSelect
@@ -2694,17 +4821,32 @@ function ModelStatusPanel({ data }) {
                 style={{ width: '100%' }}
               />
             </label>
+            <label className='space-y-1'>
+              <Text type='secondary'>{t('隐藏低请求模型')}</Text>
+              <InputNumber
+                min={0}
+                max={1000000}
+                precision={0}
+                value={requestCountHideThreshold}
+                onChange={(value) => setRequestCountHideThreshold(value ?? 2)}
+                style={{ width: '100%' }}
+              />
+              <div className='text-xs text-semi-color-text-2'>
+                {t('隐藏请求次数小于等于该数值的模型')}
+              </div>
+            </label>
           </div>
 
-          <div className='grid grid-cols-1 gap-3 lg:grid-cols-[1fr_auto]'>
+          <div className='grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_auto]'>
             <Input
               readOnly
               value={publicUrl}
               prefix={<Link2 size={16} />}
               addonBefore={t('公开访问地址')}
             />
-            <Space>
+            <div className='flex flex-col gap-2 sm:flex-row sm:flex-wrap lg:justify-end'>
               <Button
+                className='w-full sm:w-auto'
                 icon={<CopyIcon size={16} />}
                 onClick={handleCopy}
                 disabled={!publicEnabled}
@@ -2712,6 +4854,7 @@ function ModelStatusPanel({ data }) {
                 {t('复制地址')}
               </Button>
               <Button
+                className='w-full sm:w-auto'
                 icon={<ExternalLink size={16} />}
                 onClick={() => window.open(publicUrl, '_blank', 'noopener')}
                 disabled={!publicEnabled}
@@ -2719,6 +4862,7 @@ function ModelStatusPanel({ data }) {
                 {t('打开页面')}
               </Button>
               <Button
+                className='w-full sm:w-auto'
                 type='primary'
                 icon={<Save size={16} />}
                 loading={saving}
@@ -2726,7 +4870,7 @@ function ModelStatusPanel({ data }) {
               >
                 {t('保存设置')}
               </Button>
-            </Space>
+            </div>
           </div>
         </div>
       </Card>
@@ -2824,7 +4968,7 @@ export function ModelStatusPublicPage() {
 
   if (!available && !loading) {
     return (
-      <div className='min-h-screen bg-[#f6f8fb] px-4 py-10'>
+      <div className='site-background-page-surface min-h-screen bg-semi-color-bg-0 px-4 py-10'>
         <div className='mx-auto max-w-3xl'>
           <Card className='!rounded-lg'>
             <Empty
@@ -2839,7 +4983,7 @@ export function ModelStatusPublicPage() {
   }
 
   return (
-    <div className='min-h-screen bg-[#f6f8fb] px-4 py-6 md:py-8'>
+    <div className='site-background-page-surface min-h-screen bg-semi-color-bg-0 px-4 py-6 md:py-8'>
       <div className='mx-auto max-w-6xl space-y-5'>
         <ModelStatusBoard
           statuses={visibleStatuses}
@@ -2885,11 +5029,11 @@ export function ModelStatusPublicPage() {
 }
 
 function GenericSection({ section, data, onRefresh }) {
-  if (section === 'dashboard') {
-    return <DashboardPanel data={data} />;
-  }
   if (section === 'redemptions') {
     return <RedemptionsPanel data={data} onRefresh={onRefresh} />;
+  }
+  if (section === 'registration-codes') {
+    return <RegistrationCodesPanel data={data} onRefresh={onRefresh} />;
   }
   if (section === 'users') {
     return <UsersPanel data={data} />;
@@ -2902,6 +5046,9 @@ function GenericSection({ section, data, onRefresh }) {
   }
   if (section === 'model-status') {
     return <ModelStatusPanel data={data} />;
+  }
+  if (section === 'auto-group') {
+    return <AutoGroupPanel data={data} />;
   }
 
   const summary =
@@ -2926,21 +5073,20 @@ function GenericSection({ section, data, onRefresh }) {
 
 async function fetchSection(section) {
   switch (section) {
-    case 'dashboard': {
-      const [overview, trend, topUsers, models] = await Promise.all([
-        API.get('/api/enhancements/dashboard/overview').then(unwrap),
-        API.get('/api/enhancements/dashboard/trends/hourly').then(unwrap),
-        API.get('/api/enhancements/dashboard/top-users').then(unwrap),
-        API.get('/api/enhancements/dashboard/models').then(unwrap),
-      ]);
-      return { overview, trend, topUsers, models };
-    }
     case 'redemptions': {
       const [statistics, list] = await Promise.all([
         API.get('/api/enhancements/redemptions/statistics').then(unwrap),
         API.get('/api/enhancements/redemptions').then(unwrap),
       ]);
       return { statistics, list };
+    }
+    case 'registration-codes': {
+      const [config, statistics, list] = await Promise.all([
+        API.get('/api/enhancements/registration-codes/config').then(unwrap),
+        API.get('/api/enhancements/registration-codes/statistics').then(unwrap),
+        API.get('/api/enhancements/registration-codes').then(unwrap),
+      ]);
+      return { config, statistics, list };
     }
     case 'users': {
       const [summary, list] = await Promise.all([
@@ -3009,20 +5155,34 @@ async function fetchSection(section) {
 export default function Enhancements() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const params = useParams();
-  const activeSection = params.section || 'dashboard';
+  const location = useLocation();
+  const [tabActiveKey, setTabActiveKey] = useState(() =>
+    getSectionFromSearch(location.search),
+  );
+  const activeSection = tabActiveKey;
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
   useEffect(() => {
-    if (!sectionIds.has(activeSection)) {
-      navigate(`${ENHANCEMENTS_BASE_PATH}/dashboard`, { replace: true });
+    const tab = new URLSearchParams(location.search).get('tab');
+    if (!sectionIds.has(tab)) {
+      setTabActiveKey(DEFAULT_SECTION);
+      navigate(`${ENHANCEMENTS_BASE_PATH}?tab=${DEFAULT_SECTION}`, {
+        replace: true,
+      });
+      return;
     }
-  }, [activeSection, navigate]);
+    setTabActiveKey(tab);
+  }, [location.search, navigate]);
 
   const activeMeta =
     SECTIONS.find((section) => section.id === activeSection) || SECTIONS[0];
+
+  const onChangeTab = (key) => {
+    setTabActiveKey(key);
+    navigate(`${ENHANCEMENTS_BASE_PATH}?tab=${key}`);
+  };
 
   const loadData = async () => {
     if (!sectionIds.has(activeSection)) return;
@@ -3044,6 +5204,33 @@ export default function Enhancements() {
   }, [activeSection]);
 
   const Icon = activeMeta.icon;
+  const renderSectionContent = (sectionId) => {
+    if (tabActiveKey !== sectionId) return null;
+
+    if (loading) {
+      return (
+        <div className='py-20 flex justify-center'>
+          <Spin size='large' />
+        </div>
+      );
+    }
+
+    if (error) {
+      return (
+        <Card className='!rounded-lg'>
+          <Empty title={error} />
+        </Card>
+      );
+    }
+
+    return (
+      <GenericSection
+        section={activeSection}
+        data={data}
+        onRefresh={loadData}
+      />
+    );
+  };
 
   return (
     <div className='mt-[60px] px-2 pb-6'>
@@ -3071,37 +5258,32 @@ export default function Enhancements() {
         </Space>
       </div>
 
-      <Card className='!rounded-lg mb-4' bodyStyle={{ paddingBottom: 0 }}>
-        <Tabs
-          type='line'
-          activeKey={activeSection}
-          onChange={(key) => navigate(`${ENHANCEMENTS_BASE_PATH}/${key}`)}
-        >
-          {SECTIONS.map((section) => (
+      <Tabs
+        type='card'
+        collapsible
+        activeKey={activeSection}
+        onChange={onChangeTab}
+      >
+        {SECTIONS.map((section) => {
+          const SectionIcon = section.icon;
+          return (
             <TabPane
-              tab={t(section.label)}
+              tab={
+                <span
+                  style={{ display: 'flex', alignItems: 'center', gap: '5px' }}
+                >
+                  <SectionIcon size={18} />
+                  {t(section.label)}
+                </span>
+              }
               itemKey={section.id}
               key={section.id}
-            />
-          ))}
-        </Tabs>
-      </Card>
-
-      {loading ? (
-        <div className='py-20 flex justify-center'>
-          <Spin size='large' />
-        </div>
-      ) : error ? (
-        <Card className='!rounded-lg'>
-          <Empty title={error} />
-        </Card>
-      ) : (
-        <GenericSection
-          section={activeSection}
-          data={data}
-          onRefresh={loadData}
-        />
-      )}
+            >
+              {renderSectionContent(section.id)}
+            </TabPane>
+          );
+        })}
+      </Tabs>
     </div>
   );
 }

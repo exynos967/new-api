@@ -74,6 +74,7 @@ const NotificationSettings = ({
       detail: true,
       token: true,
       log: true,
+      email_log: true,
       midjourney: true,
       task: true,
     },
@@ -163,6 +164,7 @@ const NotificationSettings = ({
         detail: true,
         token: true,
         log: true,
+        email_log: true,
         midjourney: true,
         task: true,
       },
@@ -268,6 +270,11 @@ const NotificationSettings = ({
         { key: 'token', title: t('令牌管理'), description: t('API令牌管理') },
         { key: 'log', title: t('使用日志'), description: t('API使用记录') },
         {
+          key: 'email_log',
+          title: t('邮件日志'),
+          description: t('邮件发送记录'),
+        },
+        {
           key: 'midjourney',
           title: t('绘图日志'),
           description: t('绘图任务记录'),
@@ -296,6 +303,11 @@ const NotificationSettings = ({
       modules: [
         { key: 'channel', title: t('渠道管理'), description: t('API渠道配置') },
         { key: 'models', title: t('模型管理'), description: t('AI模型配置') },
+        {
+          key: 'ip_ban',
+          title: t('IP封禁'),
+          description: t('IP访问封禁管理'),
+        },
         {
           key: 'deployment',
           title: t('模型部署'),

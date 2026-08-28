@@ -70,6 +70,32 @@ func applySystemPromptIfNeeded(c *gin.Context, info *relaycommon.RelayInfo, requ
 	}
 }
 
+func shouldChatCompletionsUseResponses(info *relaycommon.RelayInfo) bool {
+	if info == nil {
+		return false
+	}
+	model := info.OriginModelName
+	if info.ChannelType == constant.ChannelTypeOpenCode || info.ChannelType == constant.ChannelTypeOpenCodeGo {
+		model = info.UpstreamModelName
+	}
+	return service.ShouldChatCompletionsUseResponsesGlobal(info.ChannelId, info.ChannelType, model)
+}
+
+func shouldPassThroughTextRequest(info *relaycommon.RelayInfo, globalEnabled bool) bool {
+	// OpenCode gateways select an upstream wire protocol per model. The client
+	// body therefore has to pass through the selected adaptor conversion.
+	if info != nil && (info.ChannelType == constant.ChannelTypeOpenCode || info.ChannelType == constant.ChannelTypeOpenCodeGo) {
+		return false
+	}
+	// Gemini does not support image/gif inputs. When the per-channel filter is
+	// enabled, conversion must take precedence over byte-for-byte pass-through
+	// so the unsupported parts can be removed before the upstream request.
+	if info != nil && info.ChannelType == constant.ChannelTypeGemini && info.ChannelOtherSettings.ShouldRemoveGifImages() {
+		return false
+	}
+	return globalEnabled || (info != nil && info.ChannelSetting.PassThroughBodyEnabled)
+}
+
 func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, request *dto.GeneralOpenAIRequest) (*dto.Usage, *types.NewAPIError) {
 	chatJSON, err := common.Marshal(request)
 	if err != nil {
@@ -129,7 +155,9 @@ func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, ad
 	var requestBody io.Reader = bytes.NewBuffer(jsonData)
 
 	var httpResp *http.Response
-	resp, err := adaptor.DoRequest(c, info, requestBody)
+	resp, err := doChannelRPMGuardedRequest(c, info, func() (any, error) {
+		return adaptor.DoRequest(c, info, requestBody)
+	})
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}

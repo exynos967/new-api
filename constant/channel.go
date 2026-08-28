@@ -55,6 +55,17 @@ const (
 	ChannelTypeSora           = 55
 	ChannelTypeReplicate      = 56
 	ChannelTypeCodex          = 57
+	ChannelTypeAgnesAI        = 58
+	ChannelTypePoe            = 59
+	ChannelTypeGCP            = 60
+	ChannelTypeOpenAILocal    = 61
+	ChannelTypeCerebras       = 62
+	ChannelTypeOpenCode       = 63
+	ChannelTypeOpenCodeGo     = 64
+	ChannelTypeMistralConsole = 65
+	ChannelTypeVercel         = 66
+	ChannelTypeGMICloud       = 67
+	ChannelTypeVyceAI         = 68
 	ChannelTypeDummy          // this one is only for count, do not add any channel after this
 
 )
@@ -118,6 +129,17 @@ var ChannelBaseURLs = []string{
 	"https://api.openai.com",                    //55
 	"https://api.replicate.com",                 //56
 	"https://chatgpt.com",                       //57
+	"https://apihub.agnes-ai.com",               //58
+	"https://api.poe.com",                       //59
+	"https://speech.googleapis.com",             //60
+	"https://local.openai.com",                  //61
+	"https://api.cerebras.ai",                   //62
+	"https://opencode.ai/zen",                   //63
+	"https://opencode.ai/zen/go",                //64
+	"https://console.mistral.ai",                //65
+	"https://ai-gateway.vercel.sh",              //66
+	"https://api.gmi-serving.com",               //67
+	"https://vyceai.com",                        //68
 }
 
 var ChannelTypeNames = map[int]string{
@@ -175,6 +197,17 @@ var ChannelTypeNames = map[int]string{
 	ChannelTypeSora:           "Sora",
 	ChannelTypeReplicate:      "Replicate",
 	ChannelTypeCodex:          "Codex",
+	ChannelTypeAgnesAI:        "AgnesAI",
+	ChannelTypePoe:            "Poe",
+	ChannelTypeGCP:            "GCP",
+	ChannelTypeOpenAILocal:    "OpenAI-local",
+	ChannelTypeCerebras:       "Cerebras",
+	ChannelTypeOpenCode:       "OpenCode Zen",
+	ChannelTypeOpenCodeGo:     "OpenCode Go",
+	ChannelTypeMistralConsole: "Mistral Console",
+	ChannelTypeVercel:         "Vercel AI Gateway",
+	ChannelTypeGMICloud:       "GMI Cloud",
+	ChannelTypeVyceAI:         "VyceAI",
 }
 
 func GetChannelTypeName(channelType int) string {

@@ -3,7 +3,9 @@ package controller
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/service/enhancement"
@@ -46,6 +48,18 @@ func RegisterEnhancementRoutes(r *gin.RouterGroup) {
 		redemptions.DELETE("/:id", enhancementDeleteRedemption)
 	}
 
+	registrationCodes := r.Group("/registration-codes")
+	{
+		registrationCodes.GET("/config", enhancementRegistrationCodeConfig)
+		registrationCodes.GET("/statistics", enhancementRegistrationCodeStats)
+		registrationCodes.GET("", enhancementListRegistrationCodes)
+		registrationCodes.GET("/", enhancementListRegistrationCodes)
+		registrationCodes.POST("/generate", enhancementGenerateRegistrationCodes)
+		registrationCodes.POST("/:id/disable", enhancementDisableRegistrationCode)
+		registrationCodes.POST("/:id/enable", enhancementEnableRegistrationCode)
+		registrationCodes.DELETE("/:id", enhancementDeleteRegistrationCode)
+	}
+
 	users := r.Group("/users")
 	{
 		users.GET("/activity-stats", enhancementUserActivityStats)
@@ -67,6 +81,7 @@ func RegisterEnhancementRoutes(r *gin.RouterGroup) {
 		tokens.GET("/statistics", enhancementTokenStats)
 		tokens.GET("/groups", enhancementTokenGroups)
 		tokens.PUT("/:token_id", enhancementUpdateToken)
+		tokens.DELETE("/:token_id", enhancementDeleteToken)
 	}
 
 	risk := r.Group("/risk")
@@ -74,6 +89,8 @@ func RegisterEnhancementRoutes(r *gin.RouterGroup) {
 		risk.GET("/ip-log-coverage", enhancementIPLogCoverage)
 		risk.POST("/ip-log/enable-all", enhancementEnableAllRecordIPLog)
 		risk.GET("/shared-token-ips", enhancementSharedTokenIPs)
+		risk.POST("/shared-token-ips/:ip/ban-users", enhancementBanSharedTokenIPUsers)
+		risk.POST("/ip-bans", enhancementCreateRiskIPBans)
 		risk.GET("/token-multi-ips", enhancementTokenMultiIPs)
 		risk.GET("/leaderboards", enhancementRiskLeaderboards)
 		risk.GET("/users/:user_id/analysis", enhancementUserRiskAnalysis)
@@ -96,7 +113,9 @@ func RegisterEnhancementRoutes(r *gin.RouterGroup) {
 		modelStatus.GET("/config/theme", enhancementModelStatusConfig)
 		modelStatus.GET("/config/refresh-interval", enhancementModelStatusConfig)
 		modelStatus.GET("/config/sort-mode", enhancementModelStatusConfig)
-		modelStatus.GET("/config/show-zero-request-models", enhancementModelStatusConfig)
+		modelStatus.GET("/config/request-count-hide-threshold", enhancementModelStatusConfig)
+		modelStatus.GET("/config/ignore-error-keywords-enabled", enhancementModelStatusConfig)
+		modelStatus.GET("/config/ignored-error-keywords", enhancementModelStatusConfig)
 		modelStatus.GET("/config/groups", enhancementTokenGroups)
 		modelStatus.GET("/config/site-title", enhancementModelStatusConfig)
 		modelStatus.GET("/token-groups", enhancementTokenGroups)
@@ -146,6 +165,7 @@ func RegisterEnhancementRoutes(r *gin.RouterGroup) {
 
 func RegisterEnhancementRootRoutes(r *gin.RouterGroup) {
 	r.POST("/users/batch-delete", enhancementBatchDeleteUsers)
+	r.POST("/users/github-age-ban", enhancementGitHubAgeBanUsers)
 	r.DELETE("/users/:user_id", enhancementDeleteUser)
 	r.POST("/users/soft-deleted/purge", enhancementPurgeSoftDeletedUsers)
 	r.POST("/system/indexes/ensure", enhancementEnsureIndexes)
@@ -157,12 +177,15 @@ func RegisterEnhancementRootRoutes(r *gin.RouterGroup) {
 	r.PUT("/model-status/config/slot-granularity", enhancementModelStatusSaveOption("model_status_slot_minutes"))
 	r.PUT("/model-status/config/threshold-green", enhancementModelStatusSaveOption("model_status_green_threshold"))
 	r.PUT("/model-status/config/threshold-yellow", enhancementModelStatusSaveOption("model_status_yellow_threshold"))
-	r.PUT("/model-status/config/show-zero-request-models", enhancementModelStatusSaveOption("model_status_show_zero_requests"))
+	r.PUT("/model-status/config/request-count-hide-threshold", enhancementModelStatusSaveOption("model_status_request_count_hide_threshold"))
+	r.PUT("/model-status/config/ignore-error-keywords-enabled", enhancementModelStatusSaveOption("model_status_ignore_error_keywords_enabled"))
+	r.PUT("/model-status/config/ignored-error-keywords", enhancementModelStatusSaveOption("model_status_ignored_error_keywords"))
 	r.PUT("/model-status/config/sort-mode", enhancementModelStatusSaveOption("model_status_sort_mode"))
 	r.PUT("/model-status/config/custom-order", enhancementModelStatusSaveSelected)
 	r.PUT("/model-status/config/groups", enhancementReadOnlyPlaceholder("token groups are derived from tokens"))
 	r.PUT("/model-status/config/site-title", enhancementModelStatusSaveOption("model_status_site_title"))
 	r.PUT("/model-status/config/public-embed", enhancementModelStatusSaveOption("public_embed_enabled"))
+	r.PUT("/registration-codes/config", enhancementSaveRegistrationCodeConfig)
 	r.POST("/auto-group/batch-move", enhancementRootDryRunPlaceholder("auto-group batch move"))
 	r.POST("/auto-group/revert", enhancementRootDryRunPlaceholder("auto-group revert"))
 	r.POST("/ai-ban/config", enhancementSaveAIBanConfig)
@@ -200,6 +223,47 @@ func queryInt64(c *gin.Context, key string, fallback int64) int64 {
 		return fallback
 	}
 	return value
+}
+
+func enhancementFilters(c *gin.Context) map[string]string {
+	filters := map[string]string{}
+	for key, values := range c.Request.URL.Query() {
+		if !strings.HasPrefix(key, "filter_") || len(values) == 0 {
+			continue
+		}
+		field := strings.TrimSpace(strings.TrimPrefix(key, "filter_"))
+		value := strings.TrimSpace(values[0])
+		if field == "" || value == "" {
+			continue
+		}
+		filters[field] = value
+	}
+	return filters
+}
+
+func enhancementListQuery(c *gin.Context) enhancement.ListQuery {
+	keyword := c.Query("keyword")
+	if keyword == "" {
+		keyword = c.Query("search")
+	}
+	query := enhancement.ListQuery{
+		Page:     queryInt(c, "p", 1),
+		PageSize: queryInt(c, "page_size", queryInt(c, "limit", 20)),
+		Keyword:  keyword,
+		Sort:     c.Query("sort"),
+		Order:    c.Query("order"),
+		Filters:  enhancementFilters(c),
+	}
+	if status := strings.TrimSpace(c.Query("status")); status != "" && status != "0" {
+		query.Filters["status"] = status
+	}
+	if group := strings.TrimSpace(c.Query("group")); group != "" {
+		query.Filters["group"] = group
+	}
+	if key := strings.TrimSpace(c.Query("key")); key != "" {
+		query.Filters["key"] = strings.TrimPrefix(key, "sk-")
+	}
+	return query
 }
 
 func pathInt(c *gin.Context, key string) (int, error) {
@@ -283,11 +347,7 @@ func enhancementSystemInfo(c *gin.Context) {
 }
 
 func enhancementListRedemptions(c *gin.Context) {
-	keyword := c.Query("keyword")
-	if keyword == "" {
-		keyword = c.Query("search")
-	}
-	data, err := enhancement.ListRedemptions(queryInt(c, "p", 1), queryInt(c, "page_size", 20), queryInt(c, "status", 0), keyword)
+	data, err := enhancement.ListRedemptions(enhancementListQuery(c))
 	respondPublic(c, data, err)
 }
 
@@ -351,18 +411,89 @@ func enhancementBatchDeleteRedemptions(c *gin.Context) {
 	respondPublic(c, data, err)
 }
 
+func enhancementRegistrationCodeConfig(c *gin.Context) {
+	common.ApiSuccess(c, enhancement.RegistrationCodeConfig())
+}
+
+func enhancementSaveRegistrationCodeConfig(c *gin.Context) {
+	var req enhancement.RegistrationCodeConfigRequest
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	operatorId, _ := operator(c)
+	err := enhancement.SaveRegistrationCodeConfig(req, operatorId)
+	respondPublic(c, gin.H{"saved": true}, err)
+}
+
+func enhancementListRegistrationCodes(c *gin.Context) {
+	data, err := enhancement.ListRegistrationCodes(enhancementListQuery(c))
+	respondPublic(c, data, err)
+}
+
+func enhancementRegistrationCodeStats(c *gin.Context) {
+	data, err := enhancement.RegistrationCodeStats()
+	respondPublic(c, data, err)
+}
+
+func enhancementGenerateRegistrationCodes(c *gin.Context) {
+	var req enhancement.GenerateRegistrationCodesRequest
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	operatorId, _ := operator(c)
+	data, err := enhancement.GenerateRegistrationCodes(req, operatorId)
+	respondPublic(c, data, err)
+}
+
+func enhancementDeleteRegistrationCode(c *gin.Context) {
+	id, err := pathInt(c, "id")
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	operatorId, role := operator(c)
+	err = enhancement.DeleteRegistrationCode(id, operatorId, role >= common.RoleRootUser)
+	respondPublic(c, gin.H{"deleted": true}, err)
+}
+
+func enhancementDisableRegistrationCode(c *gin.Context) {
+	id, err := pathInt(c, "id")
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	operatorId, _ := operator(c)
+	data, err := enhancement.DisableRegistrationCode(id, operatorId)
+	respondPublic(c, data, err)
+}
+
+func enhancementEnableRegistrationCode(c *gin.Context) {
+	id, err := pathInt(c, "id")
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	operatorId, _ := operator(c)
+	data, err := enhancement.EnableRegistrationCode(id, operatorId)
+	respondPublic(c, data, err)
+}
+
 func enhancementUserActivityStats(c *gin.Context) {
 	data, err := enhancement.UserActivityStats(queryInt64(c, "start", 0), queryInt64(c, "end", 0))
 	respondPublic(c, data, err)
 }
 
 func enhancementBannedUsers(c *gin.Context) {
-	data, err := enhancement.ListUsers(queryInt(c, "p", 1), queryInt(c, "page_size", 20), common.UserStatusDisabled, c.Query("group"))
+	query := enhancementListQuery(c)
+	query.Filters["status"] = strconv.Itoa(common.UserStatusDisabled)
+	data, err := enhancement.ListUsers(query)
 	respondPublic(c, data, err)
 }
 
 func enhancementListUsers(c *gin.Context) {
-	data, err := enhancement.ListUsers(queryInt(c, "p", 1), queryInt(c, "page_size", 20), queryInt(c, "status", 0), c.Query("group"))
+	data, err := enhancement.ListUsers(enhancementListQuery(c))
 	respondPublic(c, data, err)
 }
 
@@ -417,7 +548,7 @@ func enhancementDisableToken(c *gin.Context) {
 }
 
 func enhancementListTokens(c *gin.Context) {
-	data, err := enhancement.ListTokens(queryInt(c, "p", 1), queryInt(c, "page_size", 20), queryInt(c, "status", 0), c.Query("group"), c.Query("key"))
+	data, err := enhancement.ListTokens(enhancementListQuery(c))
 	respondPublic(c, data, err)
 }
 
@@ -435,6 +566,17 @@ func enhancementUpdateToken(c *gin.Context) {
 	operatorId, _ := operator(c)
 	data, err := enhancement.UpdateToken(tokenId, req, operatorId)
 	respondPublic(c, data, err)
+}
+
+func enhancementDeleteToken(c *gin.Context) {
+	tokenId, err := pathInt(c, "token_id")
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	operatorId, _ := operator(c)
+	err = enhancement.DeleteToken(tokenId, operatorId)
+	respondPublic(c, gin.H{"deleted": true}, err)
 }
 
 func enhancementTokenStats(c *gin.Context) {
@@ -472,11 +614,39 @@ func ipRiskQuery(c *gin.Context) enhancement.IPRiskQuery {
 		Sort:     c.Query("sort"),
 		Order:    c.Query("order"),
 		Keyword:  c.Query("keyword"),
+		Filters:  enhancementFilters(c),
 	}
 }
 
 func enhancementSharedTokenIPs(c *gin.Context) {
 	data, err := enhancement.SharedTokenIPs(ipRiskQuery(c))
+	respondPublic(c, data, err)
+}
+
+func enhancementBanSharedTokenIPUsers(c *gin.Context) {
+	var req enhancement.BanUserRequest
+	_ = common.DecodeJson(c.Request.Body, &req)
+	ip, err := url.PathUnescape(c.Param("ip"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	operatorId, role := operator(c)
+	data, err := enhancement.BanSharedTokenIPUsers(ip, ipRiskQuery(c), operatorId, role, req.Reason, req.UserIds)
+	respondPublic(c, data, err)
+}
+
+func enhancementCreateRiskIPBans(c *gin.Context) {
+	var req enhancement.RiskIPBanRequest
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if selfLockConfirmationRequired(c, req.ConfirmSelfLock, req.Targets) {
+		return
+	}
+	operatorId, _ := operator(c)
+	data, err := enhancement.CreateRiskIPBans(req, operatorId)
 	respondPublic(c, data, err)
 }
 
@@ -496,17 +666,19 @@ func enhancementUserRiskAnalysis(c *gin.Context) {
 }
 
 func enhancementBanRecords(c *gin.Context) {
-	data, err := enhancement.ListUsers(queryInt(c, "p", 1), queryInt(c, "page_size", 20), common.UserStatusDisabled, "")
+	query := enhancementListQuery(c)
+	query.Filters["status"] = strconv.Itoa(common.UserStatusDisabled)
+	data, err := enhancement.ListUsers(query)
 	respondPublic(c, data, err)
 }
 
 func enhancementTokenRotation(c *gin.Context) {
-	data, err := enhancement.ListTokens(queryInt(c, "p", 1), queryInt(c, "page_size", 20), 0, "", "")
+	data, err := enhancement.ListTokens(enhancementListQuery(c))
 	respondPublic(c, data, err)
 }
 
 func enhancementAffiliatedAccounts(c *gin.Context) {
-	data, err := enhancement.RiskLeaderboards(queryInt64(c, "start", 0), queryInt64(c, "end", 0), queryInt(c, "limit", 20))
+	data, err := enhancement.RiskLeaderboardsPage(queryInt64(c, "start", 0), queryInt64(c, "end", 0), enhancementListQuery(c))
 	respondPublic(c, data, err)
 }
 
@@ -562,7 +734,7 @@ func enhancementModelStatusMultiple(c *gin.Context) {
 }
 
 func enhancementModelStatusAll(c *gin.Context) {
-	data, err := enhancement.ModelStatusesForWindow(nil, modelStatusWindowFromQuery(c), false)
+	data, err := enhancement.ModelStatusesPageForWindow(modelStatusWindowFromQuery(c), enhancementListQuery(c), false)
 	respondPublic(c, data, err)
 }
 
@@ -611,12 +783,12 @@ func enhancementAutoGroupStats(c *gin.Context) {
 }
 
 func enhancementAutoGroupPreview(c *gin.Context) {
-	data, err := enhancement.AutoGroupPreview(queryInt(c, "limit", 20))
+	data, err := enhancement.AutoGroupPreview(enhancementListQuery(c))
 	respondPublic(c, data, err)
 }
 
 func enhancementAutoGroupScan(c *gin.Context) {
-	data, err := enhancement.AutoGroupPreview(queryInt(c, "limit", 20))
+	data, err := enhancement.AutoGroupPreview(enhancementListQuery(c))
 	respondPublic(c, gin.H{"dry_run": true, "candidates": data}, err)
 }
 
@@ -633,12 +805,12 @@ func enhancementAIBanAuditLogs(c *gin.Context) {
 }
 
 func enhancementAIBanSuspicious(c *gin.Context) {
-	data, err := enhancement.RiskLeaderboards(queryInt64(c, "start", 0), queryInt64(c, "end", 0), queryInt(c, "limit", 20))
+	data, err := enhancement.RiskLeaderboardsPage(queryInt64(c, "start", 0), queryInt64(c, "end", 0), enhancementListQuery(c))
 	respondPublic(c, data, err)
 }
 
 func enhancementAIBanDryRun(c *gin.Context) {
-	data, err := enhancement.RiskLeaderboards(queryInt64(c, "start", 0), queryInt64(c, "end", 0), queryInt(c, "limit", 20))
+	data, err := enhancement.RiskLeaderboardsPage(queryInt64(c, "start", 0), queryInt64(c, "end", 0), enhancementListQuery(c))
 	respondPublic(c, gin.H{"dry_run": true, "candidates": data}, err)
 }
 
@@ -689,6 +861,17 @@ func enhancementBatchDeleteUsers(c *gin.Context) {
 	}
 	operatorId, role := operator(c)
 	data, err := enhancement.BatchDeleteUsers(req.Ids, operatorId, role)
+	respondPublic(c, data, err)
+}
+
+func enhancementGitHubAgeBanUsers(c *gin.Context) {
+	var req enhancement.GitHubAgeBanRequest
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	operatorId, _ := operator(c)
+	data, err := enhancement.BatchBanYoungGitHubUsers(c.Request.Context(), req, operatorId)
 	respondPublic(c, data, err)
 }
 

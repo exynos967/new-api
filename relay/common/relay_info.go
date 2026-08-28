@@ -102,6 +102,9 @@ type RelayInfo struct {
 	UsePrice               bool
 	RelayMode              int
 	OriginModelName        string
+	ClientModelName        string
+	ModelMappingTargetName string
+	ModelMappingBypassed   bool
 	RequestURLPath         string
 	RequestHeaders         map[string]string
 	ShouldIncludeUsage     bool
@@ -226,6 +229,7 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 	}
 
 	info.ChannelMeta = channelMeta
+	SetRelayInfo(c, info)
 
 	// reset some fields based on channel meta
 	// 重置某些字段，例如模型名称等
@@ -315,6 +319,7 @@ var streamSupportedChannels = map[int]bool{
 	constant.ChannelTypeAnthropic:   true,
 	constant.ChannelTypeAws:         true,
 	constant.ChannelTypeGemini:      true,
+	constant.ChannelTypeVertexAi:    true,
 	constant.ChannelCloudflare:      true,
 	constant.ChannelTypeAzure:       true,
 	constant.ChannelTypeVolcEngine:  true,
@@ -329,6 +334,11 @@ var streamSupportedChannels = map[int]bool{
 	constant.ChannelTypeMoonshot:    true,
 	constant.ChannelTypeMiniMax:     true,
 	constant.ChannelTypeSiliconFlow: true,
+	constant.ChannelTypePoe:         true,
+	constant.ChannelTypeOpenAILocal: true,
+	constant.ChannelTypeCerebras:    true,
+	constant.ChannelTypeOpenCode:    true,
+	constant.ChannelTypeOpenCodeGo:  true,
 }
 
 func GenRelayInfoWs(c *gin.Context, ws *websocket.Conn) *RelayInfo {
@@ -417,6 +427,13 @@ func GenRelayInfoImage(c *gin.Context, request dto.Request) *RelayInfo {
 	return info
 }
 
+func GenRelayInfoOpenAILocalSearch(c *gin.Context, request dto.Request) *RelayInfo {
+	info := genBaseRelayInfo(c, request)
+	info.RelayMode = relayconstant.RelayModeOpenAILocalSearch
+	info.RelayFormat = types.RelayFormatOpenAILocalSearch
+	return info
+}
+
 func GenRelayInfoOpenAI(c *gin.Context, request dto.Request) *RelayInfo {
 	info := genBaseRelayInfo(c, request)
 	info.RelayFormat = types.RelayFormatOpenAI
@@ -464,6 +481,7 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 		UserEmail:  common.GetContextKeyString(c, constant.ContextKeyUserEmail),
 
 		OriginModelName: common.GetContextKeyString(c, constant.ContextKeyOriginalModel),
+		ClientModelName: common.GetContextKeyString(c, constant.ContextKeyOriginalModel),
 
 		TokenId:        common.GetContextKeyInt(c, constant.ContextKeyTokenId),
 		TokenKey:       common.GetContextKeyString(c, constant.ContextKeyTokenKey),
@@ -539,6 +557,8 @@ func GenRelayInfo(c *gin.Context, relayFormat types.RelayFormat, request dto.Req
 		info = GenRelayInfoImage(c, request)
 	case types.RelayFormatOpenAIRealtime:
 		info = GenRelayInfoWs(c, ws)
+	case types.RelayFormatOpenAILocalSearch:
+		info = GenRelayInfoOpenAILocalSearch(c, request)
 	case types.RelayFormatClaude:
 		info = GenRelayInfoClaude(c, request)
 	case types.RelayFormatRerank:
@@ -559,9 +579,10 @@ func GenRelayInfo(c *gin.Context, relayFormat types.RelayFormat, request dto.Req
 		err = errors.New("request is not a OpenAIResponsesRequest")
 	case types.RelayFormatOpenAIResponsesCompaction:
 		if request, ok := request.(*dto.OpenAIResponsesCompactionRequest); ok {
-			return GenRelayInfoResponsesCompaction(c, request), nil
+			info = GenRelayInfoResponsesCompaction(c, request)
+			break
 		}
-		return nil, errors.New("request is not a OpenAIResponsesCompactionRequest")
+		err = errors.New("request is not a OpenAIResponsesCompactionRequest")
 	case types.RelayFormatTask:
 		info = genBaseRelayInfo(c, nil)
 		info.TaskRelayInfo = &TaskRelayInfo{}
@@ -580,7 +601,34 @@ func GenRelayInfo(c *gin.Context, relayFormat types.RelayFormat, request dto.Req
 	}
 
 	info.InitRequestConversionChain()
+	SetRelayInfo(c, info)
+	InstallRelayResponseWriter(c)
 	return info, nil
+}
+
+func (info *RelayInfo) IsModelMappingFullActive() bool {
+	return info != nil && info.ChannelMeta != nil && info.ChannelSetting.ModelMappingFullEnabled &&
+		info.IsModelMapped && !info.ModelMappingBypassed && strings.TrimSpace(info.ClientModelName) != ""
+}
+
+func (info *RelayInfo) MarkModelMappingBypassed() {
+	if info != nil {
+		info.ModelMappingBypassed = true
+	}
+}
+
+func (info *RelayInfo) GetDisplayModelName() string {
+	if info == nil {
+		return ""
+	}
+	if info.IsModelMappingFullActive() {
+		return info.ClientModelName
+	}
+	return info.OriginModelName
+}
+
+func (info *RelayInfo) ShouldExposeModelMapping() bool {
+	return info != nil && info.IsModelMapped && !info.IsModelMappingFullActive()
 }
 
 func (info *RelayInfo) InitRequestConversionChain() {
@@ -679,6 +727,7 @@ type TaskSubmitReq struct {
 	Model          string                 `json:"model,omitempty"`
 	Mode           string                 `json:"mode,omitempty"`
 	Image          string                 `json:"image,omitempty"`
+	ImageURL       string                 `json:"image_url,omitempty"`
 	Images         []string               `json:"images,omitempty"`
 	Size           string                 `json:"size,omitempty"`
 	Duration       int                    `json:"duration,omitempty"`
@@ -694,7 +743,10 @@ func (t *TaskSubmitReq) GetPrompt() string {
 }
 
 func (t *TaskSubmitReq) HasImage() bool {
-	return len(t.Images) > 0
+	return strings.TrimSpace(t.Image) != "" ||
+		strings.TrimSpace(t.ImageURL) != "" ||
+		strings.TrimSpace(t.InputReference) != "" ||
+		len(t.Images) > 0
 }
 
 func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
@@ -702,6 +754,7 @@ func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
 	aux := &struct {
 		Metadata json.RawMessage `json:"metadata,omitempty"`
 		Duration json.RawMessage `json:"duration,omitempty"`
+		Image    json.RawMessage `json:"image,omitempty"`
 		*Alias
 	}{
 		Alias: (*Alias)(t),
@@ -721,6 +774,20 @@ func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
 				if v, err := strconv.Atoi(durationStr); err == nil {
 					t.Duration = v
 				}
+			}
+		}
+	}
+
+	if len(aux.Image) > 0 {
+		var imageStr string
+		if err := common.Unmarshal(aux.Image, &imageStr); err == nil {
+			t.Image = imageStr
+		} else {
+			var imageObj struct {
+				URL string `json:"url"`
+			}
+			if err := common.Unmarshal(aux.Image, &imageObj); err == nil {
+				t.Image = imageObj.URL
 			}
 		}
 	}

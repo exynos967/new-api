@@ -61,6 +61,9 @@ import {
   Jimeng,
   Perplexity,
   Replicate,
+  Poe,
+  Cerebras,
+  Vercel,
 } from '@lobehub/icons';
 
 import {
@@ -69,19 +72,21 @@ import {
   MessageSquare,
   Key,
   BarChart3,
+  Mail,
   Image as ImageIcon,
   CheckSquare,
   CreditCard,
   Layers,
+  Cloud,
   Gift,
   User,
   Settings,
-  Globe2,
   CircleUser,
   Package,
   Server,
   CalendarClock,
   Sparkles,
+  Ban,
 } from 'lucide-react';
 import {
   SiAtlassian,
@@ -133,6 +138,8 @@ export function getLucideIcon(key, selected = false) {
       return <Key {...commonProps} color={iconColor} />;
     case 'log':
       return <BarChart3 {...commonProps} color={iconColor} />;
+    case 'email_log':
+      return <Mail {...commonProps} color={iconColor} />;
     case 'midjourney':
       return <ImageIcon {...commonProps} color={iconColor} />;
     case 'task':
@@ -152,12 +159,12 @@ export function getLucideIcon(key, selected = false) {
       return <Server {...commonProps} color={iconColor} />;
     case 'subscription':
       return <CalendarClock {...commonProps} color={iconColor} />;
+    case 'ip_ban':
+      return <Ban {...commonProps} color={iconColor} />;
     case 'enhancements':
       return <Sparkles {...commonProps} color={iconColor} />;
     case 'setting':
       return <Settings {...commonProps} color={iconColor} />;
-    case 'site':
-      return <Globe2 {...commonProps} color={iconColor} />;
     default:
       return <CircleUser {...commonProps} color={iconColor} />;
   }
@@ -353,6 +360,7 @@ export function getChannelIcon(channelType) {
     case 33: // AWS Claude
       return <Claude.Color size={iconSize} />;
     case 41: // Vertex AI
+    case 60: // Google Cloud
       return <Gemini.Color size={iconSize} />;
     case 34: // Cohere
       return <Cohere.Color size={iconSize} />;
@@ -360,6 +368,16 @@ export function getChannelIcon(channelType) {
       return <Cloudflare.Color size={iconSize} />;
     case 43: // DeepSeek
       return <DeepSeek.Color size={iconSize} />;
+    case 62: // Cerebras
+      return <Cerebras.Color size={iconSize} />;
+    case 66: // Vercel AI Gateway
+      return <Vercel size={iconSize} />;
+    case 67: // GMI Cloud
+    case 68: // VyceAI
+      return <Cloud size={iconSize} />;
+    case 63: // OpenCode Zen
+    case 64: // OpenCode Go
+      return <Layers size={iconSize} />;
     case 15: // 百度文心千帆
     case 46: // 百度文心千帆V2
       return <Wenxin.Color size={iconSize} />;
@@ -396,6 +414,7 @@ export function getChannelIcon(channelType) {
     case 40: // SiliconCloud
       return <SiliconCloud.Color size={iconSize} />;
     case 42: // Mistral AI
+    case 65: // Mistral Console
       return <Mistral.Color size={iconSize} />;
     case 45: // 字节火山方舟、豆包通用
       return <Doubao.Color size={iconSize} />;
@@ -411,6 +430,8 @@ export function getChannelIcon(channelType) {
       return <Doubao.Color size={iconSize} />;
     case 56: // Replicate
       return <Replicate size={iconSize} />;
+    case 59: // Poe
+      return <Poe size={iconSize} />;
     case 8: // 自定义渠道
     case 22: // 知识库：FastGPT
       return <FastGPT.Color size={iconSize} />;

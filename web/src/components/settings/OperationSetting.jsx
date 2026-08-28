@@ -79,6 +79,12 @@ const OperationSetting = () => {
     'checkin_setting.enabled': false,
     'checkin_setting.min_quota': 1000,
     'checkin_setting.max_quota': 10000,
+    'checkin_setting.special_enabled': false,
+    'checkin_setting.special_weekday': '1',
+    'checkin_setting.special_quota': 0,
+    'checkin_setting.expire_enabled': false,
+    'checkin_setting.expire_mode': 'unused',
+    'checkin_setting.client_check_enabled': false,
 
     /* 令牌设置 */
     'token_setting.max_user_tokens': 1000,

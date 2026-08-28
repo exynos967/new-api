@@ -67,6 +67,7 @@ const ModelTestModal = ({
     'jina-rerank',
     'cohere-rerank',
     'openai-response-compact',
+    'openai-video',
   ].includes(selectedEndpointType);
 
   React.useEffect(() => {
@@ -117,6 +118,7 @@ const ModelTestModal = ({
       value: 'image-generation',
       label: t('图像生成') + ' (/v1/images/generations)',
     },
+    { value: 'openai-video', label: 'OpenAI Video (/v1/videos)' },
     { value: 'embeddings', label: 'Embeddings (/v1/embeddings)' },
   ];
 
@@ -154,6 +156,36 @@ const ModelTestModal = ({
     setSelectedModelKeys(successKeys);
   };
 
+  const formatRateLimitSummary = (rateLimit) => {
+    if (!rateLimit) return '';
+    const limits = [];
+    const appendLimit = (value, unit) => {
+      if (value) {
+        limits.push(`${value} ${unit}`);
+      }
+    };
+
+    appendLimit(rateLimit.limit_requests, 'RPM');
+    appendLimit(
+      rateLimit.limit_tokens || rateLimit.limit_project_tokens,
+      'TPM',
+    );
+    appendLimit(rateLimit.limit_input_tokens, 'ITPM');
+    appendLimit(rateLimit.limit_output_tokens, 'OTPM');
+    appendLimit(
+      rateLimit.limit_priority_input_tokens,
+      t('优先级 ${unit}').replace('${unit}', 'ITPM'),
+    );
+    appendLimit(
+      rateLimit.limit_priority_output_tokens,
+      t('优先级 ${unit}').replace('${unit}', 'OTPM'),
+    );
+
+    return limits.length
+      ? t('限速: ${limits}').replace('${limits}', limits.join(' / '))
+      : '';
+  };
+
   const columns = [
     {
       title: t('模型名称'),
@@ -188,6 +220,9 @@ const ModelTestModal = ({
           );
         }
 
+        const rateLimitTier = testResult.rateLimit?.tier;
+        const rateLimitSummary = formatRateLimitSummary(testResult.rateLimit);
+
         return (
           <div className='flex flex-col gap-1'>
             <div className='flex items-center gap-2'>
@@ -203,6 +238,16 @@ const ModelTestModal = ({
                 </Typography.Text>
               )}
             </div>
+            {testResult.success && rateLimitTier && (
+              <Typography.Text type='tertiary' size='small'>
+                {t('付费层级: ${tier}').replace('${tier}', rateLimitTier)}
+              </Typography.Text>
+            )}
+            {testResult.success && !rateLimitTier && rateLimitSummary && (
+              <Typography.Text type='tertiary' size='small'>
+                {rateLimitSummary}
+              </Typography.Text>
+            )}
             {!testResult.success && testResult.message && (
               <div className='flex flex-col gap-1'>
                 <Typography.Text

@@ -262,6 +262,8 @@ func migrateDB() error {
 		&PasskeyCredential{},
 		&Option{},
 		&Redemption{},
+		&RegistrationCode{},
+		&RegistrationCodeUsage{},
 		&Ability{},
 		&Log{},
 		&ConversationLog{},
@@ -281,8 +283,14 @@ func migrateDB() error {
 		&SubscriptionPreConsumeRecord{},
 		&CustomOAuthProvider{},
 		&UserOAuthBinding{},
+		&IPBan{},
+		&IPBanUserBan{},
+		&ProbeIPAbuseState{},
 	)
 	if err != nil {
+		return err
+	}
+	if err := EnsureIPBanUserBanUniqueIndex(DB); err != nil {
 		return err
 	}
 	if err := migrateConversationLogBodyColumns(DB); err != nil {
@@ -314,6 +322,8 @@ func migrateDBFast() error {
 		{&PasskeyCredential{}, "PasskeyCredential"},
 		{&Option{}, "Option"},
 		{&Redemption{}, "Redemption"},
+		{&RegistrationCode{}, "RegistrationCode"},
+		{&RegistrationCodeUsage{}, "RegistrationCodeUsage"},
 		{&Ability{}, "Ability"},
 		{&Log{}, "Log"},
 		{&ConversationLog{}, "ConversationLog"},
@@ -333,6 +343,8 @@ func migrateDBFast() error {
 		{&SubscriptionPreConsumeRecord{}, "SubscriptionPreConsumeRecord"},
 		{&CustomOAuthProvider{}, "CustomOAuthProvider"},
 		{&UserOAuthBinding{}, "UserOAuthBinding"},
+		{&IPBan{}, "IPBan"},
+		{&ProbeIPAbuseState{}, "ProbeIPAbuseState"},
 	}
 	// 动态计算migration数量，确保errChan缓冲区足够大
 	errChan := make(chan error, len(migrations))

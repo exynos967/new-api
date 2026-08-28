@@ -27,6 +27,7 @@ export const API_ENDPOINTS = [
   '/v1/chat/completions',
   '/v1/responses',
   '/v1/responses/compact',
+  '/v1/search',
   '/v1/messages',
   '/v1beta/models',
   '/v1/embeddings',
@@ -34,7 +35,12 @@ export const API_ENDPOINTS = [
   '/v1/images/generations',
   '/v1/images/edits',
   '/v1/images/variations',
+  '/v1/ppt/generations',
+  '/v1/psd/generations',
   '/v1/audio/speech',
+  '/v1/audio/generations',
+  '/v1/music/generations',
+  '/v1/batch/generations',
   '/v1/audio/transcriptions',
   '/v1/audio/translations',
 ];
@@ -44,3 +50,11 @@ export const TASK_ACTION_TEXT_GENERATE = 'textGenerate';
 export const TASK_ACTION_FIRST_TAIL_GENERATE = 'firstTailGenerate';
 export const TASK_ACTION_REFERENCE_GENERATE = 'referenceGenerate';
 export const TASK_ACTION_REMIX_GENERATE = 'remixGenerate';
+export const TASK_ACTION_PPT = 'ppt';
+export const TASK_ACTION_PSD = 'psd';
+export const TASK_ACTION_IMAGE_GENERATION = 'image_generation';
+export const TASK_ACTION_IMAGE_EDIT = 'image_edit';
+export const TASK_ACTION_AUDIO_GENERATION = 'audio_generation';
+export const TASK_ACTION_MUSIC_GENERATION = 'music_generation';
+export const TASK_ACTION_VOICE_CLONE = 'voice_clone';
+export const TASK_ACTION_BATCH_INFERENCE = 'batch_inference';

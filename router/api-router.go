@@ -21,6 +21,7 @@ func SetApiRouter(router *gin.Engine) {
 		apiRouter.GET("/setup", controller.GetSetup)
 		apiRouter.POST("/setup", controller.PostSetup)
 		apiRouter.GET("/status", controller.GetStatus)
+		apiRouter.GET("/site-background/image", controller.GetSiteBackgroundImage)
 		apiRouter.GET("/uptime/status", controller.GetUptimeKumaStatus)
 		apiRouter.GET("/models", middleware.UserAuth(), controller.DashboardListModels)
 		apiRouter.GET("/status/test", middleware.AdminAuth(), controller.TestStatus)
@@ -139,9 +140,11 @@ func SetApiRouter(router *gin.Engine) {
 				adminRoute.GET("/:id/oauth/bindings", controller.GetUserOAuthBindingsByAdmin)
 				adminRoute.DELETE("/:id/oauth/bindings/:provider_id", controller.UnbindCustomOAuthByAdmin)
 				adminRoute.DELETE("/:id/bindings/:binding_type", controller.AdminClearUserBinding)
+				adminRoute.GET("/:id/invite-relations", controller.GetUserInviteRelations)
 				adminRoute.GET("/:id", controller.GetUser)
 				adminRoute.POST("/", controller.CreateUser)
 				adminRoute.POST("/manage", controller.ManageUser)
+				adminRoute.POST("/batch-disable", controller.BatchDisableRelatedUsers)
 				adminRoute.POST("/soft-deleted/purge", controller.PurgeSoftDeletedUsers)
 				adminRoute.PUT("/", controller.UpdateUser)
 				adminRoute.DELETE("/:id", controller.DeleteUser)
@@ -347,6 +350,21 @@ func SetApiRouter(router *gin.Engine) {
 		groupRoute.Use(middleware.AdminAuth())
 		{
 			groupRoute.GET("/", controller.GetGroups)
+		}
+
+		ipBanRoute := apiRouter.Group("/ip_ban")
+		ipBanRoute.Use(middleware.AdminAuth())
+		{
+			ipBanRoute.GET("/", controller.GetAllIPBans)
+			ipBanRoute.GET("/search", controller.SearchIPBans)
+			ipBanRoute.GET("/:id", controller.GetIPBan)
+			ipBanRoute.GET("/:id/banned_users", controller.GetIPBanRelatedUsers)
+			ipBanRoute.POST("/", controller.AddIPBan)
+			ipBanRoute.PUT("/", controller.UpdateIPBan)
+			ipBanRoute.DELETE("/:id", controller.DeleteIPBan)
+			ipBanRoute.POST("/batch", controller.BatchCreateIPBans)
+			ipBanRoute.POST("/batch_delete", controller.BatchDeleteIPBans)
+			ipBanRoute.POST("/batch_update", controller.BatchUpdateIPBans)
 		}
 
 		prefillGroupRoute := apiRouter.Group("/prefill_group")

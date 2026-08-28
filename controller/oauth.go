@@ -4,11 +4,14 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -26,6 +29,14 @@ func GenerateOAuthCode(c *gin.Context) {
 	affCode := c.Query("aff")
 	if affCode != "" {
 		session.Set("aff", affCode)
+	} else {
+		session.Delete("aff")
+	}
+	registrationCode := c.Query("registration_code")
+	if registrationCode != "" {
+		session.Set("registration_code", registrationCode)
+	} else {
+		session.Delete("registration_code")
 	}
 	session.Set("oauth_state", state)
 	err := session.Save()
@@ -111,6 +122,8 @@ func HandleOAuth(c *gin.Context) {
 			common.ApiErrorI18n(c, i18n.MsgOAuthUserDeleted)
 		case *OAuthRegistrationDisabledError:
 			common.ApiErrorI18n(c, i18n.MsgUserRegisterDisabled)
+		case *OAuthEmailAlreadyUsedError:
+			common.ApiErrorI18n(c, i18n.MsgOAuthEmailAlreadyUsed)
 		default:
 			common.ApiError(c, err)
 		}
@@ -160,6 +173,11 @@ func handleOAuthBind(c *gin.Context, provider oauth.Provider) {
 			common.ApiErrorI18n(c, i18n.MsgOAuthAlreadyBound, providerParams(provider.GetName()))
 			return
 		}
+	}
+
+	if err := validateOAuthAccountAgeForNewAssociation(provider, oauthUser, time.Now()); err != nil {
+		handleOAuthError(c, err)
+		return
 	}
 
 	// Get current user from session
@@ -237,6 +255,20 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 		return nil, &OAuthRegistrationDisabledError{}
 	}
 
+	if err := validateOAuthAccountAgeForNewAssociation(provider, oauthUser, time.Now()); err != nil {
+		return nil, err
+	}
+	if oauthUser.Email != "" {
+		oauthUser.Email = strings.TrimSpace(oauthUser.Email)
+		taken, err := model.EmailIdentityExists(model.DB, oauthUser.Email, 0, true)
+		if err != nil {
+			return nil, err
+		}
+		if taken {
+			return nil, &OAuthEmailAlreadyUsedError{}
+		}
+	}
+
 	// Set up new user
 	user.Username = provider.GetProviderPrefix() + strconv.Itoa(model.GetMaxUserId()+1)
 
@@ -264,10 +296,17 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 
 	// Handle affiliate code
 	affCode := session.Get("aff")
-	inviterId := 0
-	if affCode != nil {
-		inviterId, _ = model.GetUserIdByAffCode(affCode.(string))
+	affCodeValue := ""
+	if value, ok := affCode.(string); ok {
+		affCodeValue = value
 	}
+	inviterId, err := model.ResolveInviterIdByAffCode(affCodeValue, setting.IsInviteCodeRequired())
+	if err != nil {
+		return nil, err
+	}
+	registrationCode, _ := session.Get("registration_code").(string)
+	registrationCodeRequired := setting.IsRegistrationCodeRequired()
+	registrationSource := "oauth:" + provider.GetName()
 
 	// Use transaction to ensure user creation and OAuth binding are atomic
 	if genericProvider, ok := provider.(*oauth.GenericOAuthProvider); ok {
@@ -275,6 +314,9 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 		err := model.DB.Transaction(func(tx *gorm.DB) error {
 			// Create user
 			if err := user.InsertWithTx(tx, inviterId); err != nil {
+				return err
+			}
+			if err := model.ConsumeRegistrationCodeTx(tx, registrationCode, user.Id, user.Username, registrationSource, registrationCodeRequired); err != nil {
 				return err
 			}
 
@@ -301,6 +343,9 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 		err := model.DB.Transaction(func(tx *gorm.DB) error {
 			// Create user
 			if err := user.InsertWithTx(tx, inviterId); err != nil {
+				return err
+			}
+			if err := model.ConsumeRegistrationCodeTx(tx, registrationCode, user.Id, user.Username, registrationSource, registrationCodeRequired); err != nil {
 				return err
 			}
 
@@ -343,6 +388,37 @@ func (e *OAuthRegistrationDisabledError) Error() string {
 	return "registration is disabled"
 }
 
+type OAuthEmailAlreadyUsedError struct{}
+
+func (e *OAuthEmailAlreadyUsedError) Error() string {
+	return "oauth email is already associated with an account"
+}
+
+type OAuthAccountAgeTooLowError struct{}
+
+func (e *OAuthAccountAgeTooLowError) Error() string {
+	return "oauth account age too low"
+}
+
+func validateOAuthAccountAgeForNewAssociation(provider oauth.Provider, oauthUser *oauth.OAuthUser, now time.Time) error {
+	if _, ok := provider.(*oauth.GitHubProvider); !ok {
+		return nil
+	}
+	if common.GitHubMinimumAccountAgeSeconds <= 0 {
+		return nil
+	}
+	if oauthUser == nil || oauthUser.AccountCreatedAt == nil {
+		return &OAuthAccountAgeTooLowError{}
+	}
+
+	accountAgeSeconds := now.Unix() - oauthUser.AccountCreatedAt.Unix()
+	if accountAgeSeconds <= common.GitHubMinimumAccountAgeSeconds {
+		return &OAuthAccountAgeTooLowError{}
+	}
+
+	return nil
+}
+
 // handleOAuthError handles OAuth errors and returns translated message
 func handleOAuthError(c *gin.Context, err error) {
 	switch e := err.(type) {
@@ -356,6 +432,8 @@ func handleOAuthError(c *gin.Context, err error) {
 		common.ApiErrorMsg(c, e.Message)
 	case *oauth.TrustLevelError:
 		common.ApiErrorI18n(c, i18n.MsgOAuthTrustLevelLow)
+	case *OAuthAccountAgeTooLowError:
+		common.ApiErrorI18n(c, i18n.MsgOAuthAccountAgeTooLow)
 	default:
 		common.ApiError(c, err)
 	}

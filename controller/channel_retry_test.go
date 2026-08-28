@@ -218,6 +218,36 @@ func TestResolveFetchModelsURL(t *testing.T) {
 		"https://dashscope.aliyuncs.com/compatible-mode/v1/models",
 		resolveFetchModelsURL(constant.ChannelTypeAli, "https://dashscope.aliyuncs.com", ""),
 	)
+	require.Equal(
+		t,
+		"https://ark.cn-beijing.volces.com/api/v3/models",
+		resolveFetchModelsURL(constant.ChannelTypeVolcEngine, "https://ark.cn-beijing.volces.com", ""),
+	)
+	require.Equal(
+		t,
+		"https://ark.cn-beijing.volces.com/api/v3/models",
+		resolveFetchModelsURL(constant.ChannelTypeVolcEngine, "https://ark.cn-beijing.volces.com/api/v3/", ""),
+	)
+	require.Equal(
+		t,
+		"https://ark.cn-beijing.volces.com/api/coding/v3/models",
+		resolveFetchModelsURL(constant.ChannelTypeVolcEngine, "doubao-coding-plan", ""),
+	)
+	require.Equal(
+		t,
+		"https://api.poe.com/v1/models",
+		resolveFetchModelsURL(constant.ChannelTypePoe, constant.ChannelBaseURLs[constant.ChannelTypePoe], ""),
+	)
+	require.Equal(
+		t,
+		"https://api.cerebras.ai/v1/models",
+		resolveFetchModelsURL(constant.ChannelTypeCerebras, constant.ChannelBaseURLs[constant.ChannelTypeCerebras], ""),
+	)
+	require.Equal(
+		t,
+		"https://opencode.ai/zen/go/v1/models",
+		resolveFetchModelsURL(constant.ChannelTypeOpenCodeGo, constant.ChannelBaseURLs[constant.ChannelTypeOpenCodeGo], ""),
+	)
 }
 
 func TestFetchModelsUsesCustomModelListURL(t *testing.T) {
@@ -321,6 +351,22 @@ func TestFetchCohereModelsPaginatesEndpointsAndSorts(t *testing.T) {
 	require.Equal(t, []string{"command-a-03-2025", "command-r-plus", "embed-v4.0", "rerank-v4.0"}, models)
 }
 
+func TestFetchMistralConsoleModelsUsesStaticList(t *testing.T) {
+	channel := &model.Channel{
+		Type: constant.ChannelTypeMistralConsole,
+		Key:  "ory_session_test=\"session\"",
+	}
+
+	models, err := fetchChannelModelIDsWithKey(
+		channel,
+		constant.ChannelBaseURLs[constant.ChannelTypeMistralConsole],
+		channel.Key,
+		"",
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{"glm-5-2"}, models)
+}
+
 func TestFetchUpstreamModelsUsesSavedCustomModelListURL(t *testing.T) {
 	db := openChannelRetryControllerTestDB(t)
 
@@ -363,4 +409,87 @@ func TestFetchUpstreamModelsUsesSavedCustomModelListURL(t *testing.T) {
 	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &resp))
 	require.True(t, resp.Success, resp.Message)
 	require.Equal(t, []string{"custom/model-a", "custom/model-b"}, resp.Data)
+}
+
+func TestDashboardTaskViewsExposeErrorDetailsOnlyToRoot(t *testing.T) {
+	db := openChannelRetryControllerTestDB(t)
+
+	hiddenChannel := model.Channel{Name: "hidden-errors", Key: "key", Models: "task-model", Group: "default"}
+	hiddenChannel.SetSetting(dto.ChannelSettings{})
+	require.NoError(t, db.Create(&hiddenChannel).Error)
+	visibleChannel := model.Channel{Name: "visible-errors", Key: "key", Models: "task-model", Group: "default"}
+	visibleChannel.SetSetting(dto.ChannelSettings{ShowErrorDetails: true})
+	require.NoError(t, db.Create(&visibleChannel).Error)
+
+	tasks := []*model.Task{
+		{ChannelId: hiddenChannel.Id, Status: model.TaskStatusFailure, FailReason: "hidden provider detail", Data: []byte(`{"secret":true}`)},
+		{ChannelId: visibleChannel.Id, Status: model.TaskStatusFailure, FailReason: "visible provider detail", Data: []byte(`{"secret":true}`)},
+		{ChannelId: 999999, Status: model.TaskStatusFailure, FailReason: "deleted channel detail", Data: []byte(`{"secret":true}`)},
+	}
+	nonRootTasks := tasksToDto(tasks, false, false)
+	for _, task := range nonRootTasks {
+		require.Equal(t, dto.TaskFailureCode, task.FailReason)
+		require.Nil(t, task.Data)
+	}
+
+	rootTasks := tasksToDto(tasks, false, true)
+	require.Equal(t, "hidden provider detail", rootTasks[0].FailReason)
+	require.NotNil(t, rootTasks[0].Data)
+	require.Equal(t, "visible provider detail", rootTasks[1].FailReason)
+	require.NotNil(t, rootTasks[1].Data)
+	successTask := &model.Task{
+		Status:     model.TaskStatusSuccess,
+		FailReason: "",
+		Properties: model.Properties{Input: "user input"},
+		Data:       []byte(`{"result":"ok"}`),
+	}
+	nonRootSuccessTask := tasksToDto([]*model.Task{successTask}, false, false)[0]
+	require.Equal(t, successTask.Properties, nonRootSuccessTask.Properties)
+	require.Equal(t, successTask.Data, nonRootSuccessTask.Data)
+
+	midjourneyTasks := []*model.Midjourney{
+		{ChannelId: hiddenChannel.Id, Status: "FAILURE", FailReason: "hidden mj detail", Description: "hidden description", Properties: `{"secret":true}`, State: "secret state", ImageUrl: "https://secret.example/image", VideoUrl: "https://secret.example/video", VideoUrls: `["https://secret.example/video"]`, Buttons: "secret buttons"},
+		{ChannelId: visibleChannel.Id, Status: "FAILURE", FailReason: "visible mj detail", Description: "visible description", Properties: `{"secret":true}`, State: "secret state", ImageUrl: "https://secret.example/image", VideoUrl: "https://secret.example/video", VideoUrls: `["https://secret.example/video"]`, Buttons: "secret buttons"},
+	}
+	nonRootMidjourneyTasks := midjourneyTasksForViewer(midjourneyTasks, false)
+	for _, task := range nonRootMidjourneyTasks {
+		require.Equal(t, dto.TaskFailureCode, task.FailReason)
+		require.Equal(t, dto.TaskFailureCode, task.Description)
+		require.Empty(t, task.Properties)
+		require.Empty(t, task.State)
+		require.Empty(t, task.ImageUrl)
+		require.Empty(t, task.VideoUrl)
+		require.Empty(t, task.VideoUrls)
+		require.Empty(t, task.Buttons)
+	}
+	rootMidjourneyTasks := midjourneyTasksForViewer(midjourneyTasks, true)
+	require.Equal(t, "hidden mj detail", rootMidjourneyTasks[0].FailReason)
+	require.Equal(t, "visible mj detail", rootMidjourneyTasks[1].FailReason)
+	require.Equal(t, "hidden mj detail", midjourneyTasks[0].FailReason)
+	successMidjourneyTask := &model.Midjourney{Status: "SUCCESS", Description: "completed", Properties: `{"result":"ok"}`, ImageUrl: "https://example.com/image"}
+	nonRootSuccessMidjourneyTask := midjourneyTasksForViewer([]*model.Midjourney{successMidjourneyTask}, false)[0]
+	require.Equal(t, successMidjourneyTask.Description, nonRootSuccessMidjourneyTask.Description)
+	require.Equal(t, successMidjourneyTask.Properties, nonRootSuccessMidjourneyTask.Properties)
+	require.Equal(t, successMidjourneyTask.ImageUrl, nonRootSuccessMidjourneyTask.ImageUrl)
+}
+
+func TestLogViewsExposeErrorDetailsOnlyToRoot(t *testing.T) {
+	logs := []*model.Log{{
+		Type:    model.LogTypeError,
+		Content: "provider endpoint and account leaked",
+		Other:   `{"error_code":"invalid_api_key","admin_info":{"use_channel":[1,2]}}`,
+	}, {
+		Type:    model.LogTypeConsume,
+		Content: "normal usage detail",
+	}}
+
+	nonRootLogs := logsForViewer(logs, common.RoleAdminUser)
+	require.Equal(t, "invalid_api_key", nonRootLogs[0].Content)
+	require.NotContains(t, nonRootLogs[0].Other, "admin_info")
+	require.Equal(t, "provider endpoint and account leaked", logs[0].Content)
+	require.Equal(t, "normal usage detail", nonRootLogs[1].Content)
+
+	rootLogs := logsForViewer(logs, common.RoleRootUser)
+	require.Equal(t, "provider endpoint and account leaked", rootLogs[0].Content)
+	require.Contains(t, rootLogs[0].Other, "admin_info")
 }

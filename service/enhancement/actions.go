@@ -101,7 +101,7 @@ func DisableRedemption(id int, operatorId int) (RedemptionSummary, error) {
 			"redemption_id": id,
 		})
 	}
-	return redemptionToSummary(redemption, false), nil
+	return redemptionToSummary(redemption, true), nil
 }
 
 func EnableRedemption(id int, operatorId int) (RedemptionSummary, error) {
@@ -124,7 +124,7 @@ func EnableRedemption(id int, operatorId int) (RedemptionSummary, error) {
 			"redemption_id": id,
 		})
 	}
-	return redemptionToSummary(redemption, false), nil
+	return redemptionToSummary(redemption, true), nil
 }
 
 func BatchDeleteRedemptions(ids []int, operatorId int, force bool) (map[string]interface{}, error) {
@@ -193,6 +193,7 @@ func BanUser(userId int, operatorId int, operatorRole int, reason string) error 
 	if err := user.Update(false); err != nil {
 		return err
 	}
+	_ = model.InvalidateUserCache(user.Id)
 	_ = model.InvalidateUserTokensCache(user.Id)
 	audit(operatorId, "enhancements.users", "ban", map[string]interface{}{
 		"target_user_id": user.Id,
@@ -214,6 +215,7 @@ func UnbanUser(userId int, operatorId int, operatorRole int) error {
 	if err := user.Update(false); err != nil {
 		return err
 	}
+	_ = model.InvalidateUserCache(user.Id)
 	_ = model.InvalidateUserTokensCache(user.Id)
 	audit(operatorId, "enhancements.users", "unban", map[string]interface{}{
 		"target_user_id": user.Id,
@@ -311,6 +313,24 @@ func DisableToken(tokenId int, operatorId int) error {
 	return nil
 }
 
+func DeleteToken(tokenId int, operatorId int) error {
+	if tokenId <= 0 {
+		return errors.New("invalid token id")
+	}
+	var token model.Token
+	if err := model.DB.Where("id = ?", tokenId).First(&token).Error; err != nil {
+		return err
+	}
+	if err := token.Delete(); err != nil {
+		return err
+	}
+	audit(operatorId, "enhancements.tokens", "delete", map[string]interface{}{
+		"token_id": token.Id,
+		"user_id":  token.UserId,
+	})
+	return nil
+}
+
 func EnableAllRecordIPLog(operatorId int) (map[string]interface{}, error) {
 	var users []struct {
 		Id      int    `gorm:"column:id"`
@@ -355,6 +375,193 @@ func EnableAllRecordIPLog(operatorId int) (map[string]interface{}, error) {
 	return map[string]interface{}{
 		"updated":  len(updatedIDs),
 		"coverage": stats,
+	}, nil
+}
+
+func normalizeRiskIPBanTargets(targets []string) ([]string, error) {
+	if len(targets) == 0 {
+		return nil, errors.New("targets cannot be empty")
+	}
+	if len(targets) > MaxBatchOperation {
+		return nil, fmt.Errorf("targets exceeds limit %d", MaxBatchOperation)
+	}
+	seen := make(map[string]struct{}, len(targets))
+	normalizedTargets := make([]string, 0, len(targets))
+	for _, target := range targets {
+		normalized, err := model.NormalizeIPBanTarget(target)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		normalizedTargets = append(normalizedTargets, normalized)
+	}
+	if len(normalizedTargets) == 0 {
+		return nil, errors.New("targets cannot be empty")
+	}
+	return normalizedTargets, nil
+}
+
+func CreateRiskIPBans(req RiskIPBanRequest, operatorId int) (map[string]interface{}, error) {
+	targets, err := normalizeRiskIPBanTargets(req.Targets)
+	if err != nil {
+		return nil, err
+	}
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		reason = "risk ip ban"
+	}
+	if len([]rune(reason)) > 255 {
+		return nil, errors.New("reason is too long")
+	}
+
+	created := make([]*model.IPBan, 0, len(targets))
+	skipped := make([]string, 0)
+	for _, target := range targets {
+		if _, err := model.GetIPBanByTarget(target); err == nil {
+			skipped = append(skipped, target)
+			continue
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+
+		ban := &model.IPBan{
+			Target:      target,
+			Reason:      reason,
+			ExpiresAt:   0,
+			AutoBanUser: true,
+			CreatedBy:   operatorId,
+		}
+		if err := model.CreateIPBan(ban); err != nil {
+			return nil, err
+		}
+		created = append(created, ban)
+	}
+	if len(created) > 0 {
+		model.InitIPBanCache()
+	}
+	audit(operatorId, "enhancements.risk", "create_ip_bans", map[string]interface{}{
+		"targets": len(targets),
+		"created": len(created),
+		"skipped": len(skipped),
+	})
+	return map[string]interface{}{
+		"targets":         targets,
+		"created":         len(created),
+		"skipped":         len(skipped),
+		"created_items":   created,
+		"skipped_targets": skipped,
+	}, nil
+}
+
+func selectedUserIDSet(userIds *[]int) (map[int]struct{}, bool, error) {
+	if userIds == nil {
+		return nil, false, nil
+	}
+	if len(*userIds) == 0 {
+		return nil, true, errors.New("user_ids cannot be empty")
+	}
+	if len(*userIds) > MaxBatchOperation {
+		return nil, true, fmt.Errorf("user_ids exceeds limit %d", MaxBatchOperation)
+	}
+	set := make(map[int]struct{}, len(*userIds))
+	for _, id := range *userIds {
+		if id <= 0 {
+			continue
+		}
+		set[id] = struct{}{}
+	}
+	if len(set) == 0 {
+		return nil, true, errors.New("user_ids cannot be empty")
+	}
+	return set, true, nil
+}
+
+func BanSharedTokenIPUsers(ip string, query IPRiskQuery, operatorId int, operatorRole int, reason string, userIds *[]int) (map[string]interface{}, error) {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return nil, errors.New("ip cannot be empty")
+	}
+	query = normalizeIPRiskQuery(query)
+	selectedIDs, hasSelectedIDs, err := selectedUserIDSet(userIds)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := listIPRiskLogs(query.Start, query.End)
+	if err != nil {
+		return nil, err
+	}
+
+	usersByID := make(map[int]*IPRiskUserRef)
+	for _, row := range rows {
+		if row.IP != ip || row.UserId <= 0 || row.TokenId <= 0 {
+			continue
+		}
+		if hasSelectedIDs {
+			if _, ok := selectedIDs[row.UserId]; !ok {
+				continue
+			}
+		}
+		if user, ok := usersByID[row.UserId]; ok {
+			user.RequestCount++
+			if user.Username == "" {
+				user.Username = row.Username
+			}
+			continue
+		}
+		usersByID[row.UserId] = &IPRiskUserRef{
+			UserId:       row.UserId,
+			Username:     row.Username,
+			RequestCount: 1,
+		}
+	}
+
+	users := sortedIPRiskUsers(usersByID)
+	if len(users) == 0 {
+		if hasSelectedIDs {
+			return nil, errors.New("no selected users found for this ip in the selected window")
+		}
+		return nil, errors.New("no users found for this ip in the selected window")
+	}
+	if len(users) > MaxBatchOperation {
+		return nil, fmt.Errorf("users under this ip exceeds limit %d", MaxBatchOperation)
+	}
+
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = fmt.Sprintf("risk shared ip ban: %s", ip)
+	}
+	success := 0
+	failures := make([]map[string]interface{}, 0)
+	for _, user := range users {
+		if err := BanUser(user.UserId, operatorId, operatorRole, reason); err != nil {
+			failures = append(failures, map[string]interface{}{
+				"id":       user.UserId,
+				"username": user.Username,
+				"message":  err.Error(),
+			})
+			continue
+		}
+		success++
+	}
+
+	audit(operatorId, "enhancements.risk", "ban_shared_ip_users", map[string]interface{}{
+		"ip":       ip,
+		"total":    len(users),
+		"success":  success,
+		"fail":     len(failures),
+		"start":    query.Start,
+		"end":      query.End,
+		"selected": hasSelectedIDs,
+	})
+	return map[string]interface{}{
+		"ip":          ip,
+		"total_users": len(users),
+		"success":     success,
+		"failures":    failures,
+		"users":       users,
 	}, nil
 }
 
@@ -403,7 +610,30 @@ func UpdateToken(tokenId int, req UpdateTokenRequest, operatorId int) (TokenSumm
 	token.ModelLimits = strings.TrimSpace(req.ModelLimits)
 	allowIps := strings.TrimSpace(req.AllowIps)
 	token.AllowIps = &allowIps
-	token.Group = strings.TrimSpace(req.Group)
+	requestedGroups := token.GetGroups()
+	updateGroups := false
+	if req.Groups != nil {
+		requestedGroups = model.NormalizeTokenGroups(*req.Groups)
+		updateGroups = true
+	} else {
+		legacyGroup := strings.TrimSpace(req.Group)
+		if len(requestedGroups) <= 1 || legacyGroup != token.Group {
+			requestedGroups = model.NormalizeTokenGroups([]string{legacyGroup})
+			updateGroups = true
+		}
+	}
+	if len(requestedGroups) > 1 {
+		for _, group := range requestedGroups {
+			if group == "auto" {
+				return TokenSummary{}, errors.New("auto group cannot be combined with other groups")
+			}
+		}
+	}
+	if updateGroups {
+		if err := token.SetGroups(requestedGroups); err != nil {
+			return TokenSummary{}, err
+		}
+	}
 
 	if token.Status == common.TokenStatusEnabled {
 		if token.ExpiredTime != -1 && token.ExpiredTime <= common.GetTimestamp() {
@@ -452,18 +682,68 @@ func SaveSelectedModels(models []string, operatorId int) error {
 	return nil
 }
 
+const (
+	maxModelStatusIgnoredErrorKeywords     = 100
+	maxModelStatusIgnoredErrorKeywordRunes = 200
+)
+
+func parseModelStatusIgnoredErrorKeywords(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return []string{}, nil
+	}
+
+	var raw []string
+	if strings.HasPrefix(value, "[") {
+		if err := common.Unmarshal([]byte(value), &raw); err != nil {
+			return nil, errors.New("ignored error keywords must be a JSON string array or newline separated text")
+		}
+	} else {
+		value = strings.ReplaceAll(value, "\r\n", "\n")
+		value = strings.ReplaceAll(value, "\r", "\n")
+		raw = strings.Split(value, "\n")
+	}
+	return normalizeModelStatusIgnoredErrorKeywords(raw)
+}
+
+func normalizeModelStatusIgnoredErrorKeywords(raw []string) ([]string, error) {
+	keywords := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, item := range raw {
+		keyword := strings.TrimSpace(item)
+		if keyword == "" {
+			continue
+		}
+		if len([]rune(keyword)) > maxModelStatusIgnoredErrorKeywordRunes {
+			return nil, fmt.Errorf("ignored error keyword must be at most %d characters", maxModelStatusIgnoredErrorKeywordRunes)
+		}
+		key := strings.ToLower(keyword)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		keywords = append(keywords, keyword)
+		if len(keywords) > maxModelStatusIgnoredErrorKeywords {
+			return nil, fmt.Errorf("ignored error keywords must be at most %d entries", maxModelStatusIgnoredErrorKeywords)
+		}
+	}
+	return keywords, nil
+}
+
 func SaveModelStatusOption(key string, value string, operatorId int) error {
 	allowed := map[string]struct{}{
-		"public_embed_enabled":            {},
-		"model_status_time_window_mins":   {},
-		"model_status_refresh_seconds":    {},
-		"model_status_slot_minutes":       {},
-		"model_status_green_threshold":    {},
-		"model_status_yellow_threshold":   {},
-		"model_status_show_zero_requests": {},
-		"model_status_theme":              {},
-		"model_status_sort_mode":          {},
-		"model_status_site_title":         {},
+		"public_embed_enabled":                       {},
+		"model_status_time_window_mins":              {},
+		"model_status_refresh_seconds":               {},
+		"model_status_slot_minutes":                  {},
+		"model_status_green_threshold":               {},
+		"model_status_yellow_threshold":              {},
+		"model_status_request_count_hide_threshold":  {},
+		"model_status_ignore_error_keywords_enabled": {},
+		"model_status_ignored_error_keywords":        {},
+		"model_status_theme":                         {},
+		"model_status_sort_mode":                     {},
+		"model_status_site_title":                    {},
 	}
 	if _, ok := allowed[key]; !ok {
 		return errors.New("unsupported model status option")
@@ -498,10 +778,25 @@ func SaveModelStatusOption(key string, value string, operatorId int) error {
 		if err != nil || threshold <= 0 || threshold > 100 {
 			return errors.New("status threshold must be between 0 and 100")
 		}
-	case "model_status_show_zero_requests":
-		if _, err := strconv.ParseBool(value); err != nil {
-			return errors.New("show zero request models must be boolean")
+	case "model_status_request_count_hide_threshold":
+		threshold, err := strconv.Atoi(value)
+		if err != nil || threshold < 0 || threshold > 1000000 {
+			return errors.New("request count hide threshold must be an integer between 0 and 1000000")
 		}
+	case "model_status_ignore_error_keywords_enabled":
+		if _, err := strconv.ParseBool(value); err != nil {
+			return errors.New("ignore error keywords enabled must be boolean")
+		}
+	case "model_status_ignored_error_keywords":
+		keywords, err := parseModelStatusIgnoredErrorKeywords(value)
+		if err != nil {
+			return err
+		}
+		bytes, err := common.Marshal(keywords)
+		if err != nil {
+			return err
+		}
+		value = string(bytes)
 	case "model_status_theme":
 		if value != "light" && value != "dark" && value != "system" {
 			return errors.New("unsupported model status theme")
@@ -528,7 +823,7 @@ func AIBanConfig() map[string]interface{} {
 		"enabled":       cfg.AIBanEnabled,
 		"dry_run":       cfg.AIBanDryRun,
 		"model":         cfg.AIBanModel,
-		"base_url":      common.MaskSensitiveInfo(cfg.AIBanBaseURL),
+		"base_url":      cfg.AIBanBaseURL,
 		"api_key_set":   cfg.AIBanAPIKey != "",
 		"safe_defaults": true,
 	}
@@ -656,26 +951,31 @@ func AutoGroupConfig() map[string]interface{} {
 	}
 }
 
-func AutoGroupPreview(limit int) ([]UserSummary, error) {
-	limit = clampLimit(limit)
+func AutoGroupPreview(query ListQuery) (PageResult[UserSummary], error) {
+	query = normalizeListQuery(query)
 	autoGroups := setting.GetAutoGroups()
 	if len(autoGroups) == 0 {
-		return []UserSummary{}, nil
+		return PageResult[UserSummary]{Items: []UserSummary{}, Total: 0, Page: query.Page, PageSize: query.PageSize}, nil
 	}
 	var users []model.User
 	if err := model.DB.Omit("password").
 		Where("status = ?", common.UserStatusEnabled).
 		Order("used_quota DESC").
-		Limit(limit).
 		Find(&users).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, err
+		return PageResult[UserSummary]{}, err
 	}
 	out := make([]UserSummary, 0, len(users))
 	for _, user := range users {
 		if user.Role >= common.RoleRootUser {
 			continue
 		}
-		out = append(out, userToSummary(user))
+		item := userToSummary(user)
+		if userMatchesQuery(item, query) {
+			out = append(out, item)
+		}
 	}
-	return out, nil
+	if query.Sort != "" {
+		sortUserSummaries(out, query.Sort, query.Order)
+	}
+	return pageResult(out, query.Page, query.PageSize), nil
 }

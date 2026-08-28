@@ -14,6 +14,8 @@ const (
 	MaxBatchOperation     = 100
 )
 
+const MaxGenerateRegistrationCodes = 100
+
 type PageResult[T any] struct {
 	Items    []T   `json:"items"`
 	Total    int64 `json:"total"`
@@ -73,21 +75,22 @@ type ChannelSummary struct {
 }
 
 type TokenSummary struct {
-	Id                 int    `json:"id"`
-	UserId             int    `json:"user_id"`
-	Name               string `json:"name"`
-	Key                string `json:"key"`
-	Status             int    `json:"status"`
-	Group              string `json:"group"`
-	CreatedTime        int64  `json:"created_time"`
-	AccessedTime       int64  `json:"accessed_time"`
-	ExpiredTime        int64  `json:"expired_time"`
-	RemainQuota        int    `json:"remain_quota"`
-	UsedQuota          int    `json:"used_quota"`
-	UnlimitedQuota     bool   `json:"unlimited_quota"`
-	ModelLimitsEnabled bool   `json:"model_limits_enabled"`
-	ModelLimits        string `json:"model_limits"`
-	AllowIps           string `json:"allow_ips"`
+	Id                 int      `json:"id"`
+	UserId             int      `json:"user_id"`
+	Name               string   `json:"name"`
+	Key                string   `json:"key"`
+	Status             int      `json:"status"`
+	Group              string   `json:"group"`
+	Groups             []string `json:"groups"`
+	CreatedTime        int64    `json:"created_time"`
+	AccessedTime       int64    `json:"accessed_time"`
+	ExpiredTime        int64    `json:"expired_time"`
+	RemainQuota        int      `json:"remain_quota"`
+	UsedQuota          int      `json:"used_quota"`
+	UnlimitedQuota     bool     `json:"unlimited_quota"`
+	ModelLimitsEnabled bool     `json:"model_limits_enabled"`
+	ModelLimits        string   `json:"model_limits"`
+	AllowIps           string   `json:"allow_ips"`
 }
 
 type UserSummary struct {
@@ -98,6 +101,7 @@ type UserSummary struct {
 	Status            int    `json:"status"`
 	DisableReason     string `json:"disable_reason,omitempty"`
 	Email             string `json:"email"`
+	GitHubId          string `json:"github_id,omitempty"`
 	Quota             int    `json:"quota"`
 	UsedQuota         int    `json:"used_quota"`
 	RequestCount      int    `json:"request_count"`
@@ -105,8 +109,63 @@ type UserSummary struct {
 	TodayUsedTokens   int64  `json:"today_used_tokens"`
 	Group             string `json:"group"`
 	InviterId         int    `json:"inviter_id"`
+	AffCode           string `json:"aff_code,omitempty"`
 	AffCount          int    `json:"aff_count"`
+	RedemptionCount   int    `json:"redemption_count"`
+	RedemptionCodes   string `json:"redemption_codes,omitempty"`
 	LinuxDOId         string `json:"linux_do_id,omitempty"`
+}
+
+type GitHubAgeBanRequest struct {
+	MinimumAgeSeconds int64  `json:"minimum_age_seconds"`
+	Reason            string `json:"reason"`
+	DryRun            bool   `json:"dry_run"`
+	UserIds           []int  `json:"user_ids,omitempty"`
+	UserIdStart       int    `json:"user_id_start,omitempty"`
+	UserIdEnd         int    `json:"user_id_end,omitempty"`
+}
+
+type GitHubAgeBanUser struct {
+	Id                     int    `json:"id"`
+	Username               string `json:"username"`
+	DisplayName            string `json:"display_name,omitempty"`
+	Email                  string `json:"email,omitempty"`
+	GitHubId               string `json:"github_id"`
+	GitHubLogin            string `json:"github_login,omitempty"`
+	GitHubAccountCreatedAt string `json:"github_account_created_at"`
+	GitHubAccountAge       int64  `json:"github_account_age_seconds"`
+}
+
+type GitHubAgeBanSkippedUser struct {
+	Id       int    `json:"id"`
+	Username string `json:"username"`
+	GitHubId string `json:"github_id,omitempty"`
+	Reason   string `json:"reason"`
+}
+
+type GitHubAgeBanFailure struct {
+	Id       int    `json:"id"`
+	Username string `json:"username"`
+	GitHubId string `json:"github_id,omitempty"`
+	Message  string `json:"message"`
+}
+
+type GitHubAgeBanResult struct {
+	MinimumAgeSeconds int64                     `json:"minimum_age_seconds"`
+	DryRun            bool                      `json:"dry_run"`
+	UserIdStart       int                       `json:"user_id_start,omitempty"`
+	UserIdEnd         int                       `json:"user_id_end,omitempty"`
+	TotalCandidates   int                       `json:"total_candidates"`
+	Checked           int                       `json:"checked"`
+	Matched           int                       `json:"matched"`
+	Banned            int                       `json:"banned"`
+	Skipped           int                       `json:"skipped"`
+	Failures          int                       `json:"failures"`
+	RateLimited       bool                      `json:"rate_limited"`
+	RateLimitReset    int64                     `json:"rate_limit_reset,omitempty"`
+	MatchedUsers      []GitHubAgeBanUser        `json:"matched_users"`
+	SkippedUsers      []GitHubAgeBanSkippedUser `json:"skipped_users,omitempty"`
+	FailureUsers      []GitHubAgeBanFailure     `json:"failure_users,omitempty"`
 }
 
 type IPLogCoverage struct {
@@ -125,6 +184,7 @@ type IPRiskQuery struct {
 	Sort     string
 	Order    string
 	Keyword  string
+	Filters  map[string]string
 }
 
 type IPRiskUserRef struct {
@@ -207,15 +267,17 @@ type ModelStatus struct {
 	SlotData      []ModelStatusSlot `json:"slot_data"`
 	GeneratedAt   int64             `json:"generated_at"`
 
-	Status            string  `json:"status"`
-	Requests          int64   `json:"requests"`
-	ErrorRate         float64 `json:"error_rate"`
-	Quota             int64   `json:"quota"`
-	AvgUseTime        float64 `json:"avg_use_time"`
-	PromptTokens      int64   `json:"prompt_tokens"`
-	CompletionTokens  int64   `json:"completion_tokens"`
-	LastRequestAt     int64   `json:"last_request_at"`
-	TimeWindowMinutes int     `json:"time_window_minutes"`
+	Status                     string  `json:"status"`
+	Requests                   int64   `json:"requests"`
+	ErrorRate                  float64 `json:"error_rate"`
+	Quota                      int64   `json:"quota"`
+	AvgUseTime                 float64 `json:"avg_use_time"`
+	PromptTokens               int64   `json:"prompt_tokens"`
+	CompletionTokens           int64   `json:"completion_tokens"`
+	RecentAvgFirstResponseTime float64 `json:"recent_avg_first_response_time"`
+	RecentAvgOutputTokenSpeed  float64 `json:"recent_avg_output_token_speed"`
+	LastRequestAt              int64   `json:"last_request_at"`
+	TimeWindowMinutes          int     `json:"time_window_minutes"`
 }
 
 type GenerateRedemptionsRequest struct {
@@ -230,17 +292,25 @@ type BatchIDsRequest struct {
 }
 
 type BanUserRequest struct {
-	Reason string `json:"reason"`
+	Reason  string `json:"reason"`
+	UserIds *[]int `json:"user_ids,omitempty"`
+}
+
+type RiskIPBanRequest struct {
+	Targets         []string `json:"targets"`
+	Reason          string   `json:"reason"`
+	ConfirmSelfLock bool     `json:"confirm_self_lock"`
 }
 
 type UpdateTokenRequest struct {
-	Name               string `json:"name"`
-	Status             int    `json:"status"`
-	ExpiredTime        int64  `json:"expired_time"`
-	RemainQuota        int    `json:"remain_quota"`
-	UnlimitedQuota     bool   `json:"unlimited_quota"`
-	ModelLimitsEnabled bool   `json:"model_limits_enabled"`
-	ModelLimits        string `json:"model_limits"`
-	AllowIps           string `json:"allow_ips"`
-	Group              string `json:"group"`
+	Name               string    `json:"name"`
+	Status             int       `json:"status"`
+	ExpiredTime        int64     `json:"expired_time"`
+	RemainQuota        int       `json:"remain_quota"`
+	UnlimitedQuota     bool      `json:"unlimited_quota"`
+	ModelLimitsEnabled bool      `json:"model_limits_enabled"`
+	ModelLimits        string    `json:"model_limits"`
+	AllowIps           string    `json:"allow_ips"`
+	Group              string    `json:"group"`
+	Groups             *[]string `json:"groups"`
 }

@@ -61,6 +61,9 @@ type responseTask struct {
 		Message string `json:"message"`
 		Code    string `json:"code"`
 	} `json:"error,omitempty"`
+	Video *struct {
+		Url string `json:"url"`
+	} `json:"video,omitempty"`
 }
 
 // ============================
@@ -165,8 +168,17 @@ func seedanceEstimateBilling(c *gin.Context, modelName string) map[string]float6
 }
 
 func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, error) {
-	if info.Action == constant.TaskActionRemix {
-		return fmt.Sprintf("%s/v1/videos/%s/remix", a.baseURL, info.OriginTaskID), nil
+	action := ""
+	originTaskID := ""
+	if info != nil && info.TaskRelayInfo != nil {
+		action = info.TaskRelayInfo.Action
+		originTaskID = info.TaskRelayInfo.OriginTaskID
+	}
+	if action == constant.TaskActionRemix {
+		return fmt.Sprintf("%s/v1/videos/%s/remix", a.baseURL, originTaskID), nil
+	}
+	if isXaiRelayInfo(info) {
+		return fmt.Sprintf("%s/v1/videos/generations", a.baseURL), nil
 	}
 	return fmt.Sprintf("%s/v1/videos", a.baseURL), nil
 }
@@ -193,6 +205,9 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 		var bodyMap map[string]interface{}
 		if err := common.Unmarshal(cachedBody, &bodyMap); err == nil {
 			bodyMap["model"] = info.UpstreamModelName
+			if isXaiRelayInfo(info) {
+				normalizeXaiVideoRequestBody(bodyMap)
+			}
 			if newBody, err := common.Marshal(bodyMap); err == nil {
 				return bytes.NewReader(newBody), nil
 			}
@@ -337,14 +352,17 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		taskResult.Status = model.TaskStatusQueued
 	case "processing", "in_progress":
 		taskResult.Status = model.TaskStatusInProgress
-	case "completed":
+	case "completed", "succeeded", "succeed", "done":
 		taskResult.Status = model.TaskStatusSuccess
-		// Url intentionally left empty — the caller constructs the proxy URL using the public task ID
+		if resTask.Video != nil {
+			taskResult.Url = resTask.Video.Url
+		}
+		// If no URL is returned, the caller constructs the proxy URL using the public task ID.
 		// Seedance 2.0 在 metadata.total_tokens 返回真实 token 用量，供结算阶段按 token 重算。
 		if seedance.IsSeedanceModel(resTask.Model) && resTask.Metadata != nil {
 			taskResult.TotalTokens = resTask.Metadata.TotalTokens
 		}
-	case "failed", "cancelled":
+	case "failed", "cancelled", "canceled":
 		taskResult.Status = model.TaskStatusFailure
 		if resTask.Error != nil {
 			taskResult.Reason = resTask.Error.Message
@@ -358,6 +376,72 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 	}
 
 	return &taskResult, nil
+}
+
+func isXaiVideoModel(modelName string) bool {
+	return strings.HasPrefix(modelName, "grok-imagine-video")
+}
+
+func normalizeXaiVideoRequestBody(req map[string]interface{}) {
+	if req == nil {
+		return
+	}
+
+	if image, ok := req["image"]; ok {
+		if imageURL, ok := image.(string); ok && strings.TrimSpace(imageURL) != "" {
+			req["image"] = map[string]interface{}{"url": imageURL}
+		}
+		return
+	}
+
+	if imageURL := getRequestString(req, "image_url"); imageURL != "" {
+		req["image"] = map[string]interface{}{"url": imageURL}
+		delete(req, "image_url")
+		return
+	}
+
+	if inputReference := getRequestString(req, "input_reference"); inputReference != "" {
+		req["image"] = map[string]interface{}{"url": inputReference}
+		delete(req, "input_reference")
+		return
+	}
+
+	if images, ok := req["images"].([]interface{}); ok && len(images) > 0 {
+		switch first := images[0].(type) {
+		case string:
+			if strings.TrimSpace(first) != "" {
+				req["image"] = map[string]interface{}{"url": first}
+				delete(req, "images")
+			}
+		case map[string]interface{}:
+			req["image"] = first
+			delete(req, "images")
+		}
+	}
+}
+
+func getRequestString(req map[string]interface{}, key string) string {
+	value, ok := req[key]
+	if !ok || value == nil {
+		return ""
+	}
+	if s, ok := value.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func isXaiRelayInfo(info *relaycommon.RelayInfo) bool {
+	if info == nil {
+		return false
+	}
+	if isXaiVideoModel(info.OriginModelName) {
+		return true
+	}
+	if info.ChannelMeta == nil {
+		return false
+	}
+	return isXaiVideoModel(info.ChannelMeta.UpstreamModelName)
 }
 
 func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {

@@ -46,6 +46,7 @@ type Task struct {
 	CreatedAt  int64                 `json:"created_at" gorm:"index"`
 	UpdatedAt  int64                 `json:"updated_at"`
 	TaskID     string                `json:"task_id" gorm:"type:varchar(191);index"` // 第三方id，不一定有/ song id\ Task id
+	RequestId  string                `json:"request_id,omitempty" gorm:"type:varchar(64);index;default:''"`
 	Platform   constant.TaskPlatform `json:"platform" gorm:"type:varchar(30);index"` // 平台
 	UserId     int                   `json:"user_id" gorm:"index"`
 	Group      string                `json:"group" gorm:"type:varchar(50)"` // 修正计费用
@@ -101,10 +102,11 @@ type TaskPrivateData struct {
 	UpstreamTaskID string `json:"upstream_task_id,omitempty"` // 上游真实 task ID
 	ResultURL      string `json:"result_url,omitempty"`       // 任务成功后的结果 URL（视频地址等）
 	// 计费上下文：用于异步退款/差额结算（轮询阶段读取）
-	BillingSource  string              `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
-	SubscriptionId int                 `json:"subscription_id,omitempty"` // 订阅 ID，用于订阅退款
-	TokenId        int                 `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
-	BillingContext *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
+	BillingSource           string              `json:"billing_source,omitempty"`  // "wallet" 或 "subscription"
+	SubscriptionId          int                 `json:"subscription_id,omitempty"` // 订阅 ID，用于订阅退款
+	TokenId                 int                 `json:"token_id,omitempty"`        // 令牌 ID，用于令牌额度退款
+	BillingContext          *TaskBillingContext `json:"billing_context,omitempty"` // 计费参数快照（用于轮询阶段重新计算）
+	ModelMappingFullEnabled bool                `json:"model_mapping_full_enabled,omitempty"`
 }
 
 // TaskBillingContext 记录任务提交时的计费参数，以便轮询阶段可以重新计算额度。
@@ -161,6 +163,7 @@ type SyncTaskQueryParams struct {
 	Platform       constant.TaskPlatform
 	ChannelID      string
 	TaskID         string
+	RequestId      string
 	UserID         string
 	Action         string
 	Status         string
@@ -172,6 +175,10 @@ type SyncTaskQueryParams struct {
 func InitTask(platform constant.TaskPlatform, relayInfo *commonRelay.RelayInfo) *Task {
 	properties := Properties{}
 	privateData := TaskPrivateData{}
+	requestId := ""
+	userId := 0
+	group := ""
+	channelId := 0
 	if relayInfo != nil && relayInfo.ChannelMeta != nil {
 		if shouldPersistTaskPollingKey(relayInfo.ChannelMeta) {
 			privateData.Key = relayInfo.ChannelMeta.ApiKey
@@ -183,10 +190,17 @@ func InitTask(platform constant.TaskPlatform, relayInfo *commonRelay.RelayInfo) 
 			properties.OriginModelName = relayInfo.OriginModelName
 		}
 	}
+	if relayInfo != nil {
+		requestId = relayInfo.RequestId
+		userId = relayInfo.UserId
+		group = relayInfo.UsingGroup
+		channelId = relayInfo.ChannelId
+		privateData.ModelMappingFullEnabled = relayInfo.IsModelMappingFullActive()
+	}
 
 	// 使用预生成的公开 ID（如果有），否则新生成
 	taskID := ""
-	if relayInfo.TaskRelayInfo != nil && relayInfo.TaskRelayInfo.PublicTaskID != "" {
+	if relayInfo != nil && relayInfo.TaskRelayInfo != nil && relayInfo.TaskRelayInfo.PublicTaskID != "" {
 		taskID = relayInfo.TaskRelayInfo.PublicTaskID
 	} else {
 		taskID = GenerateTaskID()
@@ -194,12 +208,13 @@ func InitTask(platform constant.TaskPlatform, relayInfo *commonRelay.RelayInfo) 
 
 	t := &Task{
 		TaskID:      taskID,
-		UserId:      relayInfo.UserId,
-		Group:       relayInfo.UsingGroup,
+		RequestId:   requestId,
+		UserId:      userId,
+		Group:       group,
 		SubmitTime:  time.Now().Unix(),
 		Status:      TaskStatusNotStart,
 		Progress:    "0%",
-		ChannelId:   relayInfo.ChannelId,
+		ChannelId:   channelId,
 		Platform:    platform,
 		Properties:  properties,
 		PrivateData: privateData,
@@ -225,6 +240,9 @@ func TaskGetAllUserTask(userId int, startIdx int, num int, queryParams SyncTaskQ
 
 	if queryParams.TaskID != "" {
 		query = query.Where("task_id = ?", queryParams.TaskID)
+	}
+	if queryParams.RequestId != "" {
+		query = query.Where("request_id = ?", queryParams.RequestId)
 	}
 	if queryParams.Action != "" {
 		query = query.Where("action = ?", queryParams.Action)
@@ -274,6 +292,9 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 	}
 	if queryParams.TaskID != "" {
 		query = query.Where("task_id = ?", queryParams.TaskID)
+	}
+	if queryParams.RequestId != "" {
+		query = query.Where("request_id = ?", queryParams.RequestId)
 	}
 	if queryParams.Action != "" {
 		query = query.Where("action = ?", queryParams.Action)
@@ -363,6 +384,33 @@ func GetByTaskIds(userId int, taskIds []any) ([]*Task, error) {
 		return nil, err
 	}
 	return task, nil
+}
+
+func GetUserTasksByPlatformActions(userId int, platform constant.TaskPlatform, actions []string) ([]*Task, error) {
+	var tasks []*Task
+	query := DB.Where("user_id = ? and platform = ?", userId, platform)
+	if len(actions) > 0 {
+		query = query.Where("action in (?)", actions)
+	}
+	if err := query.Order("id desc").Find(&tasks).Error; err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
+func GetUserTasksByIDsPlatformActions(userId int, taskIds []string, platform constant.TaskPlatform, actions []string) ([]*Task, error) {
+	if len(taskIds) == 0 {
+		return nil, nil
+	}
+	var tasks []*Task
+	query := DB.Where("user_id = ? and task_id in (?) and platform = ?", userId, taskIds, platform)
+	if len(actions) > 0 {
+		query = query.Where("action in (?)", actions)
+	}
+	if err := query.Find(&tasks).Error; err != nil {
+		return nil, err
+	}
+	return tasks, nil
 }
 
 func (Task *Task) Insert() error {
@@ -462,6 +510,9 @@ func TaskCountAllTasks(queryParams SyncTaskQueryParams) int64 {
 	if queryParams.TaskID != "" {
 		query = query.Where("task_id = ?", queryParams.TaskID)
 	}
+	if queryParams.RequestId != "" {
+		query = query.Where("request_id = ?", queryParams.RequestId)
+	}
 	if queryParams.Action != "" {
 		query = query.Where("action = ?", queryParams.Action)
 	}
@@ -484,6 +535,9 @@ func TaskCountAllUserTask(userId int, queryParams SyncTaskQueryParams) int64 {
 	query := DB.Model(&Task{}).Where("user_id = ?", userId)
 	if queryParams.TaskID != "" {
 		query = query.Where("task_id = ?", queryParams.TaskID)
+	}
+	if queryParams.RequestId != "" {
+		query = query.Where("request_id = ?", queryParams.RequestId)
 	}
 	if queryParams.Action != "" {
 		query = query.Where("action = ?", queryParams.Action)

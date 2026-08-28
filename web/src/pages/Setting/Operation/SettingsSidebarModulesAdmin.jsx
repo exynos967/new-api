@@ -149,6 +149,11 @@ export default function SettingsSidebarModulesAdmin(props) {
         { key: 'token', title: t('令牌管理'), description: t('API令牌管理') },
         { key: 'log', title: t('使用日志'), description: t('API使用记录') },
         {
+          key: 'email_log',
+          title: t('邮件日志'),
+          description: t('邮件发送记录'),
+        },
+        {
           key: 'midjourney',
           title: t('绘图日志'),
           description: t('绘图任务记录'),
@@ -177,6 +182,11 @@ export default function SettingsSidebarModulesAdmin(props) {
         { key: 'channel', title: t('渠道管理'), description: t('API渠道配置') },
         { key: 'models', title: t('模型管理'), description: t('AI模型配置') },
         {
+          key: 'ip_ban',
+          title: t('IP封禁'),
+          description: t('IP访问封禁管理'),
+        },
+        {
           key: 'deployment',
           title: t('模型部署'),
           description: t('模型部署管理'),
@@ -201,11 +211,6 @@ export default function SettingsSidebarModulesAdmin(props) {
           key: 'setting',
           title: t('系统设置'),
           description: t('系统参数配置'),
-        },
-        {
-          key: 'site',
-          title: t('站点管理'),
-          description: t('站点级管理工具'),
         },
       ],
     },

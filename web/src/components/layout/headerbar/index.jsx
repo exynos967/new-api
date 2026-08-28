@@ -27,7 +27,12 @@ import HeaderLogo from './HeaderLogo';
 import Navigation from './Navigation';
 import ActionButtons from './ActionButtons';
 
-const HeaderBar = ({ onMobileMenuToggle, drawerOpen }) => {
+const HeaderBar = ({
+  onMobileMenuToggle,
+  drawerOpen,
+  siteBackgroundEnabled,
+  currentSiteBackgroundAsset,
+}) => {
   const {
     userState,
     statusState,
@@ -62,7 +67,12 @@ const HeaderBar = ({ onMobileMenuToggle, drawerOpen }) => {
     getUnreadKeys,
   } = useNotifications(statusState);
 
-  const { mainNavLinks } = useNavigation(t, docsLink, headerNavModules);
+  const { mainNavLinks } = useNavigation(
+    t,
+    docsLink,
+    headerNavModules,
+    statusState?.status?.server_address,
+  );
 
   return (
     <header className='text-semi-color-text-0 sticky top-0 z-50 transition-colors duration-300 bg-white/75 dark:bg-zinc-900/75 backdrop-blur-lg'>
@@ -122,6 +132,8 @@ const HeaderBar = ({ onMobileMenuToggle, drawerOpen }) => {
             logout={logout}
             navigate={navigate}
             t={t}
+            siteBackgroundEnabled={siteBackgroundEnabled}
+            currentSiteBackgroundAsset={currentSiteBackgroundAsset}
           />
         </div>
       </div>

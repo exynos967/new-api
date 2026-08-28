@@ -2,6 +2,7 @@ package xai
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -57,12 +58,33 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *relaycommon.RelayInfo) error {
 	channel.SetupApiRequestHeader(info, c, req)
 	req.Set("Authorization", "Bearer "+info.ApiKey)
+	if IsCodexCompatibilityRequest(c, info) {
+		if sessionID := strings.TrimSpace(c.GetHeader("Session_id")); sessionID != "" && req.Get(xaiGrokConversationID) == "" {
+			req.Set(xaiGrokConversationID, sessionID)
+		}
+	}
 	return nil
 }
 
 func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {
 	if request == nil {
 		return nil, errors.New("request is nil")
+	}
+	upstreamModelName := ""
+	if info != nil {
+		upstreamModelName = info.UpstreamModelName
+	}
+	if isXAIVideoModel(request.Model) || isXAIVideoModel(upstreamModelName) {
+		modelName := request.Model
+		if modelName == "" {
+			modelName = upstreamModelName
+		}
+		return nil, types.NewErrorWithStatusCode(
+			fmt.Errorf("model %s is a video generation model; use /v1/videos or /v1/videos/generations instead of /v1/chat/completions", modelName),
+			types.ErrorCodeInvalidRequest,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
 	}
 	if strings.HasSuffix(info.UpstreamModelName, "-search") {
 		info.UpstreamModelName = strings.TrimSuffix(info.UpstreamModelName, "-search")
@@ -91,6 +113,10 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	return request, nil
 }
 
+func isXAIVideoModel(modelName string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(modelName)), "grok-imagine-video")
+}
+
 func (a *Adaptor) ConvertRerankRequest(c *gin.Context, relayMode int, request dto.RerankRequest) (any, error) {
 	return nil, nil
 }
@@ -103,6 +129,9 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
 	if request.Model == "" && info != nil {
 		request.Model = info.UpstreamModelName
+	}
+	if IsCodexCompatibilityRequest(c, info) {
+		return convertCodexResponsesRequestForXAI(request, info.RelayMode == constant.RelayModeResponsesCompact), nil
 	}
 	return request, nil
 }
@@ -121,6 +150,8 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		} else {
 			usage, err = openai.OaiResponsesHandler(c, info, resp)
 		}
+	case constant.RelayModeResponsesCompact:
+		usage, err = openai.OaiResponsesCompactionHandler(c, resp)
 	default:
 		if info.IsStream {
 			usage, err = xAIStreamHandler(c, info, resp)

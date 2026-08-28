@@ -59,6 +59,8 @@ var defaultModelRatio = map[string]float64{
 	"gpt-4.1-nano":                     0.05, // $0.1 / 1M tokens
 	"gpt-4.1-nano-2025-04-14":          0.05, // $0.1 / 1M tokens
 	"gpt-image-1":                      2.5,  // $5 / 1M tokens
+	"gpt-image-2":                      2.5,
+	"codex-gpt-image-2":                2.5,
 	"o1":                               7.5,  // $15 / 1M tokens
 	"o1-2024-12-17":                    7.5,  // $15 / 1M tokens
 	"o1-preview":                       7.5,  // $15 / 1M tokens
@@ -94,10 +96,18 @@ var defaultModelRatio = map[string]float64{
 	"gpt-5":                            0.625,
 	"gpt-5-2025-08-07":                 0.625,
 	"gpt-5-chat-latest":                0.625,
+	"gpt-5-1":                          0.625,
+	"gpt-5-2":                          0.625,
+	"gpt-5-3":                          0.625,
+	"gpt-5-3-mini":                     0.125,
 	"gpt-5-mini":                       0.125,
 	"gpt-5-mini-2025-08-07":            0.125,
 	"gpt-5-nano":                       0.025,
 	"gpt-5-nano-2025-08-07":            0.025,
+	"auto":                             0.125,
+	"openai-local-search":              0.125,
+	"agnes-1.5-flash":                  0.035, // $0.07 / 1M input tokens
+	"agnes-2.0-flash":                  0.05,  // $0.10 / 1M input tokens
 	//"gpt-3.5-turbo-0301":           0.75, //deprecated
 	"gpt-3.5-turbo":          0.25,
 	"gpt-3.5-turbo-0613":     0.75,
@@ -116,10 +126,12 @@ var defaultModelRatio = map[string]float64{
 	"text-davinci-edit-001":                     10,
 	"code-davinci-edit-001":                     10,
 	"whisper-1":                                 15,  // $0.006 / minute -> $0.006 / 150 words -> $0.006 / 200 tokens -> $0.03 / 1k tokens
+	"gcp-speech-to-text":                        15,  // Align with existing minute-based STT token accounting.
 	"tts-1":                                     7.5, // 1k characters -> $0.015
 	"tts-1-1106":                                7.5, // 1k characters -> $0.015
 	"tts-1-hd":                                  15,  // 1k characters -> $0.03
 	"tts-1-hd-1106":                             15,  // 1k characters -> $0.03
+	"gcp-text-to-speech":                        7.5, // Align with existing TTS text-input accounting.
 	"davinci":                                   10,
 	"curie":                                     10,
 	"babbage":                                   10,
@@ -274,12 +286,19 @@ var defaultModelRatio = map[string]float64{
 	"deepseek-ai/DeepSeek-R1":                 0.8,
 	"deepseek-ai/DeepSeek-V3-0324":            0.8,
 	"deepseek-ai/DeepSeek-V3.1":               0.8,
+	// Cerebras
+	"zai-glm-4.7":  1.125,
+	"gpt-oss-120b": 0.175,
+	"gemma-4-31b":  0.495,
 }
 
 var defaultModelPrice = map[string]float64{
 	"suno_music":                     0.1,
 	"suno_lyrics":                    0.01,
 	"dall-e-3":                       0.04,
+	"agnes-image-2.0-flash":          0,
+	"agnes-image-2.1-flash":          0.003,
+	"agnes-video-v2.0":               0.005,
 	"imagen-3.0-generate-002":        0.03,
 	"black-forest-labs/flux-1.1-pro": 0.04,
 	"gpt-4-gizmo-*":                  0.1,
@@ -309,6 +328,18 @@ var defaultModelPrice = map[string]float64{
 	"veo-3.1-generate-preview":       0.4,
 	"veo-3.1-fast-generate-preview":  0.15,
 	"grok-imagine-video":             0.05,
+	"gpt-search":                     0,
+	"gpt-image-2-ppt":                0,
+	"gpt-image-2-psd":                0,
+	"openai-local-search":            0,
+	"openai-local-ppt":               0,
+	"openai-local-psd":               0,
+	"你妈-1x1":                         0,
+	"你妈-16x9":                        0,
+	"你妈-9x16":                        0,
+	"你妈-2x3":                         0,
+	"你妈-3x2":                         0,
+	"你妈-4x3":                         0,
 }
 
 var defaultAudioRatio = map[string]float64{
@@ -327,6 +358,7 @@ var defaultAudioCompletionRatio = map[string]float64{
 	"tts-1-hd":             0,
 	"tts-1-1106":           0,
 	"tts-1-hd-1106":        0,
+	"gcp-text-to-speech":   0,
 }
 
 var modelPriceMap = types.NewRWMap[string, float64]()
@@ -334,10 +366,15 @@ var modelRatioMap = types.NewRWMap[string, float64]()
 var completionRatioMap = types.NewRWMap[string, float64]()
 
 var defaultCompletionRatio = map[string]float64{
-	"gpt-4-gizmo-*":  2,
-	"gpt-4o-gizmo-*": 3,
-	"gpt-4-all":      2,
-	"gpt-image-1":    8,
+	"gpt-4-gizmo-*":   2,
+	"gpt-4o-gizmo-*":  3,
+	"gpt-4-all":       2,
+	"gpt-image-1":     8,
+	"agnes-1.5-flash": 15.0 / 7.0, // $0.15 output / $0.07 input
+	"agnes-2.0-flash": 2,
+	"zai-glm-4.7":     1.2222222222,
+	"gpt-oss-120b":    2.1428571429,
+	"gemma-4-31b":     1.5050505051,
 }
 
 // InitRatioSettings initializes all model related settings maps

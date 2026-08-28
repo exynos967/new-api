@@ -138,7 +138,8 @@ func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 	}
 
 	var requestBody io.Reader
-	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled {
+	if shouldPassThroughTextRequest(info, model_setting.GetGlobalSettings().PassThroughRequestEnabled) {
+		info.MarkModelMappingBypassed()
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
 			return types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
@@ -173,7 +174,9 @@ func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 		requestBody = bytes.NewReader(jsonData)
 	}
 
-	resp, err := adaptor.DoRequest(c, info, requestBody)
+	resp, err := doChannelRPMGuardedRequest(c, info, func() (any, error) {
+		return adaptor.DoRequest(c, info, requestBody)
+	})
 	if err != nil {
 		logger.LogError(c, "Do gemini request failed: "+err.Error())
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
@@ -271,7 +274,9 @@ func GeminiEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo) (newAPI
 	logger.LogDebug(c, "Gemini embedding request body: "+string(jsonData))
 	requestBody = bytes.NewReader(jsonData)
 
-	resp, err := adaptor.DoRequest(c, info, requestBody)
+	resp, err := doChannelRPMGuardedRequest(c, info, func() (any, error) {
+		return adaptor.DoRequest(c, info, requestBody)
+	})
 	if err != nil {
 		logger.LogError(c, "Do gemini request failed: "+err.Error())
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)

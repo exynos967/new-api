@@ -47,6 +47,7 @@ const UsersTable = (usersData) => {
     setEditingUser,
     setShowEditUser,
     manageUser,
+    batchDisableUsers,
     refresh,
     resetUserPasskey,
     resetUserTwoFA,
@@ -113,9 +114,29 @@ const UsersTable = (usersData) => {
     setShowDemoteModal(false);
   };
 
-  const handleEnableDisableConfirm = (reason) => {
-    manageUser(modalUser.id, enableDisableAction, modalUser, reason);
+  const handleEnableDisableConfirm = async (
+    reason,
+    relatedUserIds = [],
+    depth = 2,
+    selectAllRelated = false,
+  ) => {
+    if (enableDisableAction === 'disable') {
+      const success = await batchDisableUsers(
+        modalUser.id,
+        relatedUserIds,
+        reason,
+        depth,
+        selectAllRelated,
+      );
+      if (success) {
+        setShowEnableDisableModal(false);
+      }
+      return success;
+    }
+
+    await manageUser(modalUser.id, enableDisableAction, modalUser, reason);
     setShowEnableDisableModal(false);
+    return true;
   };
 
   const handleResetPasskeyConfirm = async () => {

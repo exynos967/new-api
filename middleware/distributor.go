@@ -14,6 +14,9 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/gmicloud"
+	openailocalmodel "github.com/QuantumNous/new-api/relay/channel/openailocal"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -109,11 +112,12 @@ func Distribute() func(c *gin.Context) {
 							}
 						} else if usingGroup == "auto" {
 							userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-							autoGroups := service.GetUserAutoGroup(userGroup)
-							for _, g := range autoGroups {
+							candidateGroups := service.GetRequestGroupCandidates(c, userGroup, usingGroup)
+							for i, g := range candidateGroups {
 								if model.IsChannelEnabledForGroupModel(g, modelRequest.Model, preferred.Id) {
 									selectGroup = g
 									common.SetContextKey(c, constant.ContextKeyAutoGroup, g)
+									common.SetContextKey(c, constant.ContextKeyAutoGroupIndex, i)
 									channel = preferred
 									service.MarkChannelAffinityUsed(c, g, preferred.Id)
 									break
@@ -153,6 +157,10 @@ func Distribute() func(c *gin.Context) {
 						return
 					}
 				}
+				if usingGroup == "auto" && selectGroup != "" {
+					common.SetContextKey(c, constant.ContextKeyAutoGroup, selectGroup)
+					common.SetContextKey(c, constant.ContextKeyUsingGroup, selectGroup)
+				}
 			}
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
@@ -160,6 +168,7 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, setupErr.StatusCode, setupErr.MaskSensitiveError(), setupErr.GetErrorCode())
 			return
 		}
+		relaycommon.InstallRelayResponseWriter(c)
 		c.Next()
 		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
 			service.RecordChannelAffinity(c, channel.Id)
@@ -224,6 +233,15 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 		}
 		c.Set("platform", string(constant.TaskPlatformSuno))
 		c.Set("relay_mode", relayMode)
+	} else if strings.HasPrefix(c.Request.URL.Path, "/v1/search") {
+		modelRequest.Model = openailocalmodel.ModelSearch
+		c.Set("relay_mode", relayconstant.RelayModeOpenAILocalSearch)
+	} else if strings.HasPrefix(c.Request.URL.Path, "/v1/ppt/generations") {
+		modelRequest.Model = openailocalmodel.ModelPPT
+	} else if strings.HasPrefix(c.Request.URL.Path, "/v1/psd/generations") {
+		modelRequest.Model = openailocalmodel.ModelPSD
+	} else if strings.HasPrefix(c.Request.URL.Path, "/v1/editable-file-tasks") {
+		shouldSelectChannel = false
 	} else if strings.Contains(c.Request.URL.Path, "/v1/videos/") && strings.HasSuffix(c.Request.URL.Path, "/remix") {
 		relayMode := relayconstant.RelayModeVideoSubmit
 		c.Set("relay_mode", relayMode)
@@ -265,6 +283,38 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 		if _, ok := c.Get("relay_mode"); !ok {
 			c.Set("relay_mode", relayMode)
 		}
+	} else if strings.HasPrefix(c.Request.URL.Path, "/v1/audio/generations") ||
+		strings.HasPrefix(c.Request.URL.Path, "/v1/music/generations") {
+		relayMode := relayconstant.RelayModeUnknown
+		if c.Request.Method == http.MethodPost {
+			req, err := getModelFromRequest(c)
+			if err != nil {
+				return nil, false, err
+			}
+			modelRequest.Model = req.Model
+			relayMode = relayconstant.RelayModeAudioGenerationSubmit
+		} else if c.Request.Method == http.MethodGet {
+			relayMode = relayconstant.RelayModeAudioGenerationFetchByID
+			shouldSelectChannel = false
+		}
+		c.Set("relay_mode", relayMode)
+	} else if strings.HasPrefix(c.Request.URL.Path, "/v1/batch/generations") {
+		relayMode := relayconstant.RelayModeUnknown
+		if c.Request.Method == http.MethodPost {
+			req, err := getModelFromRequest(c)
+			if err != nil {
+				return nil, false, err
+			}
+			modelRequest.Model = req.Model
+			if gmicloud.IsBatchModel(modelRequest.Model) {
+				modelRequest.Model = gmicloud.BatchInferenceModel
+			}
+			relayMode = relayconstant.RelayModeBatchGenerationSubmit
+		} else if c.Request.Method == http.MethodGet {
+			relayMode = relayconstant.RelayModeBatchGenerationFetchByID
+			shouldSelectChannel = false
+		}
+		c.Set("relay_mode", relayMode)
 	} else if strings.HasPrefix(c.Request.URL.Path, "/v1beta/models/") || strings.HasPrefix(c.Request.URL.Path, "/v1/models/") {
 		// Gemini API 路径处理: /v1beta/models/gemini-2.0-flash:generateContent
 		relayMode := relayconstant.RelayModeGemini
@@ -306,7 +356,8 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 			}
 		}
 	}
-	if strings.HasPrefix(c.Request.URL.Path, "/v1/audio") {
+	if strings.HasPrefix(c.Request.URL.Path, "/v1/audio") &&
+		!strings.HasPrefix(c.Request.URL.Path, "/v1/audio/generations") {
 		relayMode := relayconstant.RelayModeAudioSpeech
 		if strings.HasPrefix(c.Request.URL.Path, "/v1/audio/speech") {
 

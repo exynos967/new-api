@@ -26,12 +26,13 @@ import ColumnSelectorModal from './modals/ColumnSelectorModal';
 import UserInfoModal from './modals/UserInfoModal';
 import ChannelAffinityUsageCacheModal from './modals/ChannelAffinityUsageCacheModal';
 import ParamOverrideModal from './modals/ParamOverrideModal';
+import EnableDisableUserModal from '../users/modals/EnableDisableUserModal';
 import { useLogsData } from '../../../hooks/usage-logs/useUsageLogsData';
 import { useIsMobile } from '../../../hooks/common/useIsMobile';
 import { createCardProPagination } from '../../../helpers/utils';
 
-const LogsPage = () => {
-  const logsData = useLogsData();
+const LogsPage = ({ defaultLogType = 0, fixedLogType = null } = {}) => {
+  const logsData = useLogsData({ defaultLogType, fixedLogType });
   const isMobile = useIsMobile();
 
   return (
@@ -39,6 +40,14 @@ const LogsPage = () => {
       {/* Modals */}
       <ColumnSelectorModal {...logsData} />
       <UserInfoModal {...logsData} />
+      <EnableDisableUserModal
+        visible={logsData.showDisableUserModal}
+        onCancel={logsData.closeDisableUserModal}
+        onConfirm={logsData.disableUserFromInfoModal}
+        user={logsData.userInfoData}
+        action='disable'
+        t={logsData.t}
+      />
       <ChannelAffinityUsageCacheModal {...logsData} />
       <ParamOverrideModal {...logsData} />
 

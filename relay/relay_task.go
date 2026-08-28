@@ -19,6 +19,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -217,13 +218,21 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	// 9. 发送请求
-	resp, err := adaptor.DoRequest(c, info, requestBody)
+	resp, err := doChannelRPMGuardedTaskRequest(c, info, func() (*http.Response, error) {
+		return adaptor.DoRequest(c, info, requestBody)
+	})
 	if err != nil {
+		var apiErr *types.NewAPIError
+		if errors.As(err, &apiErr) && service.IsChannelRPMLimitError(apiErr) {
+			return nil, service.TaskErrorFromAPIError(apiErr)
+		}
 		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
 	}
 	if resp != nil && resp.StatusCode != http.StatusOK {
-		responseBody, _ := io.ReadAll(resp.Body)
-		return nil, service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
+		newAPIError := service.RelayErrorHandler(c.Request.Context(), resp, false)
+		service.ResetStatusCode(newAPIError, c.GetString("status_code_mapping"))
+		newAPIError = service.NormalizeViolationFeeErrorForRelay(info, newAPIError)
+		return nil, service.TaskErrorFromAPIError(newAPIError)
 	}
 
 	// 10. 返回 OtherRatios 给下游（header 必须在 DoResponse 写 body 之前设置）
@@ -279,9 +288,11 @@ func recalcQuotaFromRatios(info *relaycommon.RelayInfo, ratios map[string]float6
 }
 
 var fetchRespBuilders = map[int]func(c *gin.Context) (respBody []byte, taskResp *dto.TaskError){
-	relayconstant.RelayModeSunoFetchByID:  sunoFetchByIDRespBodyBuilder,
-	relayconstant.RelayModeSunoFetch:      sunoFetchRespBodyBuilder,
-	relayconstant.RelayModeVideoFetchByID: videoFetchByIDRespBodyBuilder,
+	relayconstant.RelayModeSunoFetchByID:            sunoFetchByIDRespBodyBuilder,
+	relayconstant.RelayModeSunoFetch:                sunoFetchRespBodyBuilder,
+	relayconstant.RelayModeVideoFetchByID:           videoFetchByIDRespBodyBuilder,
+	relayconstant.RelayModeAudioGenerationFetchByID: videoFetchByIDRespBodyBuilder,
+	relayconstant.RelayModeBatchGenerationFetchByID: videoFetchByIDRespBodyBuilder,
 }
 
 func RelayTaskFetch(c *gin.Context, relayMode int) (taskResp *dto.TaskError) {
@@ -325,8 +336,9 @@ func sunoFetchRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *dto.Ta
 			taskResp = service.TaskErrorWrapper(err, "get_tasks_failed", http.StatusInternalServerError)
 			return
 		}
+		visibility := taskErrorDetailsVisibility(taskModels)
 		for _, task := range taskModels {
-			tasks = append(tasks, TaskModel2Dto(task))
+			tasks = append(tasks, TaskModel2Dto(task, visibility[task.ChannelId]))
 		}
 	} else {
 		tasks = make([]any, 0)
@@ -354,7 +366,7 @@ func sunoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *dt
 
 	respBody, err = common.Marshal(dto.TaskResponse[any]{
 		Code: "success",
-		Data: TaskModel2Dto(originTask),
+		Data: TaskModel2Dto(originTask, model.ShouldShowChannelErrorDetails(originTask.ChannelId)),
 	})
 	return
 }
@@ -375,6 +387,12 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 		taskResp = service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusBadRequest)
 		return
 	}
+	defer func() {
+		if taskResp == nil && originTask.PrivateData.ModelMappingFullEnabled {
+			displayModel := taskDisplayModelName(originTask)
+			respBody = relaycommon.RewriteModelMetadataBytes(respBody, displayModel, originTask.Properties.UpstreamModelName)
+		}
+	}()
 
 	isOpenAIVideoAPI := strings.HasPrefix(c.Request.RequestURI, "/v1/videos/")
 
@@ -392,7 +410,8 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 			return
 		}
 		if converter, ok := adaptor.(channel.OpenAIVideoConverter); ok {
-			openAIVideoData, err := converter.ConvertToOpenAIVideo(originTask)
+			clientTask := taskModelForClient(originTask, model.ShouldShowChannelErrorDetails(originTask.ChannelId))
+			openAIVideoData, err := converter.ConvertToOpenAIVideo(clientTask)
 			if err != nil {
 				taskResp = service.TaskErrorWrapper(err, "convert_to_openai_video_failed", http.StatusInternalServerError)
 				return
@@ -407,7 +426,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 	// 通用 TaskDto 格式
 	respBody, err = common.Marshal(dto.TaskResponse[any]{
 		Code: "success",
-		Data: TaskModel2Dto(originTask),
+		Data: TaskModel2Dto(originTask, model.ShouldShowChannelErrorDetails(originTask.ChannelId)),
 	})
 	if err != nil {
 		taskResp = service.TaskErrorWrapper(err, "marshal_response_failed", http.StatusInternalServerError)
@@ -423,7 +442,9 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 	if err != nil {
 		return nil
 	}
-	if channelModel.Type != constant.ChannelTypeVertexAi && channelModel.Type != constant.ChannelTypeGemini {
+	if channelModel.Type != constant.ChannelTypeVertexAi &&
+		channelModel.Type != constant.ChannelTypeGemini &&
+		channelModel.Type != constant.ChannelTypeAgnesAI {
 		return nil
 	}
 
@@ -538,12 +559,83 @@ func mapTaskStatusToSimple(status model.TaskStatus) string {
 	}
 }
 
-func TaskModel2Dto(task *model.Task) *dto.TaskDto {
+func taskDisplayModelName(task *model.Task) string {
+	if task == nil {
+		return ""
+	}
+	if modelName := strings.TrimSpace(task.Properties.OriginModelName); modelName != "" {
+		return modelName
+	}
+	if task.PrivateData.BillingContext != nil {
+		if modelName := strings.TrimSpace(task.PrivateData.BillingContext.OriginModelName); modelName != "" {
+			return modelName
+		}
+	}
+	if modelName := strings.TrimSpace(task.Properties.UpstreamModelName); modelName != "" {
+		return modelName
+	}
+	return ""
+}
+
+func SanitizeTaskModelText(task *model.Task, text string) string {
+	if task == nil || !task.PrivateData.ModelMappingFullEnabled || text == "" {
+		return text
+	}
+	displayModel := taskDisplayModelName(task)
+	hiddenModel := strings.TrimSpace(task.Properties.UpstreamModelName)
+	if displayModel == "" || hiddenModel == "" || hiddenModel == displayModel {
+		return text
+	}
+	return strings.ReplaceAll(text, hiddenModel, displayModel)
+}
+
+func taskErrorDetailsVisibility(tasks []*model.Task) map[int]bool {
+	channelIDs := make([]int, 0, len(tasks))
+	for _, task := range tasks {
+		if task != nil {
+			channelIDs = append(channelIDs, task.ChannelId)
+		}
+	}
+	return model.GetChannelErrorDetailsVisibility(channelIDs)
+}
+
+func taskModelForClient(task *model.Task, showErrorDetails bool) *model.Task {
+	if task == nil || showErrorDetails || (task.Status != model.TaskStatusFailure && strings.TrimSpace(task.FailReason) == "") {
+		return task
+	}
+	clientTask := *task
+	clientTask.FailReason = dto.TaskFailureCode
+	clientTask.Properties = model.Properties{}
+	clientTask.PrivateData.ResultURL = ""
+	clientTask.Data = nil
+	return &clientTask
+}
+
+func TaskModel2Dto(task *model.Task, showErrorDetails ...bool) *dto.TaskDto {
+	showDetails := true
+	if len(showErrorDetails) > 0 {
+		showDetails = showErrorDetails[0]
+	}
+	task = taskModelForClient(task, showDetails)
+	properties := task.Properties
+	taskData := task.Data
+	modelName := taskDisplayModelName(task)
+	resultURL := task.GetResultURL()
+	if !showDetails && (task.Status == model.TaskStatusFailure || strings.TrimSpace(task.FailReason) != "") {
+		resultURL = ""
+	}
+	if task.PrivateData.ModelMappingFullEnabled {
+		properties.OriginModelName = modelName
+		properties.UpstreamModelName = modelName
+		taskData = relaycommon.RewriteModelMetadataBytes(task.Data, modelName, task.Properties.UpstreamModelName)
+	}
 	return &dto.TaskDto{
 		ID:         task.ID,
 		CreatedAt:  task.CreatedAt,
 		UpdatedAt:  task.UpdatedAt,
 		TaskID:     task.TaskID,
+		RequestId:  task.RequestId,
+		ModelName:  modelName,
 		Platform:   string(task.Platform),
 		UserId:     task.UserId,
 		Group:      task.Group,
@@ -551,14 +643,14 @@ func TaskModel2Dto(task *model.Task) *dto.TaskDto {
 		Quota:      task.Quota,
 		Action:     task.Action,
 		Status:     string(task.Status),
-		FailReason: task.FailReason,
-		ResultURL:  task.GetResultURL(),
+		FailReason: SanitizeTaskModelText(task, task.FailReason),
+		ResultURL:  resultURL,
 		SubmitTime: task.SubmitTime,
 		StartTime:  task.StartTime,
 		FinishTime: task.FinishTime,
 		Progress:   task.Progress,
-		Properties: task.Properties,
+		Properties: properties,
 		Username:   task.Username,
-		Data:       task.Data,
+		Data:       taskData,
 	}
 }

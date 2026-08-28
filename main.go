@@ -90,6 +90,9 @@ func main() {
 		go model.SyncChannelCache(common.SyncFrequency)
 	}
 
+	model.InitIPBanCache()
+	go model.SyncIPBanCache(common.SyncFrequency)
+
 	// 热更新配置
 	go model.SyncOptions(common.SyncFrequency)
 
@@ -111,6 +114,7 @@ func main() {
 
 	// Subscription quota reset task (daily/weekly/monthly/custom)
 	service.StartSubscriptionQuotaResetTask()
+	service.StartCheckinExpiryTask()
 	service.StartConversationLogCleanupTask()
 
 	// Wire task polling adaptor factory (breaks service -> relay import cycle)
@@ -168,7 +172,6 @@ func main() {
 	server.Use(middleware.RequestId())
 	server.Use(middleware.PoweredBy())
 	server.Use(middleware.I18n())
-	middleware.SetUpLogger(server)
 	// Initialize session store
 	store := cookie.NewStore([]byte(common.SessionSecret))
 	store.Options(sessions.Options{
@@ -179,6 +182,8 @@ func main() {
 		SameSite: http.SameSiteStrictMode,
 	})
 	server.Use(sessions.Sessions("session", store))
+	server.Use(middleware.IPBan())
+	middleware.SetUpLogger(server)
 
 	InjectUmamiAnalytics()
 	InjectGoogleAnalytics()

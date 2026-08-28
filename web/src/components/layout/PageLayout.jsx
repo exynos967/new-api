@@ -39,16 +39,52 @@ import { UserContext } from '../../context/User';
 import { StatusContext } from '../../context/Status';
 import { useLocation } from 'react-router-dom';
 import { normalizeLanguage } from '../../i18n/language';
+import SiteBackground from './SiteBackground';
+import {
+  darkVariantFilterId,
+  SITE_BACKGROUND_GLASS_FILTER_ID,
+} from './SiteBackgroundGlassFilter';
+import { normalizeSiteBackgroundConfig } from '../../services/siteBackground';
 const { Sider, Content, Header } = Layout;
 
 const PageLayout = () => {
   const [userState, userDispatch] = useContext(UserContext);
-  const [, statusDispatch] = useContext(StatusContext);
+  const [statusState, statusDispatch] = useContext(StatusContext);
   const isMobile = useIsMobile();
   const [collapsed, , setCollapsed] = useSidebarCollapsed();
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [currentSiteBackgroundAsset, setCurrentSiteBackgroundAsset] =
+    useState(null);
   const { i18n } = useTranslation();
   const location = useLocation();
+  const siteBackgroundConfig = normalizeSiteBackgroundConfig(
+    statusState?.status?.site_background,
+  );
+  const siteBackgroundActive = siteBackgroundConfig.enabled;
+  const siteBackgroundGlassActive =
+    siteBackgroundActive && siteBackgroundConfig.glass_enabled;
+  const appLayoutClassName = [
+    'app-layout',
+    siteBackgroundActive ? 'site-background-active' : '',
+    siteBackgroundGlassActive ? 'site-background-glass' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+  const siteBackgroundGlassStyle = siteBackgroundGlassActive
+    ? {
+        '--site-background-glass-opacity': `${siteBackgroundConfig.glass_opacity}%`,
+        // 明暗两套滤镜由 CSS 按主题挑选；折射为 0 时两个变量都不下发，
+        // CSS 侧回落到无折射写法。
+        ...(siteBackgroundConfig.glass_refraction > 0
+          ? {
+              '--site-background-glass-refract-light': `url(#${SITE_BACKGROUND_GLASS_FILTER_ID})`,
+              '--site-background-glass-refract-dark': `url(#${darkVariantFilterId(
+                SITE_BACKGROUND_GLASS_FILTER_ID,
+              )})`,
+            }
+          : {}),
+      }
+    : {};
 
   const cardProPages = [
     '/console/channel',
@@ -59,7 +95,7 @@ const PageLayout = () => {
     '/console/midjourney',
     '/console/task',
     '/console/models',
-    '/console/enhancements/dashboard',
+    '/console/enhancements',
     '/pricing',
   ];
 
@@ -149,108 +185,132 @@ const PageLayout = () => {
 
   if (location.pathname === '/model-status') {
     return (
-      <Layout className='app-layout' style={{ minHeight: '100vh' }}>
-        <Content style={{ minHeight: '100vh', overflow: 'auto' }}>
-          <ErrorBoundary>
-            <App />
-          </ErrorBoundary>
-        </Content>
-        <ToastContainer />
-      </Layout>
-    );
-  }
-
-  return (
-    <Layout
-      className='app-layout'
-      style={{
-        display: 'flex',
-        flexDirection: 'column',
-        overflow: isMobile ? 'visible' : 'hidden',
-      }}
-    >
-      <Header
-        style={{
-          padding: 0,
-          height: 'auto',
-          lineHeight: 'normal',
-          position: 'fixed',
-          width: '100%',
-          top: 0,
-          zIndex: 100,
-        }}
-      >
-        <HeaderBar
-          onMobileMenuToggle={() => setDrawerOpen((prev) => !prev)}
-          drawerOpen={drawerOpen}
+      <>
+        <SiteBackground
+          config={siteBackgroundConfig}
+          onAssetChange={setCurrentSiteBackgroundAsset}
         />
-      </Header>
-      <Layout
-        style={{
-          overflow: isMobile ? 'visible' : 'auto',
-          display: 'flex',
-          flexDirection: 'column',
-        }}
-      >
-        {showSider && (
-          <Sider
-            className='app-sider'
-            style={{
-              position: 'fixed',
-              left: 0,
-              top: '64px',
-              zIndex: 99,
-              border: 'none',
-              paddingRight: '0',
-              width: 'var(--sidebar-current-width)',
-            }}
-          >
-            <SiderBar
-              onNavigate={() => {
-                if (isMobile) setDrawerOpen(false);
-              }}
-            />
-          </Sider>
-        )}
         <Layout
-          style={{
-            marginLeft: isMobile
-              ? '0'
-              : showSider
-                ? 'var(--sidebar-current-width)'
-                : '0',
-            flex: '1 1 auto',
-            display: 'flex',
-            flexDirection: 'column',
-          }}
+          className={appLayoutClassName}
+          style={{ minHeight: '100vh', ...siteBackgroundGlassStyle }}
         >
           <Content
-            style={{
-              flex: '1 0 auto',
-              overflowY: isMobile ? 'visible' : 'hidden',
-              WebkitOverflowScrolling: 'touch',
-              padding: shouldInnerPadding ? (isMobile ? '5px' : '24px') : '0',
-              position: 'relative',
-            }}
+            className='site-background-content'
+            style={{ minHeight: '100vh', overflow: 'auto' }}
           >
             <ErrorBoundary>
               <App />
             </ErrorBoundary>
           </Content>
-          {!shouldHideFooter && (
-            <Layout.Footer
+          <ToastContainer />
+        </Layout>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <SiteBackground
+        config={siteBackgroundConfig}
+        onAssetChange={setCurrentSiteBackgroundAsset}
+      />
+      <Layout
+        className={appLayoutClassName}
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: isMobile ? 'visible' : 'hidden',
+          ...siteBackgroundGlassStyle,
+        }}
+      >
+        <Header
+          style={{
+            padding: 0,
+            height: 'auto',
+            lineHeight: 'normal',
+            position: 'fixed',
+            width: '100%',
+            top: 0,
+            zIndex: 100,
+          }}
+        >
+          <HeaderBar
+            onMobileMenuToggle={() => setDrawerOpen((prev) => !prev)}
+            drawerOpen={drawerOpen}
+            siteBackgroundEnabled={siteBackgroundActive}
+            currentSiteBackgroundAsset={currentSiteBackgroundAsset}
+          />
+        </Header>
+        <Layout
+          className='site-background-shell'
+          style={{
+            overflow: isMobile ? 'visible' : 'auto',
+            display: 'flex',
+            flexDirection: 'column',
+          }}
+        >
+          {showSider && (
+            <Sider
+              className='app-sider'
               style={{
-                flex: '0 0 auto',
-                width: '100%',
+                position: 'fixed',
+                left: 0,
+                top: '64px',
+                zIndex: 99,
+                border: 'none',
+                paddingRight: '0',
+                width: 'var(--sidebar-current-width)',
               }}
             >
-              <FooterBar />
-            </Layout.Footer>
+              <SiderBar
+                onNavigate={() => {
+                  if (isMobile) setDrawerOpen(false);
+                }}
+              />
+            </Sider>
           )}
+          <Layout
+            className='site-background-main'
+            style={{
+              marginLeft: isMobile
+                ? '0'
+                : showSider
+                  ? 'var(--sidebar-current-width)'
+                  : '0',
+              flex: '1 1 auto',
+              display: 'flex',
+              flexDirection: 'column',
+            }}
+          >
+            <Content
+              className='site-background-content'
+              style={{
+                flex: '1 0 auto',
+                overflowY: isMobile ? 'visible' : 'hidden',
+                WebkitOverflowScrolling: 'touch',
+                padding: shouldInnerPadding ? (isMobile ? '5px' : '24px') : '0',
+                position: 'relative',
+              }}
+            >
+              <ErrorBoundary>
+                <App />
+              </ErrorBoundary>
+            </Content>
+            {!shouldHideFooter && (
+              <Layout.Footer
+                style={{
+                  flex: '0 0 auto',
+                  width: '100%',
+                }}
+              >
+                <FooterBar />
+              </Layout.Footer>
+            )}
+          </Layout>
         </Layout>
+        <ToastContainer />
       </Layout>
-      <ToastContainer />
-    </Layout>
+    </>
   );
 };
 

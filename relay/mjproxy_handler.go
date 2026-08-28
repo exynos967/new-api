@@ -200,7 +200,30 @@ func coverMidjourneyTaskDto(c *gin.Context, originTask *model.Midjourney) (midjo
 			midjourneyTask.Properties = &properties
 		}
 	}
+	if !showMidjourneyErrorDetails(c, originTask.ChannelId) &&
+		(strings.EqualFold(originTask.Status, "FAILURE") || strings.TrimSpace(originTask.FailReason) != "") {
+		midjourneyTask.FailReason = dto.TaskFailureCode
+		midjourneyTask.Description = dto.TaskFailureCode
+		midjourneyTask.Properties = nil
+	}
 	return
+}
+
+const midjourneyErrorVisibilityContextKey = "midjourney_error_details_visibility"
+
+func showMidjourneyErrorDetails(c *gin.Context, channelID int) bool {
+	visibility, _ := c.Get(midjourneyErrorVisibilityContextKey)
+	visibilityMap, _ := visibility.(map[int]bool)
+	if visibilityMap == nil {
+		visibilityMap = map[int]bool{}
+	}
+	if show, ok := visibilityMap[channelID]; ok {
+		return show
+	}
+	show := model.ShouldShowChannelErrorDetails(channelID)
+	visibilityMap[channelID] = show
+	c.Set(midjourneyErrorVisibilityContextKey, visibilityMap)
+	return show
 }
 
 func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyResponse {
@@ -252,8 +275,17 @@ func RelaySwapFace(c *gin.Context, info *relaycommon.RelayInfo) *dto.MidjourneyR
 	requestURL := getMjRequestPath(c.Request.URL.String())
 	baseURL := c.GetString("base_url")
 	fullRequestURL := fmt.Sprintf("%s%s", baseURL, requestURL)
+	if rpmErr := tryAcquireCurrentChannelRPM(c); rpmErr != nil {
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, service.ChannelRPMLimitExceededMessage)
+	}
 	mjResp, _, err := service.DoMidjourneyHttpRequest(c, time.Second*60, fullRequestURL)
+	if mjResp != nil {
+		recordCurrentChannelRPM429(c, mjResp.StatusCode)
+	}
 	if err != nil {
+		if mjResp == nil {
+			return service.MidjourneyErrorWrapper(constant.MjRequestError, "do_request_failed")
+		}
 		return &mjResp.Response
 	}
 	defer func() {
@@ -507,6 +539,7 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 			}
 			c.Set("base_url", channel.GetBaseURL())
 			c.Set("channel_id", originTask.ChannelId)
+			c.Set("channel_rpm_locked", true)
 			c.Request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", channel.Key))
 			log.Printf("检测到此操作为放大、变换、重绘，获取原channel信息: %s,%s", strconv.Itoa(originTask.ChannelId), channel.GetBaseURL())
 		}
@@ -569,8 +602,17 @@ func RelayMidjourneySubmit(c *gin.Context, relayInfo *relaycommon.RelayInfo) *dt
 		}
 	}()
 
+	if rpmErr := tryAcquireCurrentChannelRPM(c); rpmErr != nil {
+		return service.MidjourneyErrorWrapper(constant.MjRequestError, service.ChannelRPMLimitExceededMessage)
+	}
 	midjResponseWithStatus, responseBody, err := service.DoMidjourneyHttpRequest(c, time.Second*60, fullRequestURL)
+	if midjResponseWithStatus != nil {
+		recordCurrentChannelRPM429(c, midjResponseWithStatus.StatusCode)
+	}
 	if err != nil {
+		if midjResponseWithStatus == nil {
+			return service.MidjourneyErrorWrapper(constant.MjRequestError, "do_request_failed")
+		}
 		return &midjResponseWithStatus.Response
 	}
 	midjResponse := &midjResponseWithStatus.Response

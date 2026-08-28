@@ -940,9 +940,19 @@ func DeleteChannelByStatus(status int64) (int64, error) {
 	return result.RowsAffected, result.Error
 }
 
-func DeleteDisabledChannel() (int64, error) {
-	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+func DeleteDisabledChannel() (int64, []int, error) {
+	var channelIds []int
+	var rowsAffected int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		condition := tx.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled)
+		if err := condition.Model(&Channel{}).Pluck("id", &channelIds).Error; err != nil {
+			return err
+		}
+		result := condition.Delete(&Channel{})
+		rowsAffected = result.RowsAffected
+		return result.Error
+	})
+	return rowsAffected, channelIds, err
 }
 
 func GetPaginatedTags(offset int, limit int) ([]*string, error) {
@@ -1016,7 +1026,7 @@ func (channel *Channel) ValidateSettings() error {
 			return err
 		}
 	}
-	return nil
+	return channelParams.Validate()
 }
 
 func (channel *Channel) GetSetting() dto.ChannelSettings {
@@ -1030,6 +1040,31 @@ func (channel *Channel) GetSetting() dto.ChannelSettings {
 		}
 	}
 	return setting
+}
+
+// GetChannelErrorDetailsVisibility resolves the current privacy setting once
+// per unique channel. Missing or deleted channels fail closed.
+func GetChannelErrorDetailsVisibility(channelIDs []int) map[int]bool {
+	visibility := make(map[int]bool, len(channelIDs))
+	for _, channelID := range channelIDs {
+		if channelID <= 0 {
+			continue
+		}
+		if _, ok := visibility[channelID]; ok {
+			continue
+		}
+
+		channel, err := CacheGetChannel(channelID)
+		if err != nil || channel == nil {
+			channel, err = GetChannelById(channelID, true)
+		}
+		visibility[channelID] = err == nil && channel != nil && channel.GetSetting().ShowErrorDetails
+	}
+	return visibility
+}
+
+func ShouldShowChannelErrorDetails(channelID int) bool {
+	return GetChannelErrorDetailsVisibility([]int{channelID})[channelID]
 }
 
 func (channel *Channel) SetSetting(setting dto.ChannelSettings) {

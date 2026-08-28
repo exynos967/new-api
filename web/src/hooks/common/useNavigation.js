@@ -18,14 +18,28 @@ For commercial licensing, please contact support@quantumnous.com
 */
 
 import { useMemo } from 'react';
+import { getServerAddress } from '../../helpers';
 
-export const useNavigation = (t, docsLink, headerNavModules) => {
+const getModelStatusLink = (serverAddress) => {
+  const base = String(serverAddress || getServerAddress() || '')
+    .trim()
+    .replace(/\/+$/, '');
+  return `${base || window.location.origin}/model-status`;
+};
+
+export const useNavigation = (
+  t,
+  docsLink,
+  headerNavModules,
+  serverAddress,
+) => {
   const mainNavLinks = useMemo(() => {
     // 默认配置，如果没有传入配置则显示所有模块
     const defaultModules = {
       home: true,
       console: true,
       pricing: true,
+      status: true,
       docs: true,
       about: true,
     };
@@ -48,6 +62,12 @@ export const useNavigation = (t, docsLink, headerNavModules) => {
         text: t('模型广场'),
         itemKey: 'pricing',
         to: '/pricing',
+      },
+      {
+        text: t('状态查看'),
+        itemKey: 'status',
+        isExternal: true,
+        externalLink: getModelStatusLink(serverAddress),
       },
       ...(docsLink
         ? [
@@ -77,9 +97,12 @@ export const useNavigation = (t, docsLink, headerNavModules) => {
           ? modules.pricing.enabled
           : modules.pricing;
       }
+      if (link.itemKey === 'status') {
+        return modules.status !== false;
+      }
       return modules[link.itemKey] === true;
     });
-  }, [t, docsLink, headerNavModules]);
+  }, [t, docsLink, headerNavModules, serverAddress]);
 
   return {
     mainNavLinks,
