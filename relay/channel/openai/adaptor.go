@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/ai360"
 	"github.com/QuantumNous/new-api/relay/channel/gmicloud"
 	"github.com/QuantumNous/new-api/relay/channel/lingyiwanwu"
+	"github.com/QuantumNous/new-api/relay/channel/modal"
 
 	//"github.com/QuantumNous/new-api/relay/channel/minimax"
 	"github.com/QuantumNous/new-api/relay/channel/openailocal"
@@ -102,6 +103,9 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	if info.ChannelType == constant.ChannelTypeGMICloud && gmicloud.IsBatchModel(info.UpstreamModelName) {
 		return "", fmt.Errorf("model %s is asynchronous; use POST /v1/batch/generations", info.UpstreamModelName)
+	}
+	if info.ChannelType == constant.ChannelTypeModal {
+		info.ChannelBaseUrl = modal.NormalizeBaseURL(info.ChannelBaseUrl)
 	}
 	if info.RelayMode == relayconstant.RelayModeRealtime {
 		if strings.HasPrefix(info.ChannelBaseUrl, "https://") {
@@ -255,6 +259,13 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	}
 	if !info.SupportStreamOptions {
 		request.StreamOptions = nil
+	}
+	// Modal deployments expose user-defined OpenAI-compatible servers. Their
+	// model names may start with "o" (for example, "orcarouter/...") without
+	// being OpenAI o-series reasoning models, so preserve the request instead
+	// of applying OpenAI-specific model-name heuristics below.
+	if info.ChannelType == constant.ChannelTypeModal {
+		return request, nil
 	}
 	if info.ChannelType == constant.ChannelTypeOpenRouter {
 		if len(request.Usage) == 0 {
@@ -677,6 +688,8 @@ func (a *Adaptor) GetModelList() []string {
 		return vercel.ModelList
 	case constant.ChannelTypeGMICloud:
 		return gmicloud.ModelList
+	case constant.ChannelTypeModal:
+		return modal.ModelList
 	default:
 		return ModelList
 	}
@@ -702,6 +715,8 @@ func (a *Adaptor) GetChannelName() string {
 		return vercel.ChannelName
 	case constant.ChannelTypeGMICloud:
 		return gmicloud.ChannelName
+	case constant.ChannelTypeModal:
+		return modal.ChannelName
 	default:
 		return ChannelName
 	}
