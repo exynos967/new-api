@@ -24,6 +24,15 @@ const (
 // 1 === ￥0.014 / 1k tokens
 
 var defaultModelRatio = map[string]float64{
+	// https://mimo.mi.com/docs/zh-CN/price/pay-as-you-go (CNY per million tokens).
+	"mimo-v2.5":     1.0 / 1000 * RMB,
+	"mimo-v2.5-pro": 3.0 / 1000 * RMB,
+	// Temporary site price: reuse v2.5-pro until ultraspeed pricing is published.
+	"mimo-v2.6-pro-ultraspeed": 3.0 / 1000 * RMB,
+	// https://docs.typesafe.ai/models: $0.042 / 1M input tokens.
+	"jev-latest":  0.021,
+	"jev-preview": 0.021,
+	"jev-1.13.0":  0.021,
 	//"midjourney":                50,
 	"gpt-4-gizmo-*":  15,
 	"gpt-4o-gizmo-*": 2.5,
@@ -108,6 +117,10 @@ var defaultModelRatio = map[string]float64{
 	"openai-local-search":              0.125,
 	"agnes-1.5-flash":                  0.035, // $0.07 / 1M input tokens
 	"agnes-2.0-flash":                  0.05,  // $0.10 / 1M input tokens
+	"agnes-2.5-flash":                  0.025,
+	"agnes-2.5-pro-beta":               0.05,
+	"agnes-2.5-pro":                    0.225,
+	"agnes-3.0-flash":                  0.025,
 	//"gpt-3.5-turbo-0301":           0.75, //deprecated
 	"gpt-3.5-turbo":          0.25,
 	"gpt-3.5-turbo-0613":     0.75,
@@ -296,9 +309,12 @@ var defaultModelPrice = map[string]float64{
 	"suno_music":                     0.1,
 	"suno_lyrics":                    0.01,
 	"dall-e-3":                       0.04,
-	"agnes-image-2.0-flash":          0,
-	"agnes-image-2.1-flash":          0.003,
-	"agnes-video-v2.0":               0.005,
+	"agnes-image-2.0-flash":          0.01,
+	"agnes-image-2.1-flash":          0.01,
+	"agnes-image-2.5-flash":          0.01,
+	"agnes-video-v2.0":               0.025,
+	"agnes-video-2.5":                0.125,
+	"agnes-video-2.5-flash":          0.125,
 	"imagen-3.0-generate-002":        0.03,
 	"black-forest-labs/flux-1.1-pro": 0.04,
 	"gpt-4-gizmo-*":                  0.1,
@@ -366,15 +382,26 @@ var modelRatioMap = types.NewRWMap[string, float64]()
 var completionRatioMap = types.NewRWMap[string, float64]()
 
 var defaultCompletionRatio = map[string]float64{
-	"gpt-4-gizmo-*":   2,
-	"gpt-4o-gizmo-*":  3,
-	"gpt-4-all":       2,
-	"gpt-image-1":     8,
-	"agnes-1.5-flash": 15.0 / 7.0, // $0.15 output / $0.07 input
-	"agnes-2.0-flash": 2,
-	"zai-glm-4.7":     1.2222222222,
-	"gpt-oss-120b":    2.1428571429,
-	"gemma-4-31b":     1.5050505051,
+	"mimo-v2.5":                2,
+	"mimo-v2.5-pro":            2,
+	"mimo-v2.6-pro-ultraspeed": 2,
+
+	"jev-latest":         0,
+	"jev-preview":        0,
+	"jev-1.13.0":         0,
+	"gpt-4-gizmo-*":      2,
+	"gpt-4o-gizmo-*":     3,
+	"gpt-4-all":          2,
+	"gpt-image-1":        8,
+	"agnes-1.5-flash":    15.0 / 7.0, // $0.15 output / $0.07 input
+	"agnes-2.0-flash":    2,
+	"agnes-2.5-flash":    3,
+	"agnes-2.5-pro-beta": 3,
+	"agnes-2.5-pro":      2,
+	"agnes-3.0-flash":    3,
+	"zai-glm-4.7":        1.2222222222,
+	"gpt-oss-120b":       2.1428571429,
+	"gemma-4-31b":        1.5050505051,
 }
 
 // InitRatioSettings initializes all model related settings maps
@@ -398,7 +425,7 @@ func ModelPrice2JSONString() string {
 }
 
 func UpdateModelPriceByJSONString(jsonStr string) error {
-	return types.LoadFromJsonStringWithCallback(modelPriceMap, jsonStr, InvalidateExposedDataCache)
+	return loadWithAgnesDefaults(modelPriceMap, jsonStr, defaultModelPrice)
 }
 
 // GetModelPrice 返回模型的价格，如果模型不存在则返回-1，false
@@ -427,7 +454,7 @@ func GetModelPrice(name string, printErr bool) (float64, bool) {
 }
 
 func UpdateModelRatioByJSONString(jsonStr string) error {
-	return types.LoadFromJsonStringWithCallback(modelRatioMap, jsonStr, InvalidateExposedDataCache)
+	return loadWithAgnesDefaults(modelRatioMap, jsonStr, defaultModelRatio)
 }
 
 // 处理带有思考预算的模型名称，方便统一定价
@@ -475,7 +502,7 @@ func CompletionRatio2JSONString() string {
 }
 
 func UpdateCompletionRatioByJSONString(jsonStr string) error {
-	return types.LoadFromJsonStringWithCallback(completionRatioMap, jsonStr, InvalidateExposedDataCache)
+	return loadWithAgnesDefaults(completionRatioMap, jsonStr, defaultCompletionRatio)
 }
 
 func GetCompletionRatio(name string) float64 {

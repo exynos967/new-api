@@ -31,6 +31,8 @@ import {
   Card,
   Radio,
   Select,
+  Input,
+  Space,
 } from '@douyinfe/semi-ui';
 const { Text } = Typography;
 import {
@@ -108,16 +110,19 @@ const SystemSetting = () => {
     EmailDomainRestrictionEnabled: '',
     EmailAliasRestrictionEnabled: '',
     EmailCaseInsensitiveEnabled: '',
-    DomainEmailRegistrationEnabled: '',
     SMTPSSLEnabled: '',
     SMTPForceAuthLogin: '',
     EmailDomainWhitelist: [],
-    DomainEmailRegistrationWhitelist: [],
+    EmailDomainInviteCodeExemptionList: [],
+    EmailDomainRegistrationCodeExemptionList: [],
     EmailDomainBlacklist: [],
     TelegramOAuthEnabled: '',
     TelegramBotToken: '',
     TelegramBotName: '',
     LinuxDOOAuthEnabled: '',
+    'nodeloc.enabled': false,
+    'nodeloc.client_id': '',
+    'nodeloc.client_secret': '',
     LinuxDOClientId: '',
     LinuxDOClientSecret: '',
     LinuxDOMinimumTrustLevel: '',
@@ -138,16 +143,17 @@ const SystemSetting = () => {
   const [isLoaded, setIsLoaded] = useState(false);
   const formApiRef = useRef(null);
   const [emailDomainWhitelist, setEmailDomainWhitelist] = useState([]);
-  const [
-    domainEmailRegistrationWhitelist,
-    setDomainEmailRegistrationWhitelist,
-  ] = useState([]);
+  const [inviteCodeExemptionList, setInviteCodeExemptionList] = useState([]);
+  const [registrationCodeExemptionList, setRegistrationCodeExemptionList] =
+    useState([]);
   const [emailDomainBlacklist, setEmailDomainBlacklist] = useState([]);
   const [showPasswordLoginConfirmModal, setShowPasswordLoginConfirmModal] =
     useState(false);
   const [linuxDOOAuthEnabled, setLinuxDOOAuthEnabled] = useState(false);
   const [emailToAdd, setEmailToAdd] = useState('');
-  const [domainEmailToAdd, setDomainEmailToAdd] = useState('');
+  const [inviteCodeDomainToAdd, setInviteCodeDomainToAdd] = useState('');
+  const [registrationCodeDomainToAdd, setRegistrationCodeDomainToAdd] =
+    useState('');
   const [blacklistedEmailToAdd, setBlacklistedEmailToAdd] = useState('');
   const [domainFilterMode, setDomainFilterMode] = useState(true);
   const [ipFilterMode, setIpFilterMode] = useState(true);
@@ -169,8 +175,11 @@ const SystemSetting = () => {
           case 'EmailDomainWhitelist':
             setEmailDomainWhitelist(item.value ? item.value.split(',') : []);
             break;
-          case 'DomainEmailRegistrationWhitelist':
-            setDomainEmailRegistrationWhitelist(
+          case 'EmailDomainInviteCodeExemptionList':
+            setInviteCodeExemptionList(item.value ? item.value.split(',') : []);
+            break;
+          case 'EmailDomainRegistrationCodeExemptionList':
+            setRegistrationCodeExemptionList(
               item.value ? item.value.split(',') : [],
             );
             break;
@@ -219,10 +228,10 @@ const SystemSetting = () => {
           case 'EmailDomainRestrictionEnabled':
           case 'EmailAliasRestrictionEnabled':
           case 'EmailCaseInsensitiveEnabled':
-          case 'DomainEmailRegistrationEnabled':
           case 'SMTPSSLEnabled':
           case 'SMTPForceAuthLogin':
           case 'LinuxDOOAuthEnabled':
+          case 'nodeloc.enabled':
           case 'discord.enabled':
           case 'oidc.enabled':
           case 'passkey.enabled':
@@ -297,7 +306,7 @@ const SystemSetting = () => {
         });
         if (!res.data.success) {
           showError(res.data.message);
-          return;
+          return false;
         }
       }
 
@@ -318,6 +327,7 @@ const SystemSetting = () => {
         errorResults.forEach((res) => {
           showError(res.data.message);
         });
+        if (errorResults.length > 0) return false;
       }
 
       showSuccess(t('更新成功'));
@@ -327,10 +337,13 @@ const SystemSetting = () => {
         newInputs[opt.key] = opt.value;
       });
       setInputs(newInputs);
+      return true;
     } catch (error) {
       showError(t('更新失败'));
+      return false;
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const handleFormChange = (values) => {
@@ -410,20 +423,25 @@ const SystemSetting = () => {
 
   const submitEmailDomainSettings = async () => {
     const normalizedWhitelist = normalizeEmailDomainList(emailDomainWhitelist);
-    const normalizedDomainRegistrationWhitelist = normalizeEmailDomainList(
-      domainEmailRegistrationWhitelist,
+    const normalizedInviteCodeList = normalizeEmailDomainList(
+      inviteCodeExemptionList,
+    );
+    const normalizedRegistrationCodeList = normalizeEmailDomainList(
+      registrationCodeExemptionList,
     );
     const normalizedBlacklist = normalizeEmailDomainList(emailDomainBlacklist);
     if (
       normalizedWhitelist === null ||
-      normalizedDomainRegistrationWhitelist === null ||
+      normalizedInviteCodeList === null ||
+      normalizedRegistrationCodeList === null ||
       normalizedBlacklist === null
     ) {
       return;
     }
 
     setEmailDomainWhitelist(normalizedWhitelist);
-    setDomainEmailRegistrationWhitelist(normalizedDomainRegistrationWhitelist);
+    setInviteCodeExemptionList(normalizedInviteCodeList);
+    setRegistrationCodeExemptionList(normalizedRegistrationCodeList);
     setEmailDomainBlacklist(normalizedBlacklist);
     await updateOptions([
       {
@@ -431,8 +449,12 @@ const SystemSetting = () => {
         value: normalizedWhitelist.join(','),
       },
       {
-        key: 'DomainEmailRegistrationWhitelist',
-        value: normalizedDomainRegistrationWhitelist.join(','),
+        key: 'EmailDomainInviteCodeExemptionList',
+        value: normalizedInviteCodeList.join(','),
+      },
+      {
+        key: 'EmailDomainRegistrationCodeExemptionList',
+        value: normalizedRegistrationCodeList.join(','),
       },
       {
         key: 'EmailDomainBlacklist',
@@ -730,6 +752,28 @@ const SystemSetting = () => {
     }
   };
 
+  const submitNodeLocOAuth = async () => {
+    const options = [];
+    if (originInputs['nodeloc.client_id'] !== inputs['nodeloc.client_id']) {
+      options.push({
+        key: 'nodeloc.client_id',
+        value: inputs['nodeloc.client_id'],
+      });
+    }
+    if (inputs['nodeloc.client_secret']?.trim()) {
+      options.push({
+        key: 'nodeloc.client_secret',
+        value: inputs['nodeloc.client_secret'],
+      });
+    }
+    if (options.length > 0) {
+      if (await updateOptions(options)) {
+        formApiRef.current?.setValue('nodeloc.client_secret', '');
+        setInputs((previous) => ({ ...previous, 'nodeloc.client_secret': '' }));
+      }
+    }
+  };
+
   const submitPasskeySettings = async () => {
     // 使用formApi直接获取当前表单值
     const formValues = formApiRef.current?.getValues() || {};
@@ -775,7 +819,10 @@ const SystemSetting = () => {
     if (optionKey === 'PasswordLoginEnabled' && !value) {
       setShowPasswordLoginConfirmModal(true);
     } else {
-      await updateOptions([{ key: optionKey, value }]);
+      const saved = await updateOptions([{ key: optionKey, value }]);
+      if (!saved && optionKey === 'nodeloc.enabled') {
+        formApiRef.current?.setValue(optionKey, !value);
+      }
     }
     if (optionKey === 'LinuxDOOAuthEnabled') {
       setLinuxDOOAuthEnabled(value);
@@ -1147,6 +1194,15 @@ const SystemSetting = () => {
                         {t('允许通过 Discord 账户登录 & 注册')}
                       </Form.Checkbox>
                       <Form.Checkbox
+                        field='nodeloc.enabled'
+                        noLabel
+                        onChange={(e) =>
+                          handleCheckboxChange('nodeloc.enabled', e)
+                        }
+                      >
+                        {t('允许通过 NodeLoc 账户登录 & 注册')}
+                      </Form.Checkbox>
+                      <Form.Checkbox
                         field='LinuxDOOAuthEnabled'
                         noLabel
                         onChange={(e) =>
@@ -1320,7 +1376,7 @@ const SystemSetting = () => {
                 <Form.Section text={t('配置邮箱域名注册')}>
                   <Text>
                     {t(
-                      '配置允许注册的邮箱域名、域名邮箱免代码注册范围以及禁止注册的邮箱域名',
+                      '分别配置免邀请码和免注册码的邮箱域名，列表为空时不豁免；邮箱域名黑名单优先。仅验证邮箱后的密码注册生效。',
                     )}
                   </Text>
                   <Row
@@ -1363,20 +1419,6 @@ const SystemSetting = () => {
                         }
                       >
                         {t('邮箱用户名大小写不敏感')}
-                      </Form.Checkbox>
-                    </Col>
-                    <Col xs={24} sm={12} md={6} lg={6} xl={6}>
-                      <Form.Checkbox
-                        field='DomainEmailRegistrationEnabled'
-                        noLabel
-                        onChange={(e) =>
-                          handleCheckboxChange(
-                            'DomainEmailRegistrationEnabled',
-                            e,
-                          )
-                        }
-                      >
-                        {t('域名邮箱免邀请码和注册码注册')}
                       </Form.Checkbox>
                     </Col>
                   </Row>
@@ -1424,20 +1466,20 @@ const SystemSetting = () => {
                   />
 
                   <div style={{ marginTop: 20 }}>
-                    <Text>{t('免代码注册邮箱域名')}</Text>
+                    <Text>{t('免邀请码注册邮箱域名')}</Text>
                   </div>
                   <TagInput
-                    value={domainEmailRegistrationWhitelist}
-                    onChange={setDomainEmailRegistrationWhitelist}
+                    value={inviteCodeExemptionList}
+                    onChange={setInviteCodeExemptionList}
                     placeholder={t('输入域名后回车')}
                     style={{ width: '100%', marginTop: 8 }}
                   />
-                  <Form.Input
+                  <Input
                     placeholder={t(
-                      '输入可免代码注册的邮箱域名，如 example.com 或 *.edu.cn',
+                      '输入可免邀请码注册的邮箱域名，如 example.com 或 *.edu.cn',
                     )}
-                    value={domainEmailToAdd}
-                    onChange={(value) => setDomainEmailToAdd(value)}
+                    value={inviteCodeDomainToAdd}
+                    onChange={setInviteCodeDomainToAdd}
                     style={{ marginTop: 16 }}
                     suffix={
                       <Button
@@ -1445,10 +1487,10 @@ const SystemSetting = () => {
                         type='primary'
                         onClick={() =>
                           handleAddEmailDomain(
-                            domainEmailToAdd,
-                            domainEmailRegistrationWhitelist,
-                            setDomainEmailRegistrationWhitelist,
-                            setDomainEmailToAdd,
+                            inviteCodeDomainToAdd,
+                            inviteCodeExemptionList,
+                            setInviteCodeExemptionList,
+                            setInviteCodeDomainToAdd,
                           )
                         }
                       >
@@ -1457,10 +1499,52 @@ const SystemSetting = () => {
                     }
                     onEnterPress={() =>
                       handleAddEmailDomain(
-                        domainEmailToAdd,
-                        domainEmailRegistrationWhitelist,
-                        setDomainEmailRegistrationWhitelist,
-                        setDomainEmailToAdd,
+                        inviteCodeDomainToAdd,
+                        inviteCodeExemptionList,
+                        setInviteCodeExemptionList,
+                        setInviteCodeDomainToAdd,
+                      )
+                    }
+                  />
+
+                  <div style={{ marginTop: 20 }}>
+                    <Text>{t('免注册码注册邮箱域名')}</Text>
+                  </div>
+                  <TagInput
+                    value={registrationCodeExemptionList}
+                    onChange={setRegistrationCodeExemptionList}
+                    placeholder={t('输入域名后回车')}
+                    style={{ width: '100%', marginTop: 8 }}
+                  />
+                  <Input
+                    placeholder={t(
+                      '输入可免注册码注册的邮箱域名，如 example.com 或 *.edu.cn',
+                    )}
+                    value={registrationCodeDomainToAdd}
+                    onChange={setRegistrationCodeDomainToAdd}
+                    style={{ marginTop: 16 }}
+                    suffix={
+                      <Button
+                        theme='solid'
+                        type='primary'
+                        onClick={() =>
+                          handleAddEmailDomain(
+                            registrationCodeDomainToAdd,
+                            registrationCodeExemptionList,
+                            setRegistrationCodeExemptionList,
+                            setRegistrationCodeDomainToAdd,
+                          )
+                        }
+                      >
+                        {t('添加')}
+                      </Button>
+                    }
+                    onEnterPress={() =>
+                      handleAddEmailDomain(
+                        registrationCodeDomainToAdd,
+                        registrationCodeExemptionList,
+                        setRegistrationCodeExemptionList,
+                        setRegistrationCodeDomainToAdd,
                       )
                     }
                   />
@@ -1774,6 +1858,57 @@ const SystemSetting = () => {
                   </Row>
                   <Button onClick={submitLinuxDOOAuth}>
                     {t('保存 Linux DO OAuth 设置')}
+                  </Button>
+                </Form.Section>
+              </Card>
+
+              <Card>
+                <Form.Section text={t('配置 NodeLoc OAuth')}>
+                  <Text>
+                    {t(
+                      'NodeLoc 仅请求 openid profile，用户等级准入在 NodeLoc 应用侧设置。',
+                    )}
+                  </Text>
+                  <Space className='ml-2'>
+                    <a
+                      href='https://www.nodeloc.com/oauth-provider/applications'
+                      target='_blank'
+                      rel='noreferrer'
+                    >
+                      {t('管理 NodeLoc OAuth 应用')}
+                    </a>
+                    <a
+                      href='https://docs.nodeloc.com/api-reference/introduction'
+                      target='_blank'
+                      rel='noreferrer'
+                    >
+                      {t('接入文档')}
+                    </a>
+                  </Space>
+                  <Banner
+                    type='info'
+                    style={{ marginBottom: 20, marginTop: 16 }}
+                    description={`${t('回调 URL 填')} ${inputs.ServerAddress ? inputs.ServerAddress.trim().replace(/\/+$/, '') : t('网站地址')}/oauth/nodeloc`}
+                  />
+                  <Row gutter={24}>
+                    <Col xs={24} md={12}>
+                      <Form.Input
+                        field='nodeloc.client_id'
+                        label={t('NodeLoc Client ID')}
+                      />
+                    </Col>
+                    <Col xs={24} md={12}>
+                      <Form.Input
+                        field='nodeloc.client_secret'
+                        label={t('NodeLoc Client Secret')}
+                        type='password'
+                        autoComplete='new-password'
+                        placeholder={t('敏感信息不会发送到前端显示')}
+                      />
+                    </Col>
+                  </Row>
+                  <Button onClick={submitNodeLocOAuth}>
+                    {t('保存 NodeLoc OAuth 设置')}
                   </Button>
                 </Form.Section>
               </Card>

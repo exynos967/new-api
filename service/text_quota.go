@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -51,6 +52,9 @@ type textQuotaSummary struct {
 	FileSearchPrice          float64
 	FileSearchCallCount      int
 	AudioInputPrice          float64
+	AudioInputSeparate       bool
+	AudioOutputPrice         float64
+	AudioOutputTokens        int
 	ImageGenerationCallPrice float64
 	ToolCallSurchargeQuota   decimal.Decimal
 }
@@ -184,7 +188,7 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 	summary.CompletionTokens = usage.CompletionTokens
 	summary.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	summary.CacheTokens = usage.PromptTokensDetails.CachedTokens
-	summary.CacheCreationTokens = usage.PromptTokensDetails.CachedCreationTokens
+	summary.CacheCreationTokens = usage.PromptTokensDetails.GetCacheCreationTokens()
 	summary.CacheCreationTokens5m = usage.ClaudeCacheCreation5mTokens
 	summary.CacheCreationTokens1h = usage.ClaudeCacheCreation1hTokens
 	summary.ImageTokens = usage.PromptTokensDetails.ImageTokens
@@ -262,16 +266,33 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 		}
 
 		if !dAudioTokens.IsZero() {
-			summary.AudioInputPrice = operation_setting.GetGeminiInputAudioPricePerMillionTokens(summary.ModelName)
-			if summary.AudioInputPrice > 0 {
+			configuredAudio := ratio_setting.ContainsAudioRatio(summary.ModelName)
+			if configuredAudio {
+				summary.AudioInputPrice = summary.ModelRatio * 2 * relayInfo.PriceData.AudioRatio
+			} else {
+				summary.AudioInputPrice = operation_setting.GetGeminiInputAudioPricePerMillionTokens(summary.ModelName)
+			}
+			if configuredAudio || summary.AudioInputPrice > 0 {
+				summary.AudioInputSeparate = true
 				baseTokens = baseTokens.Sub(dAudioTokens)
 				audioInputQuota = decimal.NewFromFloat(summary.AudioInputPrice).
 					Div(decimal.NewFromInt(1000000)).Mul(dAudioTokens).Mul(dGroupRatio).Mul(dQuotaPerUnit)
 			}
 		}
 
+		// Inconsistent upstream subcategory counts must not manufacture a credit
+		// by making the number of remaining text tokens negative.
+		baseTokens = decimal.Max(decimal.Zero, baseTokens)
 		promptQuota := baseTokens.Add(cachedTokensWithRatio).Add(imageTokensWithRatio).Add(cachedCreationTokensWithRatio)
 		completionQuota := dCompletionTokens.Mul(dCompletionRatio)
+		if ratio_setting.ContainsAudioCompletionRatio(summary.ModelName) {
+			summary.AudioOutputTokens = usage.CompletionTokenDetails.AudioTokens
+			summary.AudioOutputPrice = summary.ModelRatio * 2 * relayInfo.PriceData.AudioRatio * relayInfo.PriceData.AudioCompletionRatio
+			audioOutputTokens := decimal.NewFromInt(int64(usage.CompletionTokenDetails.AudioTokens))
+			completionQuota = decimal.Max(decimal.Zero, dCompletionTokens.Sub(audioOutputTokens)).Mul(dCompletionRatio).
+				Add(audioOutputTokens.Mul(decimal.NewFromFloat(relayInfo.PriceData.AudioRatio)).
+					Mul(decimal.NewFromFloat(relayInfo.PriceData.AudioCompletionRatio)))
+		}
 		quotaCalculateDecimal := promptQuota.Add(completionQuota).Mul(ratio)
 		quotaCalculateDecimal = quotaCalculateDecimal.Add(summary.ToolCallSurchargeQuota)
 		quotaCalculateDecimal = quotaCalculateDecimal.Add(audioInputQuota)
@@ -282,10 +303,7 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 			}
 		}
 
-		if !ratio.IsZero() && quotaCalculateDecimal.LessThanOrEqual(decimal.Zero) {
-			quotaCalculateDecimal = decimal.NewFromInt(1)
-		}
-		summary.Quota = int(quotaCalculateDecimal.Round(0).IntPart())
+		summary.Quota = roundSignedQuota(quotaCalculateDecimal, !ratio.IsZero())
 	} else {
 		quotaCalculateDecimal := dModelPrice.Mul(dQuotaPerUnit).Mul(dGroupRatio)
 		quotaCalculateDecimal = quotaCalculateDecimal.Add(summary.ToolCallSurchargeQuota)
@@ -298,10 +316,8 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 		summary.Quota = int(quotaCalculateDecimal.Round(0).IntPart())
 	}
 
-	if summary.TotalTokens == 0 {
+	if summary.TotalTokens == 0 && !mistralNativeCallPrice(relayInfo) {
 		summary.Quota = 0
-	} else if !ratio.IsZero() && summary.Quota == 0 {
-		summary.Quota = 1
 	}
 
 	return summary
@@ -315,6 +331,12 @@ func usageSemanticFromUsage(relayInfo *relaycommon.RelayInfo, usage *dto.Usage) 
 		return "anthropic"
 	}
 	return "openai"
+}
+
+// A successful native OCR/speech response can contain pages or audio but no
+// tokens. Honor explicit per-request pricing without fabricating token usage.
+func mistralNativeCallPrice(info *relaycommon.RelayInfo) bool {
+	return info != nil && info.RelayFormat == types.RelayFormatMistralNative && info.PriceData.UsePrice
 }
 
 func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, usage *dto.Usage, extraContent []string) {
@@ -353,14 +375,14 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	if summary.FileSearchCallCount > 0 {
 		extraContent = append(extraContent, fmt.Sprintf("File Search 调用 %d 次，调用花费 %s", summary.FileSearchCallCount, decimal.NewFromFloat(summary.FileSearchPrice).Mul(decimal.NewFromInt(int64(summary.FileSearchCallCount))).Div(decimal.NewFromInt(1000)).Mul(decimal.NewFromFloat(summary.GroupRatio)).Mul(decimal.NewFromFloat(common.QuotaPerUnit)).String()))
 	}
-	if summary.AudioInputPrice > 0 && summary.AudioTokens > 0 {
+	if summary.AudioInputPrice != 0 && summary.AudioTokens > 0 {
 		extraContent = append(extraContent, fmt.Sprintf("Audio Input 花费 %s", decimal.NewFromFloat(summary.AudioInputPrice).Div(decimal.NewFromInt(1000000)).Mul(decimal.NewFromInt(int64(summary.AudioTokens))).Mul(decimal.NewFromFloat(summary.GroupRatio)).Mul(decimal.NewFromFloat(common.QuotaPerUnit)).String()))
 	}
 	if summary.ImageGenerationCallPrice > 0 {
 		extraContent = append(extraContent, fmt.Sprintf("Image Generation Call 花费 %s", decimal.NewFromFloat(summary.ImageGenerationCallPrice).Mul(decimal.NewFromFloat(summary.GroupRatio)).Mul(decimal.NewFromFloat(common.QuotaPerUnit)).String()))
 	}
 
-	if summary.TotalTokens == 0 {
+	if summary.TotalTokens == 0 && !mistralNativeCallPrice(relayInfo) {
 		extraContent = append(extraContent, "上游没有返回计费信息，无法扣费（可能是上游超时）")
 		logger.LogError(ctx, fmt.Sprintf("total tokens is 0, cannot consume quota, userId %d, channelId %d, tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, summary.ModelName, relayInfo.FinalPreConsumedQuota))
 	} else {
@@ -422,10 +444,14 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		other["file_search_call_count"] = summary.FileSearchCallCount
 		other["file_search_price"] = summary.FileSearchPrice
 	}
-	if summary.AudioInputPrice > 0 && summary.AudioTokens > 0 {
+	if summary.AudioInputSeparate && summary.AudioTokens > 0 {
 		other["audio_input_seperate_price"] = true
 		other["audio_input_token_count"] = summary.AudioTokens
 		other["audio_input_price"] = summary.AudioInputPrice
+	}
+	if summary.AudioOutputTokens > 0 {
+		other["audio_output_token_count"] = summary.AudioOutputTokens
+		other["audio_output_price"] = summary.AudioOutputPrice
 	}
 	if summary.ImageGenerationCallPrice > 0 {
 		other["image_generation_call"] = true

@@ -23,6 +23,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/gmicloud"
+	"github.com/QuantumNous/new-api/relay/channel/mistral"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -39,10 +40,11 @@ import (
 )
 
 type testResult struct {
-	context     *gin.Context
-	localErr    error
-	newAPIError *types.NewAPIError
-	rateLimit   *channelRateLimitInfo
+	context       *gin.Context
+	localErr      error
+	newAPIError   *types.NewAPIError
+	rateLimit     *channelRateLimitInfo
+	upstreamModel string
 }
 
 type channelRateLimitInfo struct {
@@ -258,6 +260,18 @@ func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointTyp
 	if normalized != "" {
 		return normalized
 	}
+	if channel != nil && channel.Type == constant.ChannelTypeTypeSafe {
+		return string(constant.EndpointTypeTypeSafeSystemOne)
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeMistral {
+		if mistral.IsTranscriptionModel(modelName) {
+			return string(constant.EndpointTypeAudioTranscription)
+		}
+		if strings.Contains(strings.ToLower(modelName), "embed") {
+			return string(constant.EndpointTypeEmbeddings)
+		}
+		return string(constant.EndpointTypeOpenAI)
+	}
 	if channel != nil && channel.Type == constant.ChannelTypeCohere {
 		if common.IsCohereRerankModel(modelName) {
 			return string(constant.EndpointTypeCohereRerank)
@@ -357,11 +371,23 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 			}
 			if testModel == "" {
 				testModel = "gpt-4o-mini"
+				if channel.Type == constant.ChannelTypeTypeSafe {
+					testModel = "jev-latest"
+				}
 			}
 		}
 	}
 
 	endpointType = normalizeChannelTestEndpoint(channel, testModel, endpointType)
+	if channel.Type == constant.ChannelTypeTypeSafe {
+		if endpointType != string(constant.EndpointTypeTypeSafeSystemOne) {
+			return testResult{localErr: errors.New("TypeSafe only supports /v1/systemone")}
+		}
+		isStream = false
+	}
+	if endpointType == string(constant.EndpointTypeTypeSafeSystemOne) && channel.Type != constant.ChannelTypeTypeSafe {
+		return testResult{localErr: errors.New("/v1/systemone requires a TypeSafe channel")}
+	}
 
 	requestPath := "/v1/chat/completions"
 
@@ -448,6 +474,8 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 	// 根据指定的端点类型设置 relayFormat
 	if endpointType != "" {
 		switch constant.EndpointType(endpointType) {
+		case constant.EndpointTypeTypeSafeSystemOne:
+			relayFormat = types.RelayFormatTypeSafe
 		case constant.EndpointTypeOpenAI, constant.EndpointTypeCohereChat:
 			relayFormat = types.RelayFormatOpenAI
 		case constant.EndpointTypeOpenAIResponse:
@@ -581,8 +609,15 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 	var convertedAudioReader io.Reader
 	// 根据 RelayMode 选择正确的转换函数
 	switch info.RelayMode {
+	case relayconstant.RelayModeTypeSafeSystemOne:
+		convertedRequest = request
 	case relayconstant.RelayModeAudioSpeech, relayconstant.RelayModeAudioTranscription, relayconstant.RelayModeAudioTranslation:
 		if audioReq, ok := request.(*dto.AudioRequest); ok {
+			if channel.Type == constant.ChannelTypeMistral && info.RelayMode == relayconstant.RelayModeAudioTranscription {
+				if err = prepareMistralTranscriptionTest(c, audioReq.Model); err != nil {
+					return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeConvertRequestFailed)}
+				}
+			}
 			convertedAudioReader, err = adaptor.ConvertAudioRequest(c, info, *audioReq)
 		} else {
 			return testResult{
@@ -704,7 +739,7 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 	//	}
 	//}
 
-	if len(info.ParamOverride) > 0 {
+	if len(info.ParamOverride) > 0 && !(channel.Type == constant.ChannelTypeMistral && convertedAudioReader != nil) {
 		jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
 		if err != nil {
 			if fixedErr, ok := relaycommon.AsParamOverrideReturnError(err); ok {
@@ -719,6 +754,12 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 				localErr:    err,
 				newAPIError: types.NewError(err, types.ErrorCodeChannelParamOverrideInvalid),
 			}
+		}
+	}
+	if info.RelayMode == relayconstant.RelayModeTypeSafeSystemOne {
+		var effective dto.TypeSafeRequest
+		if err := common.Unmarshal(jsonData, &effective); err != nil {
+			return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeInvalidRequest)}
 		}
 	}
 
@@ -773,6 +814,7 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 	if httpResp != nil {
 		rateLimit = extractChannelRateLimitInfo(channel, info.UpstreamModelName, httpResp.Header)
 	}
+	responseCapture := captureTestUpstreamResponse(info, httpResp)
 	usageA, respErr := adaptor.DoResponse(c, httpResp, info)
 	if respErr != nil {
 		return testResult{
@@ -828,10 +870,11 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 	common.SysLog(fmt.Sprintf("testing channel #%d, response: \n%s", channel.Id, string(respBody)))
 	testSucceeded = true
 	return testResult{
-		context:     c,
-		localErr:    nil,
-		newAPIError: nil,
-		rateLimit:   rateLimit,
+		context:       c,
+		localErr:      nil,
+		newAPIError:   nil,
+		rateLimit:     rateLimit,
+		upstreamModel: extractTestUpstreamModel(responseCapture.Snapshot().UpstreamResponseBody),
 	}
 }
 
@@ -1061,6 +1104,7 @@ func testTaskChannel(c *gin.Context, channel *model.Channel, testModel string, t
 	}
 
 	rateLimit := extractChannelRateLimitInfo(channel, info.UpstreamModelName, resp.Header)
+	responseCapture := captureTestUpstreamResponse(info, resp)
 	taskID, _, taskErr := adaptor.DoResponse(c, resp, info)
 	if taskErr != nil {
 		return taskErrorToTestResult(c, taskErr)
@@ -1088,10 +1132,11 @@ func testTaskChannel(c *gin.Context, channel *model.Channel, testModel string, t
 	common.SysLog(fmt.Sprintf("testing channel #%d, task id: %s", channel.Id, taskID))
 	testSucceeded = true
 	return testResult{
-		context:     c,
-		localErr:    nil,
-		newAPIError: nil,
-		rateLimit:   rateLimit,
+		context:       c,
+		localErr:      nil,
+		newAPIError:   nil,
+		rateLimit:     rateLimit,
+		upstreamModel: extractTestUpstreamModel(responseCapture.Snapshot().UpstreamResponseBody),
 	}
 }
 
@@ -1270,6 +1315,13 @@ func detectErrorMessageFromJSONBytes(jsonBytes []byte) string {
 }
 
 func buildTestRequest(model string, endpointType string, channel *model.Channel, isStream bool) dto.Request {
+	if constant.EndpointType(endpointType) == constant.EndpointTypeTypeSafeSystemOne ||
+		(endpointType == "" && channel != nil && channel.Type == constant.ChannelTypeTypeSafe) {
+		return &dto.TypeSafeRequest{Model: model, Fields: map[string]json.RawMessage{
+			"state":     json.RawMessage(`"Please help urgently."`),
+			"questions": json.RawMessage(`{"urgent":{"type":"noul","instructions":"Does this message express urgency?"}}`),
+		}}
+	}
 	testResponsesInput := json.RawMessage(`[{"role":"user","content":"hi"}]`)
 
 	// 根据端点类型构建不同的测试请求
@@ -1318,10 +1370,13 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 			return &dto.AudioRequest{
 				Model:          model,
 				Input:          "你好，这是一次渠道测试。",
-				Voice:          "cmn-CN-Wavenet-A",
+				Voice:          dto.AudioVoice{Name: "cmn-CN-Wavenet-A"},
 				ResponseFormat: "mp3",
 			}
 		case constant.EndpointTypeAudioTranscription:
+			if channel != nil && channel.Type == constant.ChannelTypeMistral {
+				return &dto.AudioRequest{Model: model, ResponseFormat: "json"}
+			}
 			return &dto.AudioRequest{
 				Model:          model,
 				ResponseFormat: "json",
@@ -1345,7 +1400,7 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 				MaxTokens: lo.ToPtr(maxTokens),
 			}
 			if isStream {
-				req.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
+				req.StreamOptions = &dto.StreamOptions{IncludeUsage: common.GetPointer(true)}
 			}
 			return req
 		}
@@ -1408,7 +1463,7 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 		},
 	}
 	if isStream {
-		testRequest.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
+		testRequest.StreamOptions = &dto.StreamOptions{IncludeUsage: common.GetPointer(true)}
 	}
 
 	if strings.HasPrefix(model, "o") {
@@ -1496,9 +1551,10 @@ func TestChannel(c *gin.Context) {
 		return
 	}
 	resp := gin.H{
-		"success": true,
-		"message": "",
-		"time":    consumedTime,
+		"success":        true,
+		"message":        "",
+		"time":           consumedTime,
+		"upstream_model": result.upstreamModel,
 	}
 	if result.rateLimit != nil {
 		resp["rate_limit"] = result.rateLimit

@@ -72,7 +72,6 @@ import {
   MessageSquare,
   Key,
   BarChart3,
-  Mail,
   Image as ImageIcon,
   CheckSquare,
   CreditCard,
@@ -138,8 +137,6 @@ export function getLucideIcon(key, selected = false) {
       return <Key {...commonProps} color={iconColor} />;
     case 'log':
       return <BarChart3 {...commonProps} color={iconColor} />;
-    case 'email_log':
-      return <Mail {...commonProps} color={iconColor} />;
     case 'midjourney':
       return <ImageIcon {...commonProps} color={iconColor} />;
     case 'task':
@@ -373,8 +370,10 @@ export function getChannelIcon(channelType) {
     case 66: // Vercel AI Gateway
       return <Vercel size={iconSize} />;
     case 67: // GMI Cloud
+    case 72: // Xiaomi MiMo
     case 68: // VyceAI
     case 69: // Modal
+    case 70: // Kilo
       return <Cloud size={iconSize} />;
     case 63: // OpenCode Zen
     case 64: // OpenCode Go
@@ -1238,8 +1237,12 @@ function getQuotaDisplayType() {
   return localStorage.getItem('quota_display_type') || 'USD';
 }
 
-function resolveBillingDisplayMode(displayMode, modelPrice = -1) {
-  if (modelPrice !== -1) {
+function resolveBillingDisplayMode(
+  displayMode,
+  modelPrice = -1,
+  usePrice = modelPrice !== -1,
+) {
+  if (usePrice) {
     return 'price';
   }
   if (getQuotaDisplayType() === 'TOKENS') {
@@ -1248,12 +1251,19 @@ function resolveBillingDisplayMode(displayMode, modelPrice = -1) {
   return displayMode === 'ratio' ? 'ratio' : 'price';
 }
 
-function isPriceDisplayMode(displayMode, modelPrice = -1) {
-  return resolveBillingDisplayMode(displayMode, modelPrice) === 'price';
+function isPriceDisplayMode(
+  displayMode,
+  modelPrice = -1,
+  usePrice = modelPrice !== -1,
+) {
+  return resolveBillingDisplayMode(displayMode, modelPrice, usePrice) === 'price';
 }
 
-function shouldUseRatioBillingProcess(modelPrice = -1) {
-  return modelPrice === -1 && getQuotaDisplayType() === 'TOKENS';
+function shouldUseRatioBillingProcess(
+  modelPrice = -1,
+  usePrice = modelPrice !== -1,
+) {
+  return !usePrice && getQuotaDisplayType() === 'TOKENS';
 }
 
 function formatCompactDisplayPrice(usdAmount, digits = 6) {
@@ -1332,6 +1342,7 @@ function renderBillingArticle(lines, { showReferenceNote = true } = {}) {
 function renderPriceSimpleCore({
   modelRatio,
   modelPrice = -1,
+  usePrice = modelPrice !== -1,
   groupRatio,
   user_group_ratio,
   cacheTokens = 0,
@@ -1375,16 +1386,16 @@ function renderPriceSimpleCore({
       },
     ];
 
-    if (modelPrice !== -1) {
+    if (usePrice) {
       segments.push({
         tone: 'secondary',
-        text: isPriceDisplayMode(displayMode, modelPrice)
+        text: isPriceDisplayMode(displayMode, modelPrice, usePrice)
           ? i18next.t('模型价格 {{price}}', {
               price: formatCompactDisplayPrice(modelPrice),
             })
           : i18next.t('按次'),
       });
-    } else if (isPriceDisplayMode(displayMode, modelPrice)) {
+    } else if (isPriceDisplayMode(displayMode, modelPrice, usePrice)) {
       segments.push({
         tone: 'secondary',
         text: i18next.t('输入 {{price}} / 1M tokens', {
@@ -1513,8 +1524,8 @@ function renderPriceSimpleCore({
     return segments;
   }
 
-  if (modelPrice !== -1) {
-    if (isPriceDisplayMode(displayMode, modelPrice)) {
+  if (usePrice) {
+    if (isPriceDisplayMode(displayMode, modelPrice, usePrice)) {
       return joinBillingSummary([
         i18next.t('模型价格：{{symbol}}{{price}}', {
           symbol: symbol,
@@ -1532,9 +1543,9 @@ function renderPriceSimpleCore({
     });
   }
 
-  if (isPriceDisplayMode(displayMode, modelPrice)) {
+  if (isPriceDisplayMode(displayMode, modelPrice, usePrice)) {
     const parts = [];
-    if (modelPrice !== -1) {
+    if (usePrice) {
       parts.push(
         i18next.t('模型价格 {{price}}', {
           price: formatCompactDisplayPrice(modelPrice),
@@ -1670,6 +1681,7 @@ export function renderModelPrice(opts) {
     completion_tokens: completionTokens = 0,
     model_ratio: modelRatio = 0,
     model_price: modelPrice = -1,
+    use_price: usePrice = modelPrice !== -1,
     completion_ratio: _completionRatio,
     group_ratio: _groupRatio,
     user_group_ratio,
@@ -1687,6 +1699,8 @@ export function renderModelPrice(opts) {
     audio_input_seperate_price: audioInputSeperatePrice = false,
     audio_input_token_count: audioInputTokens = 0,
     audio_input_price: audioInputPrice = 0,
+    audio_output_token_count: audioOutputTokens = 0,
+    audio_output_price: audioOutputPrice = 0,
     image_generation_call: imageGenerationCall = false,
     image_generation_call_price: imageGenerationCallPrice = 0,
     displayMode = 'price',
@@ -1700,8 +1714,25 @@ export function renderModelPrice(opts) {
 
   const { symbol, rate } = getCurrencyConfig();
 
-  if (!shouldUseRatioBillingProcess(modelPrice)) {
-    if (modelPrice !== -1) {
+  const textCompletionTokens = Math.max(0, completionTokens - audioOutputTokens);
+  const audioOutputAmount =
+    (audioOutputTokens / 1000000) * audioOutputPrice * groupRatio;
+  const audioOutputLine =
+    audioOutputTokens > 0
+      ? buildBillingText(
+          '音频输出：{{tokens}} / 1M * {{price}} * {{ratioType}} {{ratio}} = {{amount}}',
+          {
+            tokens: audioOutputTokens,
+            price: renderDisplayAmountFromUsd(audioOutputPrice),
+            ratioType: ratioLabel,
+            ratio: groupRatio,
+            amount: renderDisplayAmountFromUsd(audioOutputAmount),
+          },
+        )
+      : null;
+
+  if (!shouldUseRatioBillingProcess(modelPrice, usePrice)) {
+    if (usePrice) {
       return renderBillingArticle([
         buildBillingPriceText('按次：{{symbol}}{{price}}', {
           symbol,
@@ -1739,7 +1770,8 @@ export function renderModelPrice(opts) {
     const price =
       (effectiveInputTokens / 1000000) * inputRatioPrice * groupRatio +
       (audioInputTokens / 1000000) * audioInputPrice * groupRatio +
-      (completionTokens / 1000000) * completionRatioPrice * groupRatio +
+      (textCompletionTokens / 1000000) * completionRatioPrice * groupRatio +
+      audioOutputAmount +
       (webSearchCallCount / 1000) * webSearchPrice * groupRatio +
       (fileSearchCallCount / 1000) * fileSearchPrice * groupRatio +
       imageGenerationCallPrice * groupRatio;
@@ -1793,7 +1825,7 @@ export function renderModelPrice(opts) {
     const outputDesc = buildBillingText(
       '输出 {{completion}} tokens / 1M tokens * {{symbol}}{{compPrice}}) * {{ratioType}} {{ratio}}',
       {
-        completion: completionTokens,
+        completion: textCompletionTokens,
         symbol,
         compPrice: formatBillingDisplayPrice(completionRatioPrice, rate),
         ratio: groupRatio,
@@ -1802,6 +1834,9 @@ export function renderModelPrice(opts) {
     );
 
     const extraServices = [
+      audioOutputTokens > 0
+        ? ` + ${i18next.t('音频输出价格')} ${formatCompactDisplayPrice(audioOutputPrice)} / 1M tokens * ${audioOutputTokens} * ${groupRatio}`
+        : '',
       webSearch && webSearchCallCount > 0
         ? buildBillingPriceText(
             ' + Web搜索 {{count}}次 / 1K 次 * {{symbol}}{{price}} * {{ratioType}} {{ratio}}',
@@ -1860,6 +1895,7 @@ export function renderModelPrice(opts) {
         rate,
         amountKey: 'total',
       }),
+      audioOutputLine,
       cacheTokens > 0
         ? buildBillingPriceText(
             '缓存读取价格：{{symbol}}{{total}} / 1M tokens',
@@ -1918,7 +1954,7 @@ export function renderModelPrice(opts) {
     return renderBillingArticle(billingLines);
   }
 
-  if (modelPrice !== -1) {
+  if (usePrice) {
     const displayPrice = (modelPrice * rate).toFixed(6);
     const displayTotal = (modelPrice * groupRatio * rate).toFixed(6);
     return i18next.t(
@@ -1940,7 +1976,7 @@ export function renderModelPrice(opts) {
   const inputRatioPrice = modelRatio * 2.0;
   const completionRatioPrice = modelRatio * 2.0 * completionRatioValue;
   const audioRatioValue =
-    audioInputSeperatePrice && audioInputPrice > 0
+    audioInputSeperatePrice && inputRatioPrice !== 0
       ? formatRatioValue(audioInputPrice / inputRatioPrice)
       : null;
 
@@ -1967,7 +2003,7 @@ export function renderModelPrice(opts) {
   const audioInputAmount =
     (audioInputTokens / 1000000) * audioInputPrice * groupRatio;
   const completionAmount =
-    (completionTokens / 1000000) * completionRatioPrice * groupRatio;
+    (textCompletionTokens / 1000000) * completionRatioPrice * groupRatio;
   const webSearchAmount =
     (webSearchCallCount / 1000) * webSearchPrice * groupRatio;
   const fileSearchAmount =
@@ -1980,6 +2016,7 @@ export function renderModelPrice(opts) {
     imageInputAmount +
     audioInputAmount +
     completionAmount +
+    audioOutputAmount +
     webSearchAmount +
     fileSearchAmount +
     imageGenerationAmount;
@@ -2068,7 +2105,7 @@ export function renderModelPrice(opts) {
     buildBillingText(
       '输出：{{tokens}} / 1M * 模型倍率 {{modelRatio}} * 补全倍率 {{completionRatio}} * {{ratioType}} {{ratio}} = {{amount}}',
       {
-        tokens: completionTokens,
+        tokens: textCompletionTokens,
         modelRatio: modelRatioValue,
         completionRatio: completionRatioValue,
         ratioType: ratioLabel,
@@ -2076,6 +2113,7 @@ export function renderModelPrice(opts) {
         amount: renderDisplayAmountFromUsd(completionAmount),
       },
     ),
+    audioOutputLine,
     webSearch && webSearchCallCount > 0
       ? buildBillingText(
           'Web 搜索：{{count}} / 1K * 单价 {{price}} * {{ratioType}} {{ratio}} = {{amount}}',
@@ -2122,6 +2160,7 @@ export function renderLogContent(opts) {
     model_ratio: modelRatio,
     completion_ratio: completionRatio,
     model_price: modelPrice = -1,
+    use_price: usePrice = modelPrice !== -1,
     group_ratio: groupRatio,
     user_group_ratio,
     cache_ratio: cacheRatio = 1.0,
@@ -2142,8 +2181,8 @@ export function renderLogContent(opts) {
   // 获取货币配置
   const { symbol, rate } = getCurrencyConfig();
 
-  if (isPriceDisplayMode(displayMode, modelPrice)) {
-    if (modelPrice !== -1) {
+  if (isPriceDisplayMode(displayMode, modelPrice, usePrice)) {
+    if (usePrice) {
       return joinBillingSummary([
         i18next.t('模型价格 {{symbol}}{{price}} / 次', {
           symbol,
@@ -2201,7 +2240,7 @@ export function renderLogContent(opts) {
     return joinBillingSummary(parts);
   }
 
-  if (modelPrice !== -1) {
+  if (usePrice) {
     return i18next.t('模型价格 {{symbol}}{{price}}，{{ratioType}} {{ratio}}', {
       symbol: symbol,
       price: (modelPrice * rate).toFixed(6),
@@ -2404,6 +2443,7 @@ export function renderModelPriceSimple(opts) {
   const {
     model_ratio: modelRatio,
     model_price: modelPrice = -1,
+    use_price: usePrice = modelPrice !== -1,
     group_ratio: groupRatio,
     user_group_ratio,
     cache_tokens: cacheTokens = 0,
@@ -2424,6 +2464,7 @@ export function renderModelPriceSimple(opts) {
   return renderPriceSimpleCore({
     modelRatio,
     modelPrice,
+    usePrice,
     groupRatio,
     user_group_ratio,
     cacheTokens,
@@ -2448,6 +2489,7 @@ export function renderAudioModelPrice(opts) {
     completion_tokens: completionTokens = 0,
     model_ratio: modelRatio = 0,
     model_price: modelPrice = -1,
+    use_price: usePrice = modelPrice !== -1,
     completion_ratio: _completionRatio,
     audio_input: audioInputTokens = 0,
     audio_output: audioCompletionTokens = 0,
@@ -2471,8 +2513,8 @@ export function renderAudioModelPrice(opts) {
   // 获取货币配置
   const { symbol, rate } = getCurrencyConfig();
 
-  if (!shouldUseRatioBillingProcess(modelPrice)) {
-    if (modelPrice !== -1) {
+  if (!shouldUseRatioBillingProcess(modelPrice, usePrice)) {
+    if (usePrice) {
       return renderBillingArticle([
         buildBillingPriceText('模型价格：{{symbol}}{{price}} / 次', {
           symbol,
@@ -2567,7 +2609,7 @@ export function renderAudioModelPrice(opts) {
   }
 
   // 1 ratio = $0.002 / 1K tokens
-  if (modelPrice !== -1) {
+  if (usePrice) {
     return i18next.t(
       '模型价格：{{symbol}}{{price}} * {{ratioType}}：{{ratio}} = {{symbol}}{{total}}',
       {
@@ -2730,6 +2772,7 @@ export function renderClaudeModelPrice(opts) {
     completion_tokens: completionTokens = 0,
     model_ratio: modelRatio = 0,
     model_price: modelPrice = -1,
+    use_price: usePrice = modelPrice !== -1,
     completion_ratio: _completionRatio,
     group_ratio: _groupRatio,
     user_group_ratio,
@@ -2753,8 +2796,8 @@ export function renderClaudeModelPrice(opts) {
   // 获取货币配置
   const { symbol, rate } = getCurrencyConfig();
 
-  if (!shouldUseRatioBillingProcess(modelPrice)) {
-    if (modelPrice !== -1) {
+  if (!shouldUseRatioBillingProcess(modelPrice, usePrice)) {
+    if (usePrice) {
       return renderBillingArticle([
         buildBillingPriceText('模型价格：{{symbol}}{{price}} / 次', {
           symbol,
@@ -2945,7 +2988,7 @@ export function renderClaudeModelPrice(opts) {
     ]);
   }
 
-  if (modelPrice !== -1) {
+  if (usePrice) {
     return i18next.t(
       '模型价格：{{symbol}}{{price}} * {{ratioType}}：{{ratio}} = {{symbol}}{{total}}',
       {
@@ -3132,6 +3175,7 @@ export function renderClaudeLogContent(opts) {
     model_ratio: modelRatio,
     completion_ratio: completionRatio,
     model_price: modelPrice = -1,
+    use_price: usePrice = modelPrice !== -1,
     group_ratio: _groupRatio,
     user_group_ratio,
     cache_ratio: cacheRatio = 1.0,
@@ -3151,8 +3195,8 @@ export function renderClaudeLogContent(opts) {
   // 获取货币配置
   const { symbol, rate } = getCurrencyConfig();
 
-  if (isPriceDisplayMode(displayMode, modelPrice)) {
-    if (modelPrice !== -1) {
+  if (isPriceDisplayMode(displayMode, modelPrice, usePrice)) {
+    if (usePrice) {
       return joinBillingSummary([
         i18next.t('模型价格 {{symbol}}{{price}} / 次', {
           symbol,
@@ -3209,7 +3253,7 @@ export function renderClaudeLogContent(opts) {
     return joinBillingSummary(parts);
   }
 
-  if (modelPrice !== -1) {
+  if (usePrice) {
     return i18next.t('模型价格 {{symbol}}{{price}}，{{ratioType}} {{ratio}}', {
       symbol: symbol,
       price: (modelPrice * rate).toFixed(6),

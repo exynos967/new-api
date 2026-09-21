@@ -293,3 +293,17 @@ custom_oauth.name_empty: "Provider name cannot be empty"
 custom_oauth.has_bindings: "Cannot delete provider with existing user bindings"
 custom_oauth.binding_not_found: "OAuth binding not found"
 custom_oauth.provider_id_field_invalid: "Could not extract user ID from provider response"
+
+user.disable_permanent: "Permanently banned"
+user.disable_period: "Banned for {{.Minutes}} minutes; unban time: {{.Until}}"
+
+# Login password requirements
+user.password_setup_required: "Set a login password before continuing."
+user.password_policy: "Password must contain at least 8 characters, at most 72 UTF-8 bytes, and include a digit, an uppercase letter, a lowercase letter and an ASCII punctuation symbol."
+user.original_password_incorrect: "The original password is incorrect."
+user.password_unchanged: "The new password must differ from the original password."
+user.password_changed_retry: "Your password changed during this request. Please refresh and try again."
+
+oauth.access_denied: "Authorization was denied. You can try signing in again."
+oauth.authorization_failed: "Authorization failed. Please try again."
+oauth.nodeloc_config_invalid: "To enable NodeLoc, configure the Client ID, Client Secret and a valid server address (http:// or https://, without a path)."

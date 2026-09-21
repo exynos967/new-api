@@ -67,7 +67,10 @@ const (
 	ChannelTypeGMICloud       = 67
 	ChannelTypeVyceAI         = 68
 	ChannelTypeModal          = 69
-	ChannelTypeDummy          // this one is only for count, do not add any channel after this
+	ChannelTypeKilo           = 70
+	ChannelTypeTypeSafe       = 71
+	ChannelTypeMiMo           = 72
+	ChannelTypeDummy          = ChannelTypeMiMo + 1 // this one is only for count, do not add any channel after this
 
 )
 
@@ -142,6 +145,9 @@ var ChannelBaseURLs = []string{
 	"https://api.gmi-serving.com",               //67
 	"https://vyceai.com",                        //68
 	"",                                          //69, Modal deployments use per-app base URLs
+	"https://api.kilo.ai/api/gateway",           //70
+	"https://api.typesafe.ai",                   //71
+	"https://api.xiaomimimo.com",                //72
 }
 
 var ChannelTypeNames = map[int]string{
@@ -211,6 +217,9 @@ var ChannelTypeNames = map[int]string{
 	ChannelTypeGMICloud:       "GMI Cloud",
 	ChannelTypeVyceAI:         "VyceAI",
 	ChannelTypeModal:          "Modal",
+	ChannelTypeKilo:           "Kilo",
+	ChannelTypeTypeSafe:       "TypeSafe",
+	ChannelTypeMiMo:           "MiMo",
 }
 
 func GetChannelTypeName(channelType int) string {

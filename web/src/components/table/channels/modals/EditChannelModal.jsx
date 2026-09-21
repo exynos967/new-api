@@ -131,6 +131,11 @@ const GCP_CHANNEL_TYPE = 60;
 const MISTRAL_CONSOLE_CHANNEL_TYPE = 65;
 const MODAL_CHANNEL_TYPE = 69;
 
+const KILO_CHANNEL_TYPE = 70;
+const TYPESAFE_CHANNEL_TYPE = 71;
+const MIMO_CHANNEL_TYPE = 72;
+const MIMO_TEST_MODEL = 'mimo-v2.6-pro-ultraspeed';
+
 const isVertexChannel = (type) => Number(type) === VERTEX_CHANNEL_TYPE;
 const isServiceAccountChannel = (type) =>
   isVertexChannel(type) || Number(type) === GCP_CHANNEL_TYPE;
@@ -162,6 +167,8 @@ function type2secretPrompt(type) {
       return '请输入完整 Cookie 请求头值；批量创建时也可每行仅填一个 ory_session 值（不包含 Cookie: 前缀）';
     case MODAL_CHANNEL_TYPE:
       return '请输入 MODAL_PROXY_TOKEN_ID.MODAL_PROXY_TOKEN_SECRET';
+    case KILO_CHANNEL_TYPE:
+      return '请输入 Kilo API Key；匿名模式无需密钥';
     default:
       return '请输入渠道对应的鉴权密钥';
   }
@@ -236,6 +243,9 @@ const EditChannelModal = (props) => {
     modal_keepalive_interval_seconds: 30,
     openrouter_auto_sync_free_and_alpha_models_enabled: false,
     openrouter_free_model_name_simplification_enabled: false,
+    kilo_anonymous_enabled: false,
+    kilo_auto_sync_free_models_enabled: false,
+    kilo_free_model_name_simplification_enabled: false,
     upstream_model_update_check_enabled: false,
     upstream_model_update_auto_sync_enabled: false,
     upstream_model_update_last_check_time: 0,
@@ -247,6 +257,13 @@ const EditChannelModal = (props) => {
   const [multiKeyMode, setMultiKeyMode] = useState('random');
   const [autoBan, setAutoBan] = useState(true);
   const [inputs, setInputs] = useState(originInputs);
+  const isKiloAnonymous =
+    inputs.type === KILO_CHANNEL_TYPE && inputs.kilo_anonymous_enabled;
+  const isManagedFreeSync =
+    (inputs.type === 20 &&
+      inputs.openrouter_auto_sync_free_and_alpha_models_enabled) ||
+    (inputs.type === KILO_CHANNEL_TYPE &&
+      inputs.kilo_auto_sync_free_models_enabled);
   const [originModelOptions, setOriginModelOptions] = useState([]);
   const [modelOptions, setModelOptions] = useState([]);
   const [groupOptions, setGroupOptions] = useState([]);
@@ -620,7 +637,12 @@ const EditChannelModal = (props) => {
       value = Array.from(new Set(value.map((m) => (m || '').trim())));
     }
 
-    if (name === 'base_url' && value.endsWith('/v1')) {
+    if (
+      name === 'base_url' &&
+      value.endsWith('/v1') &&
+      inputs.type !== TYPESAFE_CHANNEL_TYPE &&
+      inputs.type !== MIMO_CHANNEL_TYPE
+    ) {
       Modal.confirm({
         title: '警告',
         content:
@@ -635,6 +657,21 @@ const EditChannelModal = (props) => {
     if (name === 'type') {
       let localModels = [];
       switch (value) {
+        case MIMO_CHANNEL_TYPE:
+          localModels = getChannelModels(value);
+          if (!isEdit) {
+            const testModel = inputs.test_model || MIMO_TEST_MODEL;
+            setInputs((prev) => ({
+              ...prev,
+              base_url: 'https://api.xiaomimimo.com',
+              models: localModels,
+              test_model: testModel,
+            }));
+            formApiRef.current?.setValue('base_url', 'https://api.xiaomimimo.com');
+            formApiRef.current?.setValue('models', localModels);
+            formApiRef.current?.setValue('test_model', testModel);
+          }
+          break;
         case 2:
           localModels = [
             'mj_imagine',
@@ -678,6 +715,18 @@ const EditChannelModal = (props) => {
             base_url: 'https://ark.cn-beijing.volces.com',
           }));
           break;
+        case KILO_CHANNEL_TYPE:
+          localModels = [];
+          setBatch(false);
+          setMultiToSingle(false);
+          setInputs((prev) => ({
+            ...prev,
+            base_url: '',
+            models: [],
+          }));
+          formApiRef.current?.setValue('base_url', '');
+          formApiRef.current?.setValue('models', []);
+          break;
         case MODAL_CHANNEL_TYPE:
           // Modal deployments define their own models; do not retain the
           // OpenAI defaults selected when the creation form first opens.
@@ -692,7 +741,8 @@ const EditChannelModal = (props) => {
           localModels = getChannelModels(value);
           break;
       }
-      if (value !== MODAL_CHANNEL_TYPE && inputs.models.length === 0) {
+      if (value !== MODAL_CHANNEL_TYPE &&
+        value !== KILO_CHANNEL_TYPE && inputs.models.length === 0) {
         setInputs((inputs) => ({ ...inputs, models: localModels }));
       }
       setBasicModels(localModels);
@@ -982,6 +1032,12 @@ const EditChannelModal = (props) => {
           data.openrouter_auto_sync_free_and_alpha_models_enabled =
             parsedSettings.openrouter_auto_sync_free_and_alpha_models_enabled ===
             true;
+          data.kilo_anonymous_enabled =
+            parsedSettings.kilo_anonymous_enabled === true;
+          data.kilo_auto_sync_free_models_enabled =
+            parsedSettings.kilo_auto_sync_free_models_enabled === true;
+          data.kilo_free_model_name_simplification_enabled =
+            parsedSettings.kilo_free_model_name_simplification_enabled === true;
           data.openrouter_free_model_name_simplification_enabled =
             parsedSettings.openrouter_free_model_name_simplification_enabled ===
             true;
@@ -1026,6 +1082,9 @@ const EditChannelModal = (props) => {
           data.modal_keepalive_interval_seconds = 30;
           data.openrouter_auto_sync_free_and_alpha_models_enabled = false;
           data.openrouter_free_model_name_simplification_enabled = false;
+          data.kilo_anonymous_enabled = false;
+          data.kilo_auto_sync_free_models_enabled = false;
+          data.kilo_free_model_name_simplification_enabled = false;
           data.upstream_model_update_check_enabled = false;
           data.upstream_model_update_auto_sync_enabled = false;
           data.upstream_model_update_last_check_time = 0;
@@ -1055,6 +1114,9 @@ const EditChannelModal = (props) => {
         data.modal_keepalive_interval_seconds = 30;
         data.openrouter_auto_sync_free_and_alpha_models_enabled = false;
         data.openrouter_free_model_name_simplification_enabled = false;
+        data.kilo_anonymous_enabled = false;
+        data.kilo_auto_sync_free_models_enabled = false;
+        data.kilo_free_model_name_simplification_enabled = false;
         data.upstream_model_update_check_enabled = false;
         data.upstream_model_update_auto_sync_enabled = false;
         data.upstream_model_update_last_check_time = 0;
@@ -1135,6 +1197,12 @@ const EditChannelModal = (props) => {
       // 如果是编辑模式，使用已有的 channelId 获取模型列表
       try {
         const res = await API.get('/api/channel/fetch_models/' + channelId, {
+          params:
+            inputs.type === KILO_CHANNEL_TYPE
+              ? {
+                  kilo_free_only: !!inputs.kilo_auto_sync_free_models_enabled,
+                }
+              : undefined,
           skipErrorHandler: true,
         });
         if (res && res.data && res.data.success) {
@@ -1176,7 +1244,7 @@ const EditChannelModal = (props) => {
         }
       }
 
-      if (!fetchKey) {
+      if (!fetchKey && !isKiloAnonymous) {
         errorMessage = errorMessage || t('请填写密钥');
         err = true;
       } else {
@@ -1193,6 +1261,10 @@ const EditChannelModal = (props) => {
               aws_key_type: inputs['aws_key_type'],
               other: inputs['other'],
               proxy: inputs['proxy'],
+              kilo_free_only:
+                inputs.type === KILO_CHANNEL_TYPE &&
+                !!inputs.kilo_auto_sync_free_models_enabled,
+              kilo_anonymous_enabled: isKiloAnonymous,
             },
             { skipErrorHandler: true },
           );
@@ -1504,6 +1576,10 @@ const EditChannelModal = (props) => {
       system_prompt_override: false,
     });
     // 重置密钥模式状态
+    setIsMultiKeyChannel(false);
+    setBatch(false);
+    setMultiToSingle(false);
+    setMultiKeyMode('random');
     setKeyMode('append');
     // 重置企业账户状态
     setIsEnterpriseAccount(false);
@@ -1661,6 +1737,13 @@ const EditChannelModal = (props) => {
     const formValues = formApiRef.current ? formApiRef.current.getValues() : {};
     let localInputs = { ...formValues };
     localInputs.param_override = inputs.param_override;
+    const kiloAnonymous =
+      localInputs.type === KILO_CHANNEL_TYPE &&
+      localInputs.kilo_anonymous_enabled === true;
+    if (kiloAnonymous && batch) {
+      showInfo(t('Kilo 匿名模式仅支持单渠道'));
+      return;
+    }
 
     if (localInputs.type === 57) {
       if (batch) {
@@ -1908,6 +1991,18 @@ const EditChannelModal = (props) => {
     }
 
     // type === 20: 设置企业账户标识，无论是true还是false都要传到后端
+    if (localInputs.type === KILO_CHANNEL_TYPE) {
+      settings.kilo_anonymous_enabled = kiloAnonymous;
+      settings.kilo_auto_sync_free_models_enabled =
+        localInputs.kilo_auto_sync_free_models_enabled === true;
+      settings.kilo_free_model_name_simplification_enabled =
+        settings.kilo_auto_sync_free_models_enabled &&
+        localInputs.kilo_free_model_name_simplification_enabled === true;
+    } else {
+      Object.keys(settings)
+        .filter((key) => key.startsWith('kilo_'))
+        .forEach((key) => delete settings[key]);
+    }
     if (localInputs.type === 20) {
       settings.openrouter_enterprise =
         localInputs.is_enterprise_account === true;
@@ -2025,7 +2120,8 @@ const EditChannelModal = (props) => {
     if (
       !Array.isArray(settings.upstream_model_update_last_detected_models) ||
       (!settings.upstream_model_update_check_enabled &&
-        !settings.openrouter_auto_sync_free_and_alpha_models_enabled)
+        !settings.openrouter_auto_sync_free_and_alpha_models_enabled &&
+        !settings.kilo_auto_sync_free_models_enabled)
     ) {
       settings.upstream_model_update_last_detected_models = [];
     }
@@ -2072,6 +2168,9 @@ const EditChannelModal = (props) => {
     delete localInputs.modal_keepalive_interval_seconds;
     delete localInputs.openrouter_auto_sync_free_and_alpha_models_enabled;
     delete localInputs.openrouter_free_model_name_simplification_enabled;
+    delete localInputs.kilo_anonymous_enabled;
+    delete localInputs.kilo_auto_sync_free_models_enabled;
+    delete localInputs.kilo_free_model_name_simplification_enabled;
     delete localInputs.upstream_model_update_check_enabled;
     delete localInputs.upstream_model_update_auto_sync_enabled;
     delete localInputs.upstream_model_update_last_check_time;
@@ -2226,7 +2325,7 @@ const EditChannelModal = (props) => {
     }
   };
 
-  const batchAllowed = (!isEdit || isMultiKeyChannel) && inputs.type !== 57;
+  const batchAllowed = (!isEdit || isMultiKeyChannel) && inputs.type !== 57 && !isKiloAnonymous;
   const batchExtra = batchAllowed ? (
     <Space>
       {!isEdit && (
@@ -2466,10 +2565,45 @@ const EditChannelModal = (props) => {
                     {t('上游模型管理')}
                   </Text>
 
+                  {inputs.type === KILO_CHANNEL_TYPE && (
+                    <>
+                      <Form.Switch
+                        field='kilo_auto_sync_free_models_enabled'
+                        label={t('自动维护 Kilo 免费模型')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        onChange={(value) =>
+                          handleChannelOtherSettingsChange(
+                            'kilo_auto_sync_free_models_enabled',
+                            value,
+                          )
+                        }
+                        extraText={t(
+                          '按 Kilo 的免费标记自动增删模型，保留其他手动模型；站内计费仍使用现有定价。',
+                        )}
+                      />
+                      <Form.Switch
+                        field='kilo_free_model_name_simplification_enabled'
+                        label={t('简化 Kilo 免费模型名称')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        disabled={!inputs.kilo_auto_sync_free_models_enabled}
+                        onChange={(value) =>
+                          handleChannelOtherSettingsChange(
+                            'kilo_free_model_name_simplification_enabled',
+                            value,
+                          )
+                        }
+                        extraText={t(
+                          '将 provider/model:free 简化为 model 并添加重定向；免费路由模型保持原名，名称冲突时保留完整名称。',
+                        )}
+                      />
+                    </>
+                  )}
                   {inputs.type === 20 && (
                     <Form.Switch
                       field='openrouter_auto_sync_free_and_alpha_models_enabled'
-                      label={t('自动维护 OpenRouter 免费及匿名 Alpha 模型')}
+                      label={t('自动维护 OpenRouter 免费及 Alpha 测试模型')}
                       checkedText={t('开')}
                       uncheckedText={t('关')}
                       onChange={(value) =>
@@ -2479,7 +2613,7 @@ const EditChannelModal = (props) => {
                         )
                       }
                       extraText={t(
-                        '开启后自动增删以 :free 结尾、openrouter/free 及 openrouter/*-alpha 模型，并保留其他模型',
+                        '开启后自动增删以 :free 结尾的模型、openrouter/free 及以 -alpha 结尾的测试模型（不限提供商前缀），并保留其他模型',
                       )}
                     />
                   )}
@@ -2499,7 +2633,7 @@ const EditChannelModal = (props) => {
                         )
                       }
                       extraText={t(
-                        '将 provider/model:free 简化为 model 并自动添加模型重定向；openrouter/free 和匿名 Alpha 模型保持原名，名称冲突时保留完整模型名',
+                        '将 provider/model:free 简化为 model 并自动添加模型重定向；openrouter/free 和 Alpha 测试模型保持原名，名称冲突时保留完整模型名',
                       )}
                     />
                   )}
@@ -2508,10 +2642,7 @@ const EditChannelModal = (props) => {
                     label={t('是否检测上游模型更新')}
                     checkedText={t('开')}
                     uncheckedText={t('关')}
-                    disabled={
-                      inputs.type === 20 &&
-                      inputs.openrouter_auto_sync_free_and_alpha_models_enabled
-                    }
+                    disabled={isManagedFreeSync}
                     onChange={(value) =>
                       handleChannelOtherSettingsChange(
                         'upstream_model_update_check_enabled',
@@ -2519,9 +2650,10 @@ const EditChannelModal = (props) => {
                       )
                     }
                     extraText={t(
-                      inputs.type === 20 &&
-                        inputs.openrouter_auto_sync_free_and_alpha_models_enabled
-                        ? 'OpenRouter 免费及匿名 Alpha 模型同步已开启，全部模型巡检设置暂时停用'
+                      isManagedFreeSync
+                        ? inputs.type === KILO_CHANNEL_TYPE
+                          ? 'Kilo 免费模型同步已开启，全部模型巡检设置暂时停用'
+                          : 'OpenRouter 免费及 Alpha 测试模型同步已开启，全部模型巡检设置暂时停用'
                         : '开启后由后端定时任务检测该渠道上游模型变化',
                     )}
                   />
@@ -2532,8 +2664,7 @@ const EditChannelModal = (props) => {
                     uncheckedText={t('关')}
                     disabled={
                       !inputs.upstream_model_update_check_enabled ||
-                      (inputs.type === 20 &&
-                        inputs.openrouter_auto_sync_free_and_alpha_models_enabled)
+                      isManagedFreeSync
                     }
                     onChange={(value) =>
                       handleChannelOtherSettingsChange('upstream_model_update_auto_sync_enabled', value)
@@ -3162,6 +3293,28 @@ const EditChannelModal = (props) => {
                       autoComplete='new-password'
                     />
 
+                    {inputs.type === KILO_CHANNEL_TYPE && (
+                      <Form.Switch
+                        field='kilo_anonymous_enabled'
+                        label={t('Kilo 匿名调用')}
+                        checkedText={t('开')}
+                        uncheckedText={t('关')}
+                        disabled={isEdit && isMultiKeyChannel && !isKiloAnonymous}
+                        onChange={(value) => {
+                          handleChannelOtherSettingsChange(
+                            'kilo_anonymous_enabled',
+                            value,
+                          );
+                          if (value) {
+                            setBatch(false);
+                            setMultiToSingle(false);
+                          }
+                        }}
+                        extraText={t(
+                          '匿名模式无需密钥，仅适用于上游允许匿名访问的免费模型；关闭后使用已保存或新填写的密钥。',
+                        )}
+                      />
+                    )}
                     {inputs.type === 33 && (
                       <>
                         <Form.Select
@@ -3571,8 +3724,9 @@ const EditChannelModal = (props) => {
                                     )
                                 : t(type2secretPrompt(inputs.type))
                             }
+                            disabled={isKiloAnonymous}
                             rules={
-                              isEdit
+                              isEdit || isKiloAnonymous
                                 ? []
                                 : [{ required: true, message: t('请输入密钥') }]
                             }
@@ -3867,6 +4021,35 @@ const EditChannelModal = (props) => {
                         />
                       )}
 
+                      {inputs.type === TYPESAFE_CHANNEL_TYPE && (
+                        <Banner
+                          type='info'
+                          description={t(
+                            'TypeSafe 默认地址为 https://api.typesafe.ai，支持 /v1/systemone 原生评估和模型列表获取，不支持聊天或流式请求。',
+                          )}
+                          className='!rounded-lg'
+                        />
+                      )}
+
+                      {inputs.type === MIMO_CHANNEL_TYPE && (
+                        <Banner
+                          type='info'
+                          description={t(
+                            'MiMo 支持 OpenAI 和 Anthropic 对话接口。模型列表会补充 mimo-v2.6-pro-ultraspeed；该模型暂按 v2.5-pro 的站内价格计费，可在模型定价中调整。',
+                          )}
+                          className='!rounded-lg'
+                        />
+                      )}
+
+                      {inputs.type === KILO_CHANNEL_TYPE && (
+                        <Banner
+                          type='info'
+                          description={t(
+                            'Kilo 默认网关为 https://api.kilo.ai/api/gateway，可获取最新模型列表；开启免费模型同步后仅获取免费模型。',
+                          )}
+                        />
+                      )}
+
                       {inputs.type === MODAL_CHANNEL_TYPE && (
                         <Row gutter={12}>
                           <Col xs={24} sm={12}>
@@ -3921,7 +4104,13 @@ const EditChannelModal = (props) => {
                                   : t('API地址')
                               }
                               placeholder={
-                                inputs.type === MODAL_CHANNEL_TYPE
+                                inputs.type === TYPESAFE_CHANNEL_TYPE
+                                  ? 'https://api.typesafe.ai'
+                                  : inputs.type === MIMO_CHANNEL_TYPE
+                                  ? 'https://api.xiaomimimo.com'
+                                  : inputs.type === KILO_CHANNEL_TYPE
+                                  ? 'https://api.kilo.ai/api/gateway'
+                                  : inputs.type === MODAL_CHANNEL_TYPE
                                   ? 'https://your-workspace--your-app.modal.direct'
                                   : t(
                                       '此项可选，用于通过自定义API地址来进行 API 调用，末尾不要带/v1和/',

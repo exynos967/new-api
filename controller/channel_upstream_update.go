@@ -97,11 +97,12 @@ func isOpenRouterManagedFreeOrAlphaModel(modelName string) bool {
 	if modelName == "openrouter/free" || strings.HasSuffix(modelName, ":free") {
 		return true
 	}
-	if !strings.HasPrefix(modelName, "openrouter/") || !strings.HasSuffix(modelName, "-alpha") {
+	if !strings.HasSuffix(modelName, "-alpha") {
 		return false
 	}
-	alphaName := strings.TrimSuffix(strings.TrimPrefix(modelName, "openrouter/"), "-alpha")
-	return alphaName != "" && !strings.Contains(alphaName, "/")
+	// Alpha test models can belong to any provider, including nested namespaces.
+	alphaName := modelName[strings.LastIndex(modelName, "/")+1:]
+	return strings.TrimSpace(strings.TrimSuffix(alphaName, "-alpha")) != ""
 }
 
 func filterOpenRouterManagedFreeAndAlphaModels(models []string) []string {
@@ -117,7 +118,7 @@ func isOpenRouterManagedModelSyncEnabled(channel *model.Channel, settings dto.Ch
 }
 
 func isChannelUpstreamModelUpdateEnabled(channel *model.Channel, settings dto.ChannelOtherSettings) bool {
-	return settings.UpstreamModelUpdateCheckEnabled || isOpenRouterManagedModelSyncEnabled(channel, settings)
+	return settings.UpstreamModelUpdateCheckEnabled || isOpenRouterManagedModelSyncEnabled(channel, settings) || isKiloManagedModelSyncEnabled(channel, settings)
 }
 
 func mergeModelNames(base []string, appended []string) []string {
@@ -524,7 +525,7 @@ func fetchOpenRouterManagedFreeAndAlphaModelIDs(
 	}
 	managedModels := filterOpenRouterManagedFreeAndAlphaModels(models)
 	if len(managedModels) == 0 {
-		return nil, fmt.Errorf("OpenRouter 用户模型列表未返回任何免费或匿名 Alpha 模型")
+		return nil, fmt.Errorf("OpenRouter 用户模型列表未返回任何免费或 Alpha 测试模型")
 	}
 	return managedModels, nil
 }
@@ -577,6 +578,9 @@ func checkAndPersistChannelUpstreamModelUpdates(
 	force bool,
 	allowAutoApply bool,
 ) (modelsChanged bool, autoApplyResult channelUpstreamAutoApplyResult, err error) {
+	if isKiloManagedModelSyncEnabled(channel, *settings) {
+		return checkAndPersistKiloModelUpdates(channel, settings, force, allowAutoApply)
+	}
 	now := common.GetTimestamp()
 	if !force {
 		minInterval := getUpstreamModelUpdateMinCheckIntervalSeconds()
@@ -1044,6 +1048,9 @@ func applyChannelUpstreamModelUpdates(
 	err error,
 ) {
 	settings := channel.GetOtherSettings()
+	if isKiloManagedModelSyncEnabled(channel, settings) {
+		return applyKiloModelUpdates(channel, addModelsInput, ignoreModelsInput, removeModelsInput)
+	}
 	pendingAddModels := normalizeModelNames(settings.UpstreamModelUpdateLastDetectedModels)
 	pendingRemoveModels := normalizeModelNames(settings.UpstreamModelUpdateLastRemovedModels)
 	isOpenRouterManagedSync := isOpenRouterManagedModelSyncEnabled(channel, settings)

@@ -54,6 +54,15 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
+	// Revalidate after channel selection on every attempt: an instructions-only
+	// DeepSeek request must not silently bypass another provider's input requirement
+	// when retried on a different channel.
+	if info.ChannelType == appconstant.ChannelTypeOpenAI && responsesReq.Background != nil && *responsesReq.Background {
+		return helper.ValidateResponsesBackground(responsesReq.Background)
+	}
+	if info.RelayMode == relayconstant.RelayModeResponses && responsesReq.Input == nil && info.ApiType != appconstant.APITypeDeepSeek && info.ChannelType != appconstant.ChannelTypeOpenAI {
+		return types.NewErrorWithStatusCode(fmt.Errorf("input is required"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
 
 	request, err := common.DeepCopy(responsesReq)
 	if err != nil {
@@ -78,6 +87,7 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 			return types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
 		}
 		if upstreamBytes, bErr := storage.Bytes(); bErr == nil {
+			relaycommon.SetReasoningEffortFromRequest(info, upstreamBytes)
 			relaycommon.SetConversationUpstreamRequest(info, upstreamBytes)
 		}
 		requestBody = common.ReaderOnly(storage)
@@ -106,9 +116,22 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 			}
 		}
 
+		if info.ChannelType == appconstant.ChannelTypeOpenAI {
+			var finalRequest struct {
+				Background *bool `json:"background"`
+			}
+			if err := common.Unmarshal(jsonData, &finalRequest); err != nil {
+				return types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+			if err := helper.ValidateResponsesBackground(finalRequest.Background); err != nil {
+				return err
+			}
+		}
+
 		if common.DebugEnabled {
 			println("requestBody: ", string(jsonData))
 		}
+		relaycommon.SetReasoningEffortFromRequest(info, jsonData)
 		relaycommon.SetConversationUpstreamRequest(info, jsonData)
 		requestBody = bytes.NewBuffer(jsonData)
 	}

@@ -185,6 +185,7 @@ type RelayInfo struct {
 }
 
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
+	info.ReasoningEffort = ""
 	channelType := common.GetContextKeyInt(c, constant.ContextKeyChannelType)
 	paramOverride := common.GetContextKeyStringMap(c, constant.ContextKeyChannelParamOverride)
 	headerOverride := common.GetContextKeyStringMap(c, constant.ContextKeyChannelHeaderOverride)
@@ -315,6 +316,9 @@ func (info *RelayInfo) ToString() string {
 
 // 定义支持流式选项的通道类型
 var streamSupportedChannels = map[int]bool{
+	constant.ChannelTypeMiMo:        true, // Verified stream_options.include_usage with MiMo on 2026-09-21.
+	constant.ChannelTypeKilo:        true, // https://kilo.ai/docs/gateway/streaming
+	constant.ChannelTypeAgnesAI:     true, // Verified with stream_options.include_usage on 2026-09-10.
 	constant.ChannelTypeOpenAI:      true,
 	constant.ChannelTypeAnthropic:   true,
 	constant.ChannelTypeAws:         true,
@@ -389,13 +393,20 @@ func GenRelayInfoResponses(c *gin.Context, request *dto.OpenAIResponsesRequest) 
 	info := genBaseRelayInfo(c, request)
 	info.RelayMode = relayconstant.RelayModeResponses
 	info.RelayFormat = types.RelayFormatOpenAIResponses
+	info.InitResponsesUsageInfo(request)
+	return info
+}
 
+func (info *RelayInfo) InitResponsesUsageInfo(request *dto.OpenAIResponsesRequest) {
 	info.ResponsesUsageInfo = &ResponsesUsageInfo{
 		BuiltInTools: make(map[string]*BuildInToolInfo),
 	}
 	if len(request.Tools) > 0 {
 		for _, tool := range request.GetToolsMap() {
 			toolType := common.Interface2String(tool["type"])
+			if toolType == "web_search" || strings.HasPrefix(toolType, "web_search_preview_") {
+				toolType = dto.BuildInToolWebSearchPreview
+			}
 			info.ResponsesUsageInfo.BuiltInTools[toolType] = &BuildInToolInfo{
 				ToolName:  toolType,
 				CallCount: 0,
@@ -410,7 +421,6 @@ func GenRelayInfoResponses(c *gin.Context, request *dto.OpenAIResponsesRequest) 
 			}
 		}
 	}
-	return info
 }
 
 func GenRelayInfoGemini(c *gin.Context, request dto.Request) *RelayInfo {
@@ -549,6 +559,15 @@ func GenRelayInfo(c *gin.Context, relayFormat types.RelayFormat, request dto.Req
 	var info *RelayInfo
 	var err error
 	switch relayFormat {
+	case types.RelayFormatTypeSafe:
+		info = genBaseRelayInfo(c, request)
+		info.RelayFormat = relayFormat
+		info.DisablePing = true
+	case types.RelayFormatMistralNative, types.RelayFormatMistralRealtime:
+		info = genBaseRelayInfo(c, request)
+		info.RelayFormat = relayFormat
+		info.ClientWs = ws
+		info.DisablePing = true // Native SSE event framing must remain unchanged.
 	case types.RelayFormatOpenAI:
 		info = GenRelayInfoOpenAI(c, request)
 	case types.RelayFormatOpenAIAudio:
@@ -712,7 +731,8 @@ type TaskRelayInfo struct {
 	OriginTaskID string
 	// PublicTaskID 是提交时预生成的 task_xxxx 格式公开 ID，
 	// 供 DoResponse 在返回给客户端时使用（避免暴露上游真实 ID）。
-	PublicTaskID string
+	PublicTaskID    string
+	UpstreamVideoID string
 
 	ConsumeQuota bool
 
@@ -850,7 +870,7 @@ func FailTaskInfo(reason string) *TaskInfo {
 // speed: Claude 推理速度模式字段（仅 Claude 支持，默认过滤）
 // store: 数据存储授权字段，涉及用户隐私（仅 OpenAI、Responses API 支持，默认允许透传，禁用后可能导致 Codex 无法使用）
 // safety_identifier: 安全标识符，用于向 OpenAI 报告违规用户（仅 OpenAI 支持，涉及用户隐私）
-// stream_options.include_obfuscation: 响应流混淆控制字段（仅 OpenAI Responses API 支持）
+// stream_options.include_obfuscation: 响应流混淆控制字段（OpenAI Chat Completions 和 Responses API 支持）
 func RemoveDisabledFields(jsonData []byte, channelOtherSettings dto.ChannelOtherSettings, channelPassThroughEnabled bool) ([]byte, error) {
 	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || channelPassThroughEnabled {
 		return jsonData, nil

@@ -10,6 +10,10 @@ import (
 func GetEndpointTypesByChannelType(channelType int, modelName string) []constant.EndpointType {
 	var endpointTypes []constant.EndpointType
 	switch channelType {
+	case constant.ChannelTypeMiMo:
+		return []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeAnthropic}
+	case constant.ChannelTypeTypeSafe:
+		return []constant.EndpointType{constant.EndpointTypeTypeSafeSystemOne}
 	case constant.ChannelTypeJina:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeJinaRerank}
 	case constant.ChannelTypeCohere:
@@ -30,7 +34,7 @@ func GetEndpointTypesByChannelType(channelType int, modelName string) []constant
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeGemini, constant.EndpointTypeOpenAI}
 	case constant.ChannelTypeOpenRouter:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI}
-	case constant.ChannelTypeModal:
+	case constant.ChannelTypeModal, constant.ChannelTypeKilo:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI}
 	case constant.ChannelTypeGMICloud:
 		if strings.EqualFold(strings.TrimSpace(modelName), "Gemini-batch-inference") {

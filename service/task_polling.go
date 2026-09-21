@@ -67,7 +67,13 @@ func sweepTimedOutTasks(ctx context.Context) {
 			task.FailReason = reason
 		}
 
-		won, err := task.UpdateWithStatus(oldStatus)
+		var won bool
+		var err error
+		if task.HasDeferredBilling() {
+			won, err = completeDeferredTask(ctx, task, oldStatus, nil)
+		} else {
+			won, err = task.UpdateWithStatus(oldStatus)
+		}
 		if err != nil {
 			logger.LogError(ctx, fmt.Sprintf("sweepTimedOutTasks CAS update error for task %s: %v", task.TaskID, err))
 			continue
@@ -77,7 +83,7 @@ func sweepTimedOutTasks(ctx context.Context) {
 			continue
 		}
 		timedOutCount++
-		if !isLegacy && task.Quota != 0 {
+		if !isLegacy && !task.HasDeferredBilling() && task.Quota != 0 {
 			RefundTaskQuota(ctx, task, reason)
 		}
 	}
@@ -174,7 +180,18 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
-				failedIDs = append(failedIDs, t.ID)
+				if t.HasDeferredBilling() {
+					original := *t
+					t.Status, t.Progress = model.TaskStatusFailure, "100%"
+					t.FailReason = fmt.Sprintf("Failed to get channel info, channel ID: %d", channelId)
+					t.FinishTime = time.Now().Unix()
+					if _, settleErr := completeDeferredTask(ctx, t, original.Status, nil); settleErr != nil {
+						*t = original
+						logger.LogError(ctx, fmt.Sprintf("Failed to refund deferred task %s: %v", t.TaskID, settleErr))
+					}
+				} else {
+					failedIDs = append(failedIDs, t.ID)
+				}
 			}
 		}
 		err = model.TaskBulkUpdateByID(failedIDs, map[string]any{
@@ -222,6 +239,15 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 
 	for _, responseItem := range responseItems.Data {
 		task := taskM[responseItem.TaskID]
+		if task == nil {
+			continue
+		}
+		if task.HasDeferredBilling() {
+			if err := updateDeferredSunoTask(ctx, task, responseItem); err != nil {
+				logger.LogError(ctx, fmt.Sprintf("UpdateSunoTask deferred billing: %v", err))
+			}
+			continue
+		}
 		if !taskNeedsUpdate(task, responseItem) {
 			continue
 		}
@@ -308,7 +334,18 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 		var failedIDs []int64
 		for _, upstreamID := range taskIds {
 			if t, ok := taskM[upstreamID]; ok {
-				failedIDs = append(failedIDs, t.ID)
+				if t.HasDeferredBilling() {
+					original := *t
+					t.Status, t.Progress = model.TaskStatusFailure, "100%"
+					t.FailReason = fmt.Sprintf("Failed to get channel info, channel ID: %d", channelId)
+					t.FinishTime = time.Now().Unix()
+					if _, settleErr := completeDeferredTask(ctx, t, original.Status, nil); settleErr != nil {
+						*t = original
+						logger.LogError(ctx, fmt.Sprintf("Failed to refund deferred task %s: %v", t.TaskID, settleErr))
+					}
+				} else {
+					failedIDs = append(failedIDs, t.ID)
+				}
 			}
 		}
 		errUpdate := model.TaskBulkUpdateByID(failedIDs, map[string]any{
@@ -341,6 +378,12 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 	return nil
 }
 
+// RefreshVideoTask uses the same CAS-guarded persistence and billing path as
+// background polling. Callers must enforce task ownership before invoking it.
+func RefreshVideoTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *model.Channel, task *model.Task) error {
+	return updateVideoSingleTask(ctx, adaptor, ch, task.GetUpstreamTaskID(), map[string]*model.Task{task.GetUpstreamTaskID(): task})
+}
+
 func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *model.Channel, taskId string, taskM map[string]*model.Task) error {
 	baseURL := constant.ChannelBaseURLs[ch.Type]
 	if ch.GetBaseURL() != "" {
@@ -353,6 +396,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
 		return fmt.Errorf("task %s not found", taskId)
 	}
+	if task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure {
+		return nil
+	}
 	key := ch.Key
 
 	privateData := task.PrivateData
@@ -360,13 +406,21 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		key = privateData.Key
 	}
 	resp, err := adaptor.FetchTask(baseURL, key, map[string]any{
-		"task_id": task.GetUpstreamTaskID(),
-		"action":  task.Action,
+		"task_id":    task.GetUpstreamTaskID(),
+		"action":     task.Action,
+		"video_id":   task.PrivateData.UpstreamVideoID,
+		"model_name": task.Properties.UpstreamModelName,
 	}, proxy)
 	if err != nil {
 		return fmt.Errorf("fetchTask failed for task %s: %w", taskId, err)
 	}
+	if resp == nil {
+		return fmt.Errorf("empty task response")
+	}
 	defer resp.Body.Close()
+	if ch.Type == constant.ChannelTypeAgnesAI && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Agnes task retrieval returned HTTP %d", resp.StatusCode)
+	}
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("readAll failed for task %s: %w", taskId, err)
@@ -375,6 +429,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	logger.LogDebug(ctx, fmt.Sprintf("updateVideoSingleTask response: %s", string(responseBody)))
 
 	snap := task.Snapshot()
+	originalTask := *task
 
 	taskResult := &relaycommon.TaskInfo{}
 	// try parse as New API response format
@@ -482,17 +537,28 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 
 	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
 	if isDone && snap.Status != task.Status {
-		won, err := task.UpdateWithStatus(snap.Status)
-		if err != nil {
-			logger.LogError(ctx, fmt.Sprintf("UpdateWithStatus failed for task %s: %s", task.TaskID, err.Error()))
-			shouldRefund = false
-			shouldSettle = false
+		var won bool
+		var err error
+		if task.HasDeferredBilling() {
+			won, err = completeDeferredTask(ctx, task, snap.Status, taskResult)
+			shouldSettle, shouldRefund = false, false
 			shouldChargeViolationFee = false
+		} else {
+			won, err = task.UpdateWithStatus(snap.Status)
+		}
+		if err != nil {
+			*task = originalTask
+			logger.LogError(ctx, fmt.Sprintf("UpdateWithStatus failed for task %s: %s", task.TaskID, err.Error()))
+			return err
 		} else if !won {
 			logger.LogWarn(ctx, fmt.Sprintf("Task %s already transitioned by another process, skip billing", task.TaskID))
-			shouldRefund = false
-			shouldSettle = false
-			shouldChargeViolationFee = false
+			// Foreground callers must render the winning persisted transition.
+			if current, exists, loadErr := model.GetByTaskId(task.UserId, task.TaskID); loadErr != nil {
+				return loadErr
+			} else if exists {
+				*task = *current
+			}
+			return nil
 		}
 	} else if !snap.Equal(task.Snapshot()) {
 		if _, err := task.UpdateWithStatus(snap.Status); err != nil {

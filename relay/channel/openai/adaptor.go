@@ -81,7 +81,7 @@ func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayIn
 	//}
 	if info.SupportStreamOptions && info.IsStream {
 		aiRequest.StreamOptions = &dto.StreamOptions{
-			IncludeUsage: true,
+			IncludeUsage: common.GetPointer(true),
 		}
 	}
 	return a.ConvertOpenAIRequest(c, info, aiRequest)
@@ -101,6 +101,12 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 }
 
 func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
+	if info.ChannelType == constant.ChannelTypeKilo {
+		if info.RelayMode != relayconstant.RelayModeChatCompletions {
+			return "", errors.New("Kilo channel supports chat completions only")
+		}
+		return strings.TrimRight(strings.TrimSpace(info.ChannelBaseUrl), "/") + "/chat/completions", nil
+	}
 	if info.ChannelType == constant.ChannelTypeGMICloud && gmicloud.IsBatchModel(info.UpstreamModelName) {
 		return "", fmt.Errorf("model %s is asynchronous; use POST /v1/batch/generations", info.UpstreamModelName)
 	}
@@ -201,6 +207,10 @@ func realtimeRequestPathWithModel(requestPath string, modelName string) string {
 
 func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *relaycommon.RelayInfo) error {
 	channel.SetupApiRequestHeader(info, c, header)
+	if info.ChannelType == constant.ChannelTypeKilo && info.ChannelOtherSettings.KiloAnonymousEnabled {
+		header.Del("Authorization")
+		return nil
+	}
 	if info.ChannelType == constant.ChannelTypeAzure {
 		header.Set("api-key", info.ApiKey)
 		return nil
@@ -221,7 +231,22 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, header *http.Header, info *
 	}
 	if info.RelayMode == relayconstant.RelayModeRealtime {
 		swp := c.Request.Header.Get("Sec-WebSocket-Protocol")
-		if swp != "" {
+		if info.ChannelType == constant.ChannelTypeOpenAI {
+			if dto.IsRealtimeBetaRequest(c.Request.Header) {
+				return errors.New("Realtime Beta is no longer supported; migrate to Realtime GA")
+			}
+			if !hasAuthOverride {
+				header.Set("Authorization", "Bearer "+info.ApiKey)
+			}
+			if swp != "" {
+				header.Set("Sec-WebSocket-Protocol", "realtime")
+			}
+			if info.ChannelOtherSettings.AllowSafetyIdentifier {
+				if identifier := c.GetHeader("OpenAI-Safety-Identifier"); identifier != "" {
+					header.Set("OpenAI-Safety-Identifier", identifier)
+				}
+			}
+		} else if swp != "" {
 			items := []string{
 				"realtime",
 				"openai-insecure-api-key." + info.ApiKey,
@@ -264,7 +289,7 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	// model names may start with "o" (for example, "orcarouter/...") without
 	// being OpenAI o-series reasoning models, so preserve the request instead
 	// of applying OpenAI-specific model-name heuristics below.
-	if info.ChannelType == constant.ChannelTypeModal {
+	if info.ChannelType == constant.ChannelTypeModal || info.ChannelType == constant.ChannelTypeKilo {
 		return request, nil
 	}
 	if info.ChannelType == constant.ChannelTypeOpenRouter {
@@ -392,6 +417,9 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 }
 
 func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
+	if info.ChannelType != constant.ChannelTypeOpenAI && request.Voice.ID != "" {
+		return nil, errors.New("custom voice objects are only supported by the official OpenAI channel")
+	}
 	a.ResponseFormat = request.ResponseFormat
 	if info.RelayMode == relayconstant.RelayModeAudioSpeech {
 		jsonData, err := common.Marshal(request)
@@ -409,6 +437,7 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 		if err2 != nil {
 			return nil, fmt.Errorf("error parsing multipart form: %w", err2)
 		}
+		defer formData.RemoveAll()
 
 		// 打印类似 curl 命令格式的信息
 		logger.LogDebug(c.Request.Context(), fmt.Sprintf("--form 'model=\"%s\"'", request.Model))
@@ -460,6 +489,9 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
 	switch info.RelayMode {
 	case relayconstant.RelayModeImagesEdits:
+		if info.ChannelType == constant.ChannelTypeOpenAI && strings.HasPrefix(c.GetHeader("Content-Type"), "application/json") {
+			return request, nil
+		}
 
 		var requestBody bytes.Buffer
 		writer := multipart.NewWriter(&requestBody)
@@ -625,9 +657,18 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
+	if info.ChannelType == constant.ChannelTypeOpenAI {
+		switch info.RelayMode {
+		case relayconstant.RelayModeImagesGenerations, relayconstant.RelayModeImagesEdits,
+			relayconstant.RelayModeAudioSpeech, relayconstant.RelayModeAudioTranscription, relayconstant.RelayModeAudioTranslation:
+			// The media handler commits SSE only after a successful upstream status.
+			// An early ping would prevent returning an ordinary HTTP validation error.
+			info.DisablePing = true
+		}
+	}
 	if info.RelayMode == relayconstant.RelayModeAudioTranscription ||
 		info.RelayMode == relayconstant.RelayModeAudioTranslation ||
-		info.RelayMode == relayconstant.RelayModeImagesEdits {
+		(info.RelayMode == relayconstant.RelayModeImagesEdits && !(info.ChannelType == constant.ChannelTypeOpenAI && strings.HasPrefix(c.GetHeader("Content-Type"), "application/json"))) {
 		return channel.DoFormRequest(a, c, info, requestBody)
 	} else if info.RelayMode == relayconstant.RelayModeRealtime {
 		return channel.DoWssRequest(a, c, info, requestBody)
@@ -647,6 +688,12 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	case relayconstant.RelayModeAudioTranscription:
 		err, usage = OpenaiSTTHandler(c, resp, info, a.ResponseFormat)
 	case relayconstant.RelayModeImagesGenerations, relayconstant.RelayModeImagesEdits:
+		if info.ChannelType == constant.ChannelTypeOpenAI {
+			if info.IsStream {
+				return openAIMediaStreamHandler(c, resp, info), nil
+			}
+			return openAIMediaJSONHandler(c, resp, info)
+		}
 		usage, err = OpenaiHandlerWithUsage(c, info, resp)
 	case relayconstant.RelayModeRerank:
 		usage, err = common_handler.RerankHandler(c, info, resp)
@@ -670,6 +717,8 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 
 func (a *Adaptor) GetModelList() []string {
 	switch a.ChannelType {
+	case constant.ChannelTypeKilo:
+		return []string{} // Kilo's model catalogue is fetched dynamically.
 	case constant.ChannelType360:
 		return ai360.ModelList
 	case constant.ChannelTypeLingYiWanWu:
@@ -697,6 +746,8 @@ func (a *Adaptor) GetModelList() []string {
 
 func (a *Adaptor) GetChannelName() string {
 	switch a.ChannelType {
+	case constant.ChannelTypeKilo:
+		return "Kilo"
 	case constant.ChannelType360:
 		return ai360.ChannelName
 	case constant.ChannelTypeLingYiWanWu:

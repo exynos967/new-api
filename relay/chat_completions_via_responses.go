@@ -124,6 +124,7 @@ func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, ad
 		return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
 	info.AppendRequestConversion(types.RelayFormatOpenAIResponses)
+	info.InitResponsesUsageInfo(responsesReq)
 
 	savedRelayMode := info.RelayMode
 	savedRequestURLPath := info.RequestURLPath
@@ -150,6 +151,7 @@ func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, ad
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
+	relaycommon.SetReasoningEffortFromRequest(info, jsonData)
 	relaycommon.SetConversationUpstreamRequest(info, jsonData)
 
 	var requestBody io.Reader = bytes.NewBuffer(jsonData)

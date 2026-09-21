@@ -58,17 +58,24 @@ const ModelTestModal = ({
   t,
 }) => {
   const hasChannel = Boolean(currentTestChannel);
+  const isTypeSafeChannel =
+    Number(currentTestChannel?.type ?? currentTestChannel?.channel_type) === 71;
+  const isMiMoChannel =
+    Number(currentTestChannel?.type ?? currentTestChannel?.channel_type) === 72;
   const isCohereChannel =
     currentTestChannel?.type === 34 || currentTestChannel?.channel_type === 34;
-  const streamToggleDisabled = [
-    'embeddings',
-    'cohere-embeddings',
-    'image-generation',
-    'jina-rerank',
-    'cohere-rerank',
-    'openai-response-compact',
-    'openai-video',
-  ].includes(selectedEndpointType);
+  const streamToggleDisabled =
+    isTypeSafeChannel ||
+    [
+      'typesafe-systemone',
+      'embeddings',
+      'cohere-embeddings',
+      'image-generation',
+      'jina-rerank',
+      'cohere-rerank',
+      'openai-response-compact',
+      'openai-video',
+    ].includes(selectedEndpointType);
 
   React.useEffect(() => {
     if (streamToggleDisabled && isStreamTest) {
@@ -84,43 +91,70 @@ const ModelTestModal = ({
         )
     : [];
 
-  const endpointTypeOptions = [
-    { value: '', label: t('自动检测') },
-    ...(isCohereChannel
-      ? [
-          {
-            value: 'cohere-chat',
-            label: 'Cohere Chat (/v2/chat)',
-          },
-          {
-            value: 'cohere-rerank',
-            label: 'Cohere Rerank (/v2/rerank)',
-          },
-          {
-            value: 'cohere-embeddings',
-            label: 'Cohere Embeddings (/v2/embed)',
-          },
-        ]
-      : []),
-    { value: 'openai', label: 'OpenAI (/v1/chat/completions)' },
-    { value: 'openai-response', label: 'OpenAI Response (/v1/responses)' },
-    {
-      value: 'openai-response-compact',
-      label: 'OpenAI Response Compaction (/v1/responses/compact)',
-    },
-    { value: 'anthropic', label: 'Anthropic (/v1/messages)' },
-    {
-      value: 'gemini',
-      label: 'Gemini (/v1beta/models/{model}:generateContent)',
-    },
-    { value: 'jina-rerank', label: 'Jina Rerank (/v1/rerank)' },
-    {
-      value: 'image-generation',
-      label: t('图像生成') + ' (/v1/images/generations)',
-    },
-    { value: 'openai-video', label: 'OpenAI Video (/v1/videos)' },
-    { value: 'embeddings', label: 'Embeddings (/v1/embeddings)' },
-  ];
+  const endpointTypeOptions = isTypeSafeChannel
+    ? [
+        { value: '', label: t('自动检测') },
+        { value: 'typesafe-systemone', label: 'TypeSafe (/v1/systemone)' },
+      ]
+    : [
+        { value: '', label: t('自动检测') },
+        ...(isCohereChannel
+          ? [
+              {
+                value: 'cohere-chat',
+                label: 'Cohere Chat (/v2/chat)',
+              },
+              {
+                value: 'cohere-rerank',
+                label: 'Cohere Rerank (/v2/rerank)',
+              },
+              {
+                value: 'cohere-embeddings',
+                label: 'Cohere Embeddings (/v2/embed)',
+              },
+            ]
+          : []),
+        { value: 'openai', label: 'OpenAI (/v1/chat/completions)' },
+        { value: 'openai-response', label: 'OpenAI Response (/v1/responses)' },
+        {
+          value: 'openai-response-compact',
+          label: 'OpenAI Response Compaction (/v1/responses/compact)',
+        },
+        { value: 'anthropic', label: 'Anthropic (/v1/messages)' },
+        {
+          value: 'gemini',
+          label: 'Gemini (/v1beta/models/{model}:generateContent)',
+        },
+        { value: 'jina-rerank', label: 'Jina Rerank (/v1/rerank)' },
+        {
+          value: 'image-generation',
+          label: t('图像生成') + ' (/v1/images/generations)',
+        },
+        { value: 'openai-video', label: 'OpenAI Video (/v1/videos)' },
+        { value: 'embeddings', label: 'Embeddings (/v1/embeddings)' },
+      ].filter(
+        (option) =>
+          !isMiMoChannel || ['', 'openai', 'anthropic'].includes(option.value),
+      );
+
+  React.useEffect(() => {
+    if (
+      isMiMoChannel &&
+      !['', 'openai', 'anthropic'].includes(selectedEndpointType)
+    ) {
+      setSelectedEndpointType('');
+    }
+  }, [isMiMoChannel, selectedEndpointType, setSelectedEndpointType]);
+
+  React.useEffect(() => {
+    if (
+      isTypeSafeChannel &&
+      selectedEndpointType !== '' &&
+      selectedEndpointType !== 'typesafe-systemone'
+    ) {
+      setSelectedEndpointType('typesafe-systemone');
+    }
+  }, [isTypeSafeChannel, selectedEndpointType, setSelectedEndpointType]);
 
   const handleCopySelected = () => {
     if (selectedModelKeys.length === 0) {
@@ -238,6 +272,18 @@ const ModelTestModal = ({
                 </Typography.Text>
               )}
             </div>
+            {testResult.success && (
+              <Typography.Text
+                type='tertiary'
+                size='small'
+                className='break-all'
+                style={{ maxWidth: '400px' }}
+              >
+                {t('上游模型：{{model}}', {
+                  model: testResult.upstreamModel || t('上游未返回'),
+                })}
+              </Typography.Text>
+            )}
             {testResult.success && rateLimitTier && (
               <Typography.Text type='tertiary' size='small'>
                 {t('付费层级: ${tier}').replace('${tier}', rateLimitTier)}

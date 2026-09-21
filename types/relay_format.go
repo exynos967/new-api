@@ -3,6 +3,7 @@ package types
 type RelayFormat string
 
 const (
+	RelayFormatTypeSafe                  RelayFormat = "typesafe"
 	RelayFormatOpenAI                    RelayFormat = "openai"
 	RelayFormatClaude                                = "claude"
 	RelayFormatGemini                                = "gemini"
@@ -14,6 +15,8 @@ const (
 	RelayFormatOpenAILocalSearch                     = "openai_local_search"
 	RelayFormatRerank                                = "rerank"
 	RelayFormatEmbedding                             = "embedding"
+	RelayFormatMistralNative                         = "mistral_native"
+	RelayFormatMistralRealtime                       = "mistral_realtime"
 
 	RelayFormatTask    = "task"
 	RelayFormatMjProxy = "mj_proxy"

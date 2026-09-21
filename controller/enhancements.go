@@ -519,9 +519,12 @@ func enhancementBanUser(c *gin.Context) {
 		return
 	}
 	var req enhancement.BanUserRequest
-	_ = common.DecodeJson(c.Request.Body, &req)
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	operatorId, role := operator(c)
-	err = enhancement.BanUser(userId, operatorId, role, req.Reason)
+	err = enhancement.BanUser(userId, operatorId, role, req.Reason, int64(req.DurationMinutes))
 	respondPublic(c, gin.H{"banned": true}, err)
 }
 
@@ -625,14 +628,17 @@ func enhancementSharedTokenIPs(c *gin.Context) {
 
 func enhancementBanSharedTokenIPUsers(c *gin.Context) {
 	var req enhancement.BanUserRequest
-	_ = common.DecodeJson(c.Request.Body, &req)
+	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	ip, err := url.PathUnescape(c.Param("ip"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	operatorId, role := operator(c)
-	data, err := enhancement.BanSharedTokenIPUsers(ip, ipRiskQuery(c), operatorId, role, req.Reason, req.UserIds)
+	data, err := enhancement.BanSharedTokenIPUsers(ip, ipRiskQuery(c), operatorId, role, req.Reason, req.UserIds, int64(req.DurationMinutes))
 	respondPublic(c, data, err)
 }
 
@@ -925,7 +931,7 @@ func enhancementEmbedModels(c *gin.Context) {
 }
 
 func enhancementEmbedStatusOne(c *gin.Context) {
-	data, err := enhancement.ModelStatusForGroupWindow(c.Query("group"), c.Param("model_name"), enhancement.ModelStatusConfiguredWindow(), true)
+	data, err := enhancement.ModelStatusForPublicConfig(c.Query("group"), c.Param("model_name"))
 	respondPublic(c, data, err)
 }
 
@@ -936,13 +942,22 @@ func enhancementEmbedStatusMultiple(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	data, err := enhancement.ModelStatusesForWindow(req.Models, enhancement.ModelStatusConfiguredWindow(), true)
+	data, err := enhancement.ModelStatusesForPublicModels(req.Models)
 	respondPublic(c, data, err)
 }
 
 func enhancementEmbedStatusAll(c *gin.Context) {
-	data, err := enhancement.ModelStatusesForPublicConfig()
-	respondPublic(c, data, err)
+	snapshot, err := enhancement.GetModelStatusPublicSnapshot()
+	if err != nil {
+		respondPublic(c, nil, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{
+		"success": true, "message": "", "data": snapshot.Statuses,
+		"generated_at": snapshot.GeneratedAt, "ready": snapshot.Ready,
+		"refresh_failed": snapshot.RefreshFailed,
+	})
 }
 
 func enhancementEmbedConfig(c *gin.Context) {

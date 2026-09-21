@@ -16,6 +16,8 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel/mistral"
+	"github.com/QuantumNous/new-api/relay/channel/typesafe"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -32,6 +34,12 @@ import (
 )
 
 func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+	if info.RelayFormat == types.RelayFormatTypeSafe {
+		return relay.TypeSafeHelper(c, info)
+	}
+	if info.RelayFormat == types.RelayFormatMistralNative || info.RelayFormat == types.RelayFormatMistralRealtime {
+		return relay.MistralNativeHelper(c, info)
+	}
 	var err *types.NewAPIError
 	switch info.RelayMode {
 	case relayconstant.RelayModeImagesGenerations, relayconstant.RelayModeImagesEdits:
@@ -67,6 +75,20 @@ func geminiRelayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewA
 }
 
 func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+	// Reject unsupported protocols before any WebSocket upgrade or pre-charge.
+	if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeTypeSafe && relayFormat != types.RelayFormatTypeSafe {
+		c.JSON(http.StatusBadRequest, gin.H{"error": types.OpenAIError{
+			Message: "TypeSafe only supports POST /v1/systemone",
+			Type:    "invalid_request_error", Code: types.ErrorCodeInvalidRequest,
+		}})
+		return
+	}
+	if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeMistral && mistral.UsesNativeProtocol(c) {
+		relayFormat = types.RelayFormatMistralNative
+		if c.Request.URL.Path == mistral.RealtimePath {
+			relayFormat = types.RelayFormatMistralRealtime
+		}
+	}
 
 	requestId := c.GetString(common.RequestIdKey)
 	//group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
@@ -78,6 +100,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	)
 
 	if relayFormat == types.RelayFormatOpenAIRealtime {
+		if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeOpenAI && dto.IsRealtimeBetaRequest(c.Request.Header) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": types.OpenAIError{Type: "invalid_request_error", Code: "realtime_beta_not_supported", Param: "OpenAI-Beta", Message: "Realtime Beta is no longer supported; remove the Beta header/subprotocol and migrate the client to Realtime GA"}})
+			return
+		}
 		var err error
 		ws, err = upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
@@ -90,6 +116,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	defer func() {
 		if newAPIError != nil {
 			logger.LogError(c, fmt.Sprintf("relay error: %s", newAPIError.Error()))
+			if relayFormat == types.RelayFormatTypeSafe && typesafe.WriteUpstreamError(c, newAPIError) {
+				return
+			}
+			if (relayFormat == types.RelayFormatMistralNative || relayFormat == types.RelayFormatMistralRealtime) && c.Writer.Written() {
+				return // Native HTTP/SSE/WS errors have already been relayed verbatim.
+			}
 			if !isChannelDailySuccessLimitError(newAPIError) && !service.IsChannelRPMLimitError(newAPIError) {
 				newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			}
@@ -370,6 +402,8 @@ func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
 		TokenType: types.TokenTypeTokenizer,
 	}
 	switch r := request.(type) {
+	case *dto.MistralNativeRequest:
+		meta.MaxTokens = r.MaxTokens
 	case *dto.GeneralOpenAIRequest:
 		maxCompletionTokens := lo.FromPtrOr(r.MaxCompletionTokens, uint(0))
 		maxTokens := lo.FromPtrOr(r.MaxTokens, uint(0))
@@ -792,29 +826,45 @@ func RelayTask(c *gin.Context) {
 
 	// ── 成功：结算 + 日志 + 插入任务 ──
 	if taskErr == nil {
-		if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
-			common.SysError("settle task billing error: " + settleErr.Error())
+		deferred := result.Quota < 0 ||
+			(relayInfo.PriceData.UsePrice && relayInfo.PriceData.ModelPrice < 0) ||
+			(!relayInfo.PriceData.UsePrice && relayInfo.PriceData.ModelRatio < 0)
+		if !deferred {
+			if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+				common.SysError("settle task billing error: " + settleErr.Error())
+			}
+			service.LogTaskConsumption(c, relayInfo)
 		}
-		service.LogTaskConsumption(c, relayInfo)
 
 		task := model.InitTask(result.Platform, relayInfo)
 		task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
+		task.PrivateData.UpstreamVideoID = relayInfo.UpstreamVideoID
 		task.PrivateData.BillingSource = relayInfo.BillingSource
 		task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 		task.PrivateData.TokenId = relayInfo.TokenId
 		task.PrivateData.BillingContext = &model.TaskBillingContext{
-			ModelPrice:      relayInfo.PriceData.ModelPrice,
-			GroupRatio:      relayInfo.PriceData.GroupRatioInfo.GroupRatio,
-			ModelRatio:      relayInfo.PriceData.ModelRatio,
-			OtherRatios:     relayInfo.PriceData.OtherRatios,
-			OriginModelName: relayInfo.OriginModelName,
-			PerCallBilling:  common.StringsContains(constant.TaskPricePatches, relayInfo.OriginModelName) || relayInfo.PriceData.UsePrice,
+			DeferredSettlement: deferred,
+			EstimatedQuota:     result.Quota,
+			ModelPrice:         relayInfo.PriceData.ModelPrice,
+			GroupRatio:         relayInfo.PriceData.GroupRatioInfo.GroupRatio,
+			ModelRatio:         relayInfo.PriceData.ModelRatio,
+			OtherRatios:        relayInfo.PriceData.OtherRatios,
+			OriginModelName:    relayInfo.OriginModelName,
+			PerCallBilling:     common.StringsContains(constant.TaskPricePatches, relayInfo.OriginModelName) || relayInfo.PriceData.UsePrice,
 		}
 		task.Quota = result.Quota
+		if deferred {
+			// The signed estimate has not been paid. Only the actual reservation
+			// may be returned on failure, including the subscription's minimum.
+			task.Quota = relayInfo.FinalPreConsumedQuota
+		}
 		task.Data = result.TaskData
 		task.Action = relayInfo.Action
 		if insertErr := task.Insert(); insertErr != nil {
 			common.SysError("insert task error: " + insertErr.Error())
+			if deferred {
+				service.RefundBilling(c, relayInfo)
+			}
 		}
 	}
 

@@ -112,6 +112,11 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		return "", 0, types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed)
 	}
 
+	// Kilo anonymous mode needs no key.
+	if channel.Type == constant.ChannelTypeKilo && channel.GetOtherSettings().KiloAnonymousEnabled {
+		return "", 0, nil
+	}
+
 	keyChannel := channel.LatestChannelForKeySelection()
 	if keyChannel == nil {
 		return "", 0, types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -211,6 +212,81 @@ func TestSaveModelStatusRequestCountHideThreshold(t *testing.T) {
 	var option model.Option
 	require.NoError(t, model.DB.Where("key = ?", "enhancement_setting.model_status_request_count_hide_threshold").First(&option).Error)
 	require.Equal(t, "12", option.Value)
+}
+
+func TestSaveModelStatusOneMinuteSlots(t *testing.T) {
+	setupModelStatusOptionTestDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Log{}))
+	cfg := setting.GetEnhancementSetting()
+	original := cfg.ModelStatusSlotMinutes
+	t.Cleanup(func() {
+		cfg.ModelStatusSlotMinutes = original
+		ClearModelStatusPublicCache()
+	})
+
+	require.NoError(t, SaveModelStatusOption("model_status_slot_minutes", "1", 1))
+	require.Equal(t, 1, ModelStatusConfig(false)["slot_minutes"])
+	status, err := ModelStatusForGroupWindow("default", "one-minute-model", ModelStatusWindowHalfHour, false)
+	require.NoError(t, err)
+	require.Len(t, status.SlotData, 30)
+	for _, slot := range status.SlotData {
+		require.Equal(t, int64(60), slot.EndTime-slot.StartTime)
+	}
+	for _, value := range []string{"0", "-1", "1441", "1.5"} {
+		require.Error(t, SaveModelStatusOption("model_status_slot_minutes", value, 1))
+	}
+	require.Equal(t, 1, cfg.ModelStatusSlotMinutes)
+}
+
+func TestSaveModelStatusShortWindowsAppliesTimeRange(t *testing.T) {
+	for _, tc := range []struct {
+		window  string
+		minutes int
+	}{
+		{window: "0.5h", minutes: 30},
+		{window: "1h", minutes: 60},
+		{window: "6h", minutes: 360},
+		{window: "12h", minutes: 720},
+	} {
+		t.Run(tc.window, func(t *testing.T) {
+			setupModelStatusOptionTestDB(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.Log{}))
+			configureModelStatusIgnoredErrorKeywords(t, false, nil)
+
+			cfg := setting.GetEnhancementSetting()
+			originalMinutes := cfg.ModelStatusTimeWindowMins
+			t.Cleanup(func() {
+				cfg.ModelStatusTimeWindowMins = originalMinutes
+				ClearModelStatusPublicCache()
+			})
+
+			now := common.GetTimestamp()
+			seedModelStatusLogs(t, model.DB,
+				model.Log{ModelName: "short-window", Group: "default", Type: model.LogTypeConsume, CreatedAt: now - 60},
+				model.Log{ModelName: "short-window", Group: "default", Type: model.LogTypeError, CreatedAt: now - int64(tc.minutes*60) - 60},
+			)
+
+			for _, value := range []string{tc.window, fmt.Sprint(tc.minutes)} {
+				require.NoError(t, SaveModelStatusOption("model_status_time_window_mins", value, 1))
+				require.Equal(t, tc.window, ModelStatusConfig(true)["current_window"])
+				require.Equal(t, tc.window, ModelStatusWindowFromMinutes(tc.minutes))
+
+				var option model.Option
+				require.NoError(t, model.DB.Where("key = ?", "enhancement_setting.model_status_time_window_mins").First(&option).Error)
+				require.Equal(t, fmt.Sprint(tc.minutes), option.Value)
+
+				status, err := ModelStatusForGroupWindow("default", "short-window", ModelStatusConfiguredWindow(), false)
+				require.NoError(t, err)
+				require.Equal(t, tc.window, status.TimeWindow)
+				require.Equal(t, tc.minutes, status.TimeWindowMinutes)
+				require.Equal(t, int64(1), status.TotalRequests)
+				require.Equal(t, int64(1), status.SuccessCount)
+				require.Zero(t, status.ErrorCount)
+				require.NotEmpty(t, status.SlotData)
+				require.Equal(t, int64(tc.minutes*60), status.SlotData[len(status.SlotData)-1].EndTime-status.SlotData[0].StartTime)
+			}
+		})
+	}
 }
 
 func TestSaveModelStatusRequestCountHideThresholdRejectsInvalidValues(t *testing.T) {
@@ -421,7 +497,7 @@ func TestBanSharedTokenIPUsersLimitsToSelectedIntersectedUsers(t *testing.T) {
 	}).Error)
 	selected := []int{second.Id, third.Id, 99999}
 
-	result, err := BanSharedTokenIPUsers("203.0.113.7", IPRiskQuery{Start: now - 60, End: now + 1}, 900, common.RoleRootUser, "selected risk", &selected)
+	result, err := BanSharedTokenIPUsers("203.0.113.7", IPRiskQuery{Start: now - 60, End: now + 1}, 900, common.RoleRootUser, "selected risk", &selected, 5)
 
 	require.NoError(t, err)
 	require.Equal(t, 1, result["success"])
@@ -432,6 +508,8 @@ func TestBanSharedTokenIPUsersLimitsToSelectedIntersectedUsers(t *testing.T) {
 	require.Equal(t, common.UserStatusEnabled, users[0].Status)
 	require.Equal(t, common.UserStatusDisabled, users[1].Status)
 	require.Equal(t, "selected risk", users[1].DisableReason)
+	require.Equal(t, int64(5), users[1].DisableDurationMinutes)
+	require.GreaterOrEqual(t, users[1].DisableUntil, now+300)
 	require.Equal(t, common.UserStatusEnabled, users[2].Status)
 }
 
@@ -456,4 +534,39 @@ func TestBanSharedTokenIPUsersWithoutSelectionKeepsExistingAllUsersBehavior(t *t
 	var disabled int64
 	require.NoError(t, model.DB.Model(&model.User{}).Where("id IN ? AND status = ?", []int{first.Id, second.Id}, common.UserStatusDisabled).Count(&disabled).Error)
 	require.Equal(t, int64(2), disabled)
+}
+
+func TestManualBanAndEnableResetAllDisableFields(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	user := model.User{Username: "timed-user", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}
+	require.NoError(t, model.DB.Create(&user).Error)
+	require.NoError(t, BanUser(user.Id, 999, common.RoleRootUser, "timed", 5))
+	require.NoError(t, model.DB.First(&user, user.Id).Error)
+	require.Equal(t, int64(5), user.DisableDurationMinutes)
+	require.Greater(t, user.DisableUntil, time.Now().Unix())
+	require.NoError(t, BanUser(user.Id, 999, common.RoleRootUser, "permanent"))
+	require.NoError(t, model.DB.First(&user, user.Id).Error)
+	require.Zero(t, user.DisableUntil)
+	require.Zero(t, user.DisableDurationMinutes)
+	require.NoError(t, UnbanUser(user.Id, 999, common.RoleRootUser))
+	require.NoError(t, model.DB.First(&user, user.Id).Error)
+	require.Empty(t, user.DisableReason)
+	require.Equal(t, common.UserStatusEnabled, user.Status)
+}
+
+func TestBatchUserDisableExpiryProtectsFromDeletion(t *testing.T) {
+	setupUserPurgeTestDB(t)
+	user := model.User{Username: "batch-timed", Role: common.RoleCommonUser, Status: common.UserStatusEnabled}
+	require.NoError(t, model.DB.Create(&user).Error)
+	result, err := BatchManageUsers("disable_enabled", "timed", 999, common.RoleRootUser, 2)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), result.Affected)
+	require.NoError(t, model.DB.First(&user, user.Id).Error)
+	require.Equal(t, int64(2), user.DisableDurationMinutes)
+	require.NoError(t, model.DB.Model(&user).Update("disable_until", time.Now().Unix()-1).Error)
+	result, err = BatchManageUsers("delete_disabled", "", 999, common.RoleRootUser)
+	require.NoError(t, err)
+	require.Zero(t, result.Affected)
+	require.NoError(t, model.DB.First(&user, user.Id).Error)
+	require.Equal(t, common.UserStatusEnabled, user.Status)
 }

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -104,13 +105,7 @@ func normalizeDisableReason(reason string) string {
 }
 
 func userDisabledMessage(c *gin.Context, user *model.User) string {
-	reason := normalizeDisableReason(user.DisableReason)
-	if reason == "" {
-		return common.TranslateMessage(c, i18n.MsgUserDisabled)
-	}
-	return common.TranslateMessage(c, i18n.MsgUserDisabledWithReason, map[string]any{
-		"Reason": reason,
-	})
+	return service.UserDisabledMessage(c, user.ToBaseUser(), i18n.MsgUserDisabled)
 }
 
 func respondUserDisabled(c *gin.Context, user *model.User) {
@@ -119,13 +114,18 @@ func respondUserDisabled(c *gin.Context, user *model.User) {
 
 // setup session & cookies and then return user info
 func setupLogin(user *model.User, c *gin.Context) {
+	hasPassword, err := model.HasUserPassword(user.Id)
+	if err != nil {
+		common.ApiErrorI18n(c, i18n.MsgDatabaseError)
+		return
+	}
 	session := sessions.Default(c)
 	session.Set("id", user.Id)
 	session.Set("username", user.Username)
 	session.Set("role", user.Role)
 	session.Set("status", user.Status)
 	session.Set("group", user.Group)
-	err := session.Save()
+	err = session.Save()
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgUserSessionSaveFailed)
 		return
@@ -135,6 +135,7 @@ func setupLogin(user *model.User, c *gin.Context) {
 		"success": true,
 		"data": map[string]any{
 			"id":           user.Id,
+			"has_password": hasPassword,
 			"username":     user.Username,
 			"display_name": user.DisplayName,
 			"role":         user.Role,
@@ -177,6 +178,10 @@ func Register(c *gin.Context) {
 		return
 	}
 	user.Email = strings.TrimSpace(user.Email)
+	if err := common.ValidateLoginPassword(user.Password); err != nil {
+		respondPasswordError(c, err)
+		return
+	}
 	if err := common.Validate.Struct(&user); err != nil {
 		common.ApiErrorI18n(c, i18n.MsgUserInputInvalid, map[string]any{"Error": err.Error()})
 		return
@@ -206,9 +211,10 @@ func Register(c *gin.Context) {
 		return
 	}
 	affCode := user.AffCode // this code is the inviter's code, not the user's own code
-	domainEmailRegistration := common.EmailVerificationEnabled && common.IsDomainEmailRegistrationAllowed(user.Email)
-	inviteCodeRequired := setting.IsInviteCodeRequired() && !domainEmailRegistration
-	registrationCodeRequired := setting.IsRegistrationCodeRequired() && !domainEmailRegistration
+	inviteCodeExempt := common.EmailVerificationEnabled && common.IsDomainEmailInviteCodeExempt(user.Email)
+	registrationCodeExempt := common.EmailVerificationEnabled && common.IsDomainEmailRegistrationCodeExempt(user.Email)
+	inviteCodeRequired := setting.IsInviteCodeRequired() && !inviteCodeExempt
+	registrationCodeRequired := setting.IsRegistrationCodeRequired() && !registrationCodeExempt
 	inviterId, err := model.ResolveInviterIdByAffCode(affCode, inviteCodeRequired)
 	if err != nil {
 		common.ApiError(c, err)
@@ -453,6 +459,11 @@ func GetSelf(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	hasPassword, err := model.HasUserPassword(id)
+	if err != nil {
+		common.ApiErrorI18n(c, i18n.MsgDatabaseError)
+		return
+	}
 	// Hide admin remarks: set to empty to trigger omitempty tag, ensuring the remark field is not included in JSON returned to regular users
 	user.Remark = ""
 
@@ -469,6 +480,7 @@ func GetSelf(c *gin.Context) {
 
 	// 构建响应数据，包含用户信息和权限
 	responseData := map[string]interface{}{
+		"has_password":      hasPassword,
 		"id":                user.Id,
 		"username":          user.Username,
 		"display_name":      user.DisplayName,
@@ -490,6 +502,7 @@ func GetSelf(c *gin.Context) {
 		"aff_history_quota": user.AffHistoryQuota,
 		"inviter_id":        user.InviterId,
 		"linux_do_id":       user.LinuxDOId,
+		"nodeloc_id":        user.NodeLocId,
 		"setting":           string(settingBytes),
 		"stripe_customer":   user.StripeCustomer,
 		"sidebar_modules":   userSetting.SidebarModules, // 正确提取sidebar_modules字段
@@ -696,8 +709,11 @@ func UpdateUser(c *gin.Context) {
 		return
 	}
 	_, updateDisableReason := requestData["disable_reason"]
-	if updatedUser.Password == "" {
-		updatedUser.Password = "$I_LOVE_U" // make Validator happy :)
+	if updatedUser.Password != "" {
+		if err := common.ValidateLoginPassword(updatedUser.Password); err != nil {
+			respondPasswordError(c, err)
+			return
+		}
 	}
 	updatedUser.DisableReason = normalizeDisableReason(updatedUser.DisableReason)
 	if err := common.Validate.Struct(&updatedUser); err != nil {
@@ -717,9 +733,6 @@ func UpdateUser(c *gin.Context) {
 	if myRole <= updatedUser.Role && myRole != common.RoleRootUser {
 		common.ApiErrorI18n(c, i18n.MsgUserCannotCreateHigherLevel)
 		return
-	}
-	if updatedUser.Password == "$I_LOVE_U" {
-		updatedUser.Password = "" // rollback to what it should be
 	}
 	if originUser.Status != common.UserStatusDisabled {
 		updateDisableReason = false
@@ -780,6 +793,16 @@ func UpdateSelf(c *gin.Context) {
 	if err != nil {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
+	}
+
+	// Login passwords can only be changed through UpdateSelfPassword. Reject
+	// the field before handling preferences, including JSON's case-insensitive
+	// field aliases, so a legacy request cannot report a successful change.
+	for field := range requestData {
+		if strings.EqualFold(field, "password") {
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+			return
+		}
 	}
 
 	// 检查是否是用户设置更新请求 (sidebar_modules 或 language)
@@ -851,30 +874,27 @@ func UpdateSelf(c *gin.Context) {
 		return
 	}
 
-	if user.Password == "" {
-		user.Password = "$I_LOVE_U" // make Validator happy :)
-	}
 	if err := common.Validate.Struct(&user); err != nil {
 		common.ApiErrorI18n(c, i18n.MsgInvalidInput)
 		return
 	}
 
-	cleanUser := model.User{
-		Id:          c.GetInt("id"),
-		Username:    user.Username,
-		Password:    user.Password,
-		DisplayName: user.DisplayName,
-	}
-	if user.Password == "$I_LOVE_U" {
-		user.Password = "" // rollback to what it should be
-		cleanUser.Password = ""
-	}
-	updatePassword, err := checkUpdatePassword(user.OriginalPassword, user.Password, cleanUser.Id)
+	// Preserve the existing original-password check for profile changes.
+	currentUser, err := model.GetUserById(c.GetInt("id"), true)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	if err := cleanUser.Update(updatePassword); err != nil {
+	if currentUser.Password != "" && !common.ValidatePasswordAndHash(user.OriginalPassword, currentUser.Password) {
+		respondPasswordError(c, service.ErrOriginalPassword)
+		return
+	}
+	cleanUser := model.User{
+		Id:          c.GetInt("id"),
+		Username:    user.Username,
+		DisplayName: user.DisplayName,
+	}
+	if err := cleanUser.Update(false); err != nil {
 		common.ApiError(c, err)
 		return
 	}
@@ -883,26 +903,6 @@ func UpdateSelf(c *gin.Context) {
 		"success": true,
 		"message": "",
 	})
-	return
-}
-
-func checkUpdatePassword(originalPassword string, newPassword string, userId int) (updatePassword bool, err error) {
-	var currentUser *model.User
-	currentUser, err = model.GetUserById(userId, true)
-	if err != nil {
-		return
-	}
-
-	// 密码不为空,需要验证原密码
-	// 支持第一次账号绑定时原密码为空的情况
-	if !common.ValidatePasswordAndHash(originalPassword, currentUser.Password) && currentUser.Password != "" {
-		err = fmt.Errorf("原密码错误")
-		return
-	}
-	if newPassword == "" {
-		return
-	}
-	updatePassword = true
 	return
 }
 
@@ -970,6 +970,10 @@ func CreateUser(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
+	if err := common.ValidateLoginPassword(user.Password); err != nil {
+		respondPasswordError(c, err)
+		return
+	}
 	if err := common.Validate.Struct(&user); err != nil {
 		common.ApiErrorI18n(c, i18n.MsgUserInputInvalid, map[string]any{"Error": err.Error()})
 		return
@@ -1002,24 +1006,27 @@ func CreateUser(c *gin.Context) {
 }
 
 type ManageRequest struct {
-	Id     int    `json:"id"`
-	Action string `json:"action"`
-	Value  int    `json:"value"`
-	Mode   string `json:"mode"`
-	Reason string `json:"reason,omitempty"`
+	DurationMinutes dto.UserDisableDurationMinutes `json:"duration_minutes,omitempty"`
+	Id              int                            `json:"id"`
+	Action          string                         `json:"action"`
+	Value           int                            `json:"value"`
+	Mode            string                         `json:"mode"`
+	Reason          string                         `json:"reason,omitempty"`
 }
 
 type BatchDisableRelatedUsersRequest struct {
-	Id               int    `json:"id"`
-	RelatedUserIds   []int  `json:"related_user_ids"`
-	Reason           string `json:"reason"`
-	Depth            *int   `json:"depth,omitempty"`
-	SelectAllRelated *bool  `json:"select_all_related,omitempty"`
+	DurationMinutes  dto.UserDisableDurationMinutes `json:"duration_minutes,omitempty"`
+	Id               int                            `json:"id"`
+	RelatedUserIds   []int                          `json:"related_user_ids"`
+	Reason           string                         `json:"reason"`
+	Depth            *int                           `json:"depth,omitempty"`
+	SelectAllRelated *bool                          `json:"select_all_related,omitempty"`
 }
 
 type BatchManageUsersRequest struct {
-	Action string `json:"action"`
-	Reason string `json:"reason,omitempty"`
+	DurationMinutes dto.UserDisableDurationMinutes `json:"duration_minutes,omitempty"`
+	Action          string                         `json:"action"`
+	Reason          string                         `json:"reason,omitempty"`
 }
 
 func BatchDisableRelatedUsers(c *gin.Context) {
@@ -1041,6 +1048,7 @@ func BatchDisableRelatedUsers(c *gin.Context) {
 		req.SelectAllRelated != nil && *req.SelectAllRelated,
 		c.GetInt("id"),
 		c.GetInt("role"),
+		int64(req.DurationMinutes),
 	)
 	if err != nil {
 		common.ApiError(c, err)
@@ -1055,7 +1063,7 @@ func BatchManageUsers(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
-	result, err := enhancement.BatchManageUsers(req.Action, req.Reason, c.GetInt("id"), c.GetInt("role"))
+	result, err := enhancement.BatchManageUsers(req.Action, req.Reason, c.GetInt("id"), c.GetInt("role"), int64(req.DurationMinutes))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -1074,10 +1082,18 @@ func ManageUser(c *gin.Context) {
 		Id: req.Id,
 	}
 	// Fill attributes
-	model.DB.Unscoped().Where(&user).First(&user)
-	if user.Id == 0 {
-		common.ApiErrorI18n(c, i18n.MsgUserNotExists)
+	if err := model.DB.Unscoped().First(&user, "id = ?", req.Id).Error; err != nil {
+		common.ApiError(c, err)
 		return
+	}
+	var disablePeriod model.UserDisablePeriod
+	if req.Action == "disable" {
+		var err error
+		disablePeriod, err = model.NewUserDisablePeriod(int64(req.DurationMinutes), time.Now().Unix())
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
 	}
 	myRole := c.GetInt("role")
 	if myRole <= user.Role && myRole != common.RoleRootUser {
@@ -1181,20 +1197,32 @@ func ManageUser(c *gin.Context) {
 		return
 	}
 
-	if err := user.Update(false); err != nil {
-		common.ApiError(c, err)
-		return
-	}
 	if req.Action == "disable" || req.Action == "enable" {
-		if err := model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("disable_reason", user.DisableReason).Error; err != nil {
+		updates := model.UserEnableUpdates()
+		if req.Action == "disable" {
+			updates = disablePeriod.Updates(user.DisableReason)
+		}
+		if err := model.DB.Model(&model.User{}).Where("id = ?", user.Id).Updates(updates).Error; err != nil {
 			common.ApiError(c, err)
 			return
 		}
+		if req.Action == "disable" {
+			user.DisableDurationMinutes = disablePeriod.Minutes
+			user.DisableUntil = disablePeriod.Until
+		} else {
+			user.DisableDurationMinutes = 0
+			user.DisableUntil = 0
+		}
+	} else if err := user.Update(false); err != nil {
+		common.ApiError(c, err)
+		return
 	}
 	if req.Action == "disable" {
 		adminInfo := map[string]interface{}{
-			"admin_id":       c.GetInt("id"),
-			"admin_username": c.GetString("username"),
+			"disable_duration_minutes": user.DisableDurationMinutes,
+			"disable_until":            user.DisableUntil,
+			"admin_id":                 c.GetInt("id"),
+			"admin_username":           c.GetString("username"),
 		}
 		logReason := user.DisableReason
 		if logReason == "" {
@@ -1216,9 +1244,11 @@ func ManageUser(c *gin.Context) {
 		}
 	}
 	clearUser := model.User{
-		Role:          user.Role,
-		Status:        user.Status,
-		DisableReason: user.DisableReason,
+		Role:                   user.Role,
+		Status:                 user.Status,
+		DisableReason:          user.DisableReason,
+		DisableDurationMinutes: user.DisableDurationMinutes,
+		DisableUntil:           user.DisableUntil,
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,

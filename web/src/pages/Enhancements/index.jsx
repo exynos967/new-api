@@ -17,7 +17,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import {
@@ -45,11 +51,9 @@ import {
   Activity,
   AlertTriangle,
   Ban,
-  Bot,
   CheckCircle2,
   Copy as CopyIcon,
   CreditCard,
-  Database,
   Eye,
   ExternalLink,
   Gift,
@@ -66,6 +70,12 @@ import {
   X,
 } from 'lucide-react';
 import dayjs from 'dayjs';
+import {
+  DisableDurationInput,
+  UserDisableInfo,
+  disableDurationText,
+  isDisableDurationValid,
+} from '../../components/common/UserDisableInfo';
 import {
   API,
   copy,
@@ -97,8 +107,6 @@ const SECTIONS = [
   { id: 'risk', label: '风控中心', icon: ShieldCheck },
   { id: 'model-status', label: '模型状态', icon: LineChart },
   { id: 'auto-group', label: '自动分组', icon: UserCog },
-  { id: 'ai-ban', label: 'AI 封禁', icon: Bot },
-  { id: 'system', label: '系统工具', icon: Database },
 ];
 
 const ENHANCEMENTS_BASE_PATH = '/console/enhancements';
@@ -111,6 +119,10 @@ const getSectionFromSearch = (search) => {
 const MODEL_STATUS_PUBLIC_PATH = '/model-status';
 const MODEL_STATUS_WINDOWS = [
   { label: '今日', value: 'today' },
+  { label: '0.5h', value: '0.5h' },
+  { label: '1h', value: '1h' },
+  { label: '6h', value: '6h' },
+  { label: '12h', value: '12h' },
   { label: '24h', value: '24h' },
   { label: '7天', value: '7d' },
   { label: '30天', value: '30d' },
@@ -348,6 +360,7 @@ const USER_PREVIEW_KEYS = [
   'username',
   'display_name',
   'status',
+  'disable_reason',
   'email',
   'github_id',
   'quota',
@@ -398,11 +411,6 @@ function formatFieldLabel(key, t) {
 function formatNumber(value) {
   if (typeof value !== 'number') return value;
   return new Intl.NumberFormat().format(value);
-}
-
-function formatPercent(value) {
-  const number = Number(value || 0);
-  return `${(number * 100).toFixed(1)}%`;
 }
 
 function formatStatusPercent(value) {
@@ -458,7 +466,7 @@ function getModelStatusRefreshMinutes(config = {}) {
 function getModelStatusSlotMinutes(config = {}) {
   const minutes = Number(config.slot_minutes || 30);
   if (!Number.isFinite(minutes)) return 30;
-  return Math.min(1440, Math.max(5, Math.round(minutes)));
+  return Math.min(1440, Math.max(1, Math.round(minutes)));
 }
 
 function getModelStatusThreshold(config = {}, key, fallback) {
@@ -2041,6 +2049,7 @@ function GitHubAgeBanCard({ onApplied }) {
     user_id_start: 0,
     user_id_end: 0,
     reason: '',
+    duration_minutes: 0,
   };
   const [form, setForm] = useState(defaultForm);
   const [loading, setLoading] = useState(false);
@@ -2054,6 +2063,10 @@ function GitHubAgeBanCard({ onApplied }) {
   const normalizedUserIdEnd = Math.trunc(Number(form.user_id_end || 0));
 
   const runGitHubAgeBan = async (dryRun, userIds = undefined) => {
+    if (!isDisableDurationValid(form.duration_minutes)) {
+      showError(t('禁用时长必须为有效范围内的非负整数'));
+      return false;
+    }
     if (!Number.isFinite(threshold) || normalizedThreshold <= 0) {
       showError(t('GitHub 账号年龄阈值必须大于 0'));
       return;
@@ -2083,6 +2096,7 @@ function GitHubAgeBanCard({ onApplied }) {
           user_id_start: normalizedUserIdStart,
           user_id_end: normalizedUserIdEnd,
           reason: form.reason,
+          duration_minutes: Number(form.duration_minutes),
           dry_run: dryRun,
           ...(Array.isArray(userIds) ? { user_ids: userIds } : {}),
         },
@@ -2122,6 +2136,7 @@ function GitHubAgeBanCard({ onApplied }) {
           </div>
           <div className='text-semi-color-text-1 break-words'>
             {t('封禁原因')}：{form.reason?.trim() || t('使用默认封禁原因')}
+            <div>{disableDurationText(form.duration_minutes, t)}</div>
           </div>
           <div className='text-semi-color-text-1 break-words'>
             {t('用户 ID 范围')}：
@@ -2229,6 +2244,12 @@ function GitHubAgeBanCard({ onApplied }) {
             {t('留空表示不限用户 ID 范围')}
           </div>
         </label>
+        <DisableDurationInput
+          value={form.duration_minutes}
+          onChange={(value) => patchForm({ duration_minutes: value })}
+          t={t}
+          disabled={loading}
+        />
         <label className='space-y-2'>
           <Text>{t('封禁原因')}</Text>
           <TextArea
@@ -2393,6 +2414,14 @@ function UsersPanel({ data }) {
   const formatUserValue = (value, key, t, record) => {
     if (key === 'status') {
       return formatUserStatus(value, t, record);
+    }
+    if (key === 'disable_reason') {
+      return (
+        <div>
+          {value || '-'}
+          <UserDisableInfo user={record} t={t} />
+        </div>
+      );
     }
     if (key === 'quota' || key === 'used_quota') {
       return formatQuotaAsAmount(value, currency);
@@ -3230,8 +3259,10 @@ function RiskUserBanConfirmContent({
   reason,
   onReasonChange,
   onSelectedUserIdsChange,
+  onDurationChange,
 }) {
   const { t } = useTranslation();
+  const [durationMinutes, setDurationMinutes] = useState(0);
   const [selectedUserIds, setSelectedUserIds] = useState(() =>
     users.map((user) => user.user_id),
   );
@@ -3282,6 +3313,17 @@ function RiskUserBanConfirmContent({
         }}
         empty={<Empty description={t('暂无数据')} />}
       />
+      <DisableDurationInput
+        value={durationMinutes}
+        onChange={(value) => {
+          setDurationMinutes(value);
+          onDurationChange(value);
+        }}
+        t={t}
+      />
+      {isDisableDurationValid(durationMinutes) && (
+        <div>{disableDurationText(durationMinutes, t)}</div>
+      )}
       <TextArea
         autosize
         rows={2}
@@ -3369,7 +3411,6 @@ function RiskIPSelectionBanConfirmContent({
 function RiskPanel({ data }) {
   const { t } = useTranslation();
   const currency = getCurrencyConfig();
-  const [coverage, setCoverage] = useState(data?.coverage || {});
   const [sharedIPs, setSharedIPs] = useState(data?.sharedIPs || EMPTY_PAGE);
   const [tokenMultiIPs, setTokenMultiIPs] = useState(
     data?.tokenMultiIPs || EMPTY_PAGE,
@@ -3387,17 +3428,14 @@ function RiskPanel({ data }) {
   const [tokenPageSize, setTokenPageSize] = useState(
     data?.tokenMultiIPs?.page_size || 20,
   );
-  const [coverageLoading, setCoverageLoading] = useState(false);
   const [sharedLoading, setSharedLoading] = useState(false);
   const [tokenLoading, setTokenLoading] = useState(false);
-  const [applying, setApplying] = useState(false);
   const [selectedSharedIP, setSelectedSharedIP] = useState(null);
   const [banLoadingIP, setBanLoadingIP] = useState('');
   const [ipBanLoadingKey, setIPBanLoadingKey] = useState('');
   const [tokenActionLoading, setTokenActionLoading] = useState('');
 
   useEffect(() => {
-    setCoverage(data?.coverage || {});
     setSharedIPs(data?.sharedIPs || EMPTY_PAGE);
     setTokenMultiIPs(data?.tokenMultiIPs || EMPTY_PAGE);
     setSharedPageSize(data?.sharedIPs?.page_size || 20);
@@ -3419,20 +3457,6 @@ function RiskPanel({ data }) {
     }
     appendObjectTableQueryParams(params, nextSort);
     return params;
-  };
-
-  const loadCoverage = async () => {
-    setCoverageLoading(true);
-    try {
-      const nextCoverage = await API.get(
-        '/api/enhancements/risk/ip-log-coverage',
-      ).then(unwrap);
-      setCoverage(nextCoverage || {});
-    } catch (error) {
-      showError(error.message || error);
-    } finally {
-      setCoverageLoading(false);
-    }
   };
 
   const loadSharedIPs = async (
@@ -3476,35 +3500,9 @@ function RiskPanel({ data }) {
 
   const refreshRiskDetails = async (nextFilters = filters) => {
     await Promise.all([
-      loadCoverage(),
       loadSharedIPs(1, sharedPageSize, nextFilters),
       loadTokenMultiIPs(1, tokenPageSize, nextFilters),
     ]);
-  };
-
-  const enableAll = () => {
-    Modal.confirm({
-      title: t('一键开启 IP 日志记录'),
-      content: t('确认将所有未开启“记录请求与错误日志IP”的用户改为开启？'),
-      okText: t('开启'),
-      cancelText: t('取消'),
-      onOk: async () => {
-        setApplying(true);
-        try {
-          const res = await API.post(
-            '/api/enhancements/risk/ip-log/enable-all',
-          );
-          const result = unwrap(res);
-          setCoverage(result?.coverage || {});
-          showSuccess(t('操作成功'));
-          await loadCoverage();
-        } catch (error) {
-          showError(error.message || error);
-        } finally {
-          setApplying(false);
-        }
-      },
-    });
   };
 
   const copyRiskItems = async (items, renderLabel) => {
@@ -3574,6 +3572,7 @@ function RiskPanel({ data }) {
       showError(t('该 IP 下没有可封禁用户'));
       return;
     }
+    let durationMinutes = 0;
     let reason = `共享 IP 风控封禁：${ip}`;
     let selectedUserIds = users.map((user) => user.user_id);
     Modal.confirm({
@@ -3583,6 +3582,9 @@ function RiskPanel({ data }) {
           ip={ip}
           users={users}
           reason={reason}
+          onDurationChange={(value) => {
+            durationMinutes = value;
+          }}
           onReasonChange={(value) => {
             reason = value;
           }}
@@ -3594,6 +3596,10 @@ function RiskPanel({ data }) {
       okText: t('确认封禁'),
       cancelText: t('取消'),
       onOk: async () => {
+        if (!isDisableDurationValid(durationMinutes)) {
+          showError(t('禁用时长必须为有效范围内的非负整数'));
+          return false;
+        }
         if (selectedUserIds.length === 0) {
           showError(t('请选择至少一个用户'));
           return false;
@@ -3602,7 +3608,11 @@ function RiskPanel({ data }) {
         try {
           const res = await API.post(
             `/api/enhancements/risk/shared-token-ips/${encodeURIComponent(ip)}/ban-users`,
-            { reason, user_ids: selectedUserIds },
+            {
+              reason,
+              user_ids: selectedUserIds,
+              duration_minutes: Number(durationMinutes),
+            },
             { params: riskParams(1, sharedPageSize, filters, sharedSort) },
           );
           const result = unwrap(res);
@@ -3727,10 +3737,6 @@ function RiskPanel({ data }) {
       },
     });
   };
-
-  const totalUsers = coverage?.total_users || 0;
-  const enabledUsers = coverage?.enabled_users || 0;
-  const disabledUsers = coverage?.disabled_users || 0;
 
   const sharedColumns = [
     {
@@ -3970,53 +3976,6 @@ function RiskPanel({ data }) {
 
   return (
     <div className='space-y-4'>
-      <Card title={t('IP 日志记录覆盖率')} className='!rounded-lg'>
-        <Spin spinning={coverageLoading}>
-          <div className='flex flex-col md:flex-row md:items-end md:justify-between gap-4'>
-            <div>
-              <Text type='secondary'>
-                {t('已开启记录请求与错误日志IP的用户占比')}
-              </Text>
-              <div className='text-4xl font-semibold mt-2 text-semi-color-text-0'>
-                {formatPercent(coverage?.enabled_ratio)}
-              </div>
-              <div className='mt-2 text-semi-color-text-1'>
-                {formatNumber(enabledUsers)} / {formatNumber(totalUsers)}
-              </div>
-            </div>
-            <div className='grid grid-cols-2 gap-3 min-w-64'>
-              <div className='rounded-lg border border-semi-color-border p-3'>
-                <Text type='secondary' size='small'>
-                  {t('已开启用户')}
-                </Text>
-                <div className='text-xl font-semibold mt-1'>
-                  {formatNumber(enabledUsers)}
-                </div>
-              </div>
-              <div className='rounded-lg border border-semi-color-border p-3'>
-                <Text type='secondary' size='small'>
-                  {t('未开启用户')}
-                </Text>
-                <div className='text-xl font-semibold mt-1'>
-                  {formatNumber(disabledUsers)}
-                </div>
-              </div>
-            </div>
-          </div>
-          <div className='mt-4'>
-            <Button
-              size='small'
-              type='primary'
-              loading={applying}
-              disabled={disabledUsers === 0}
-              onClick={enableAll}
-            >
-              {t('一键开启未开启用户')}
-            </Button>
-          </div>
-        </Spin>
-      </Card>
-
       <Card className='!rounded-lg'>
         <div className='flex flex-col xl:flex-row gap-3 xl:items-end'>
           <label className='space-y-1'>
@@ -4082,7 +4041,7 @@ function RiskPanel({ data }) {
           <Button
             type='primary'
             icon={<RefreshCw size={16} />}
-            loading={coverageLoading || sharedLoading || tokenLoading}
+            loading={sharedLoading || tokenLoading}
             onClick={() => refreshRiskDetails(filters)}
           >
             {t('刷新')}
@@ -4391,7 +4350,7 @@ function ModelStatusTimeline({ status }) {
   );
 }
 
-function ModelStatusCard({ status }) {
+const ModelStatusCard = React.memo(function ModelStatusCard({ status }) {
   const { t } = useTranslation();
   const meta = getModelStatusMeta(status?.current_status);
   const Icon = meta.icon;
@@ -4466,7 +4425,7 @@ function ModelStatusCard({ status }) {
       </div>
     </Card>
   );
-}
+});
 
 function ModelStatusBoard({
   statuses,
@@ -4641,7 +4600,7 @@ function ModelStatusPanel({ data }) {
       const minutes = Math.min(1440, Math.max(1, Number(refreshMinutes || 1)));
       const nextSlotMinutes = Math.min(
         1440,
-        Math.max(5, Number(slotMinutes || 30)),
+        Math.max(1, Number(slotMinutes || 30)),
       );
       const nextGreenThreshold = Math.min(
         100,
@@ -4780,7 +4739,7 @@ function ModelStatusPanel({ data }) {
               />
             </label>
             <label className='space-y-1'>
-              <Text type='secondary'>{t('刷新间隔（分钟）')}</Text>
+              <Text type='secondary'>{t('服务器统计周期（分钟）')}</Text>
               <InputNumber
                 min={1}
                 max={1440}
@@ -4792,7 +4751,7 @@ function ModelStatusPanel({ data }) {
             <label className='space-y-1'>
               <Text type='secondary'>{t('状态粒度（分钟）')}</Text>
               <InputNumber
-                min={5}
+                min={1}
                 max={1440}
                 value={slotMinutes}
                 onChange={(value) => setSlotMinutes(value || 30)}
@@ -4888,24 +4847,50 @@ export function ModelStatusPublicPage() {
   const [loading, setLoading] = useState(false);
   const [available, setAvailable] = useState(true);
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [snapshotReady, setSnapshotReady] = useState(false);
+  const [refreshFailed, setRefreshFailed] = useState(false);
+  const snapshotTimeRef = useRef(null);
+  const requestInFlightRef = useRef(false);
 
   const loadPublicStatus = useCallback(async () => {
-    setLoading(true);
+    if (requestInFlightRef.current) return;
+    requestInFlightRef.current = true;
+    setLoading(snapshotTimeRef.current === null);
     try {
-      const [nextConfig, nextStatuses] = await Promise.all([
-        API.get('/api/enhancements/model-status/embed/config').then(unwrap),
-        API.get('/api/enhancements/model-status/embed/status/all').then(unwrap),
+      const [nextConfig, statusResponse] = await Promise.all([
+        API.get('/api/enhancements/model-status/embed/config', {
+          skipErrorHandler: true,
+        }).then(unwrap),
+        API.get('/api/enhancements/model-status/embed/status/all', {
+          skipErrorHandler: true,
+        }),
       ]);
+      const nextStatuses = unwrap(statusResponse) || [];
+      const snapshot = statusResponse.data;
+      const generatedAt = Number(snapshot.generated_at || 0);
       setConfig(nextConfig || {});
-      setStatuses(nextStatuses || []);
+      if (snapshotTimeRef.current !== generatedAt) {
+        setStatuses(nextStatuses);
+        snapshotTimeRef.current = generatedAt;
+      }
       setAvailable(true);
-      setLastUpdated(new Date());
+      setSnapshotReady(!!snapshot.ready);
+      setRefreshFailed(!!snapshot.refresh_failed);
+      setLastUpdated(generatedAt > 0 ? generatedAt * 1000 : null);
     } catch (error) {
-      setAvailable(false);
-      setConfig(null);
-      setStatuses([]);
+      if (error.response?.status === 404) {
+        setAvailable(false);
+        setConfig(null);
+        setStatuses([]);
+        setLastUpdated(null);
+        setSnapshotReady(false);
+        snapshotTimeRef.current = null;
+      } else {
+        setRefreshFailed(true);
+      }
     } finally {
       setLoading(false);
+      requestInFlightRef.current = false;
     }
   }, []);
 
@@ -4913,14 +4898,16 @@ export function ModelStatusPublicPage() {
     loadPublicStatus();
   }, [loadPublicStatus]);
 
+  const pollIntervalMs = snapshotReady
+    ? getModelStatusRefreshMinutes(config || {}) * 60 * 1000
+    : 5000;
   useEffect(() => {
-    if (!available || !config) return undefined;
-    const intervalMs = getModelStatusRefreshMinutes(config) * 60 * 1000;
+    if (!available) return undefined;
     const timer = window.setInterval(() => {
       loadPublicStatus();
-    }, intervalMs);
+    }, pollIntervalMs);
     return () => window.clearInterval(timer);
-  }, [available, config, loadPublicStatus]);
+  }, [available, pollIntervalMs, loadPublicStatus]);
 
   const groupOptions = useMemo(() => {
     const groups = Array.from(
@@ -4985,6 +4972,15 @@ export function ModelStatusPublicPage() {
   return (
     <div className='site-background-page-surface min-h-screen bg-semi-color-bg-0 px-4 py-6 md:py-8'>
       <div className='mx-auto max-w-6xl space-y-5'>
+        {refreshFailed ? (
+          <div role='status' className='text-sm text-semi-color-warning'>
+            {t('统计更新暂时失败，服务器将自动重试；已有数据仍保留显示')}
+          </div>
+        ) : !snapshotReady ? (
+          <div role='status' className='text-sm text-semi-color-text-2'>
+            {t('等待服务器生成统计，页面会自动显示结果')}
+          </div>
+        ) : null}
         <ModelStatusBoard
           statuses={visibleStatuses}
           loading={loading}
@@ -5110,8 +5106,7 @@ async function fetchSection(section) {
         start: range.start,
         end: range.end,
       };
-      const [coverage, sharedIPs, tokenMultiIPs] = await Promise.all([
-        API.get('/api/enhancements/risk/ip-log-coverage').then(unwrap),
+      const [sharedIPs, tokenMultiIPs] = await Promise.all([
         API.get('/api/enhancements/risk/shared-token-ips', {
           params: riskParams,
         }).then(unwrap),
@@ -5119,7 +5114,7 @@ async function fetchSection(section) {
           params: riskParams,
         }).then(unwrap),
       ]);
-      return { coverage, sharedIPs, tokenMultiIPs };
+      return { sharedIPs, tokenMultiIPs };
     }
     case 'model-status': {
       const config = await API.get(
@@ -5133,19 +5128,6 @@ async function fetchSection(section) {
         API.get('/api/enhancements/auto-group/preview').then(unwrap),
       ]);
       return { config, preview };
-    }
-    case 'ai-ban': {
-      const [config, ranking] = await Promise.all([
-        API.get('/api/enhancements/ai-ban/config').then(unwrap),
-        API.get('/api/enhancements/ai-ban/suspicious').then(unwrap),
-      ]);
-      return { config, ranking };
-    }
-    case 'system': {
-      const summary = await API.get('/api/enhancements/system/info').then(
-        unwrap,
-      );
-      return { summary };
     }
     default:
       return {};
@@ -5247,7 +5229,6 @@ export default function Enhancements() {
           </div>
         </div>
         <Space>
-          {activeSection === 'ai-ban' && <Tag color='blue'>{t('试运行')}</Tag>}
           <Button
             icon={<RefreshCw size={16} />}
             onClick={loadData}

@@ -294,3 +294,17 @@ custom_oauth.name_empty: "提供商名称不能为空"
 custom_oauth.has_bindings: "无法删除已有用户绑定的提供商"
 custom_oauth.binding_not_found: "OAuth 绑定不存在"
 custom_oauth.provider_id_field_invalid: "无法从提供商响应中提取用户 ID"
+
+user.disable_permanent: "永久封禁"
+user.disable_period: "封禁 {{.Minutes}} 分钟，解禁时间：{{.Until}}"
+
+# Login password requirements
+user.password_setup_required: "请先设置登录密码后再继续操作。"
+user.password_policy: "密码至少 8 个字符，最多 72 个 UTF-8 字节，且必须包含数字、大写字母、小写字母和英文标点符号。"
+user.original_password_incorrect: "原密码错误。"
+user.password_unchanged: "新密码不能与原密码相同。"
+user.password_changed_retry: "密码状态已发生变化，请刷新后重试。"
+
+oauth.access_denied: "授权被拒绝，可重新发起登录。"
+oauth.authorization_failed: "授权失败，请重试。"
+oauth.nodeloc_config_invalid: "启用 NodeLoc 前，请填写 Client ID、Client Secret 和有效的服务器地址（http:// 或 https://，不包含路径）。"
