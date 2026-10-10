@@ -19,6 +19,8 @@ For commercial licensing, please contact support@quantumnous.com
 
 export const CHANNEL_OPTIONS = [
   { value: 1, color: 'green', label: 'OpenAI' },
+  { value: 75, color: 'orange', label: 'vLLM' },
+  { value: 76, color: 'cyan', label: 'LiteLLM' },
   {
     value: 2,
     color: 'light-blue',
@@ -68,6 +70,8 @@ export const CHANNEL_OPTIONS = [
   { value: 70, color: 'yellow', label: 'Kilo' },
   { value: 71, color: 'blue', label: 'TypeSafe' },
   { value: 72, color: 'orange', label: 'Xiaomi MiMo' },
+  { value: 73, color: 'grey', label: 'Cline' },
+  { value: 74, color: 'blue', label: '讯飞星辰 MaaS' },
   { value: 63, color: 'cyan', label: 'OpenCode Zen' },
   { value: 64, color: 'green', label: 'OpenCode Go' },
   {
@@ -217,7 +221,7 @@ export const CHANNEL_OPTIONS = [
 // Channel types that support upstream model list fetching in UI.
 export const MODEL_FETCHABLE_CHANNEL_TYPES = new Set([
   1, 4, 14, 33, 34, 17, 26, 27, 24, 47, 25, 20, 23, 31, 40, 42, 48, 43, 58, 59,
-  61, 62, 63, 64, 65, 66, 67, 69, 70, 71, 72,
+  61, 62, 63, 64, 65, 66, 67, 69, 70, 71, 72, 73,
 ]);
 
 export const isManualModelFetchSupported = (
@@ -225,6 +229,9 @@ export const isManualModelFetchSupported = (
   vertexKeyType = 'json',
   customModelListUrl = '',
 ) => {
+  if (Number(type) === 74) {
+    return String(customModelListUrl || '').trim() !== '';
+  }
   if (MODEL_FETCHABLE_CHANNEL_TYPES.has(Number(type))) {
     return true;
   }

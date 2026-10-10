@@ -80,7 +80,9 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	}
 	adaptor.Init(info)
 	var requestBody io.Reader
-	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled {
+	if info.ChannelType != appconstant.ChannelTypeXunfeiMaas &&
+		info.ChannelType != appconstant.ChannelTypeOpenCode && info.ChannelType != appconstant.ChannelTypeOpenCodeGo &&
+		(model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled) {
 		info.MarkModelMappingBypassed()
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
@@ -117,6 +119,12 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		}
 
 		if info.ChannelType == appconstant.ChannelTypeOpenAI {
+			if info.RelayMode == relayconstant.RelayModeResponses {
+				jsonData, err = normalizeOfficialResponsesRequest(info, jsonData)
+				if err != nil {
+					return invalidOpenAIModelRequest(err)
+				}
+			}
 			var finalRequest struct {
 				Background *bool `json:"background"`
 			}
@@ -141,6 +149,9 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		return adaptor.DoRequest(c, info, requestBody)
 	})
 	if err != nil {
+		if apiErr, ok := err.(*types.NewAPIError); ok {
+			return apiErr
+		}
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}
 

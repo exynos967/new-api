@@ -437,7 +437,10 @@ func BatchInsertChannels(channels []Channel) error {
 		}
 	}()
 
-	for _, chunk := range lo.Chunk(channels, 50) {
+	// Keep batches backed by the caller's slice so generated IDs and defaults
+	// are available to post-create work such as model synchronization.
+	for start := 0; start < len(channels); start += 50 {
+		chunk := channels[start:min(start+50, len(channels))]
 		if err := tx.Create(&chunk).Error; err != nil {
 			tx.Rollback()
 			return err
@@ -530,7 +533,18 @@ func (channel *Channel) Insert() error {
 	return err
 }
 
-func (channel *Channel) Update() error {
+func (channel *Channel) Update() error { return channel.UpdateWithKeyClear(false) }
+
+// UpdateWithKeyClear keeps ordinary blank-key edits unchanged. Clearing a
+// credential is explicit and atomic with the rest of the channel update.
+func (channel *Channel) UpdateWithKeyClear(clearKey bool) error {
+	if clearKey {
+		if !constant.IsSelfHostedChannel(channel.Type) || channel.ChannelInfo.IsMultiKey {
+			return errors.New("key clearing requires a single-key vLLM/LiteLLM channel")
+		}
+		channel.Key = ""
+		channel.Keys = nil
+	}
 	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
 	if channel.ChannelInfo.IsMultiKey {
 		var keyStr string
@@ -570,7 +584,16 @@ func (channel *Channel) Update() error {
 		}
 	}
 	var err error
-	err = DB.Model(channel).Updates(channel).Error
+	if clearKey {
+		err = DB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(channel).Updates(channel).Error; err != nil {
+				return err
+			}
+			return tx.Model(channel).Update("key", "").Error
+		})
+	} else {
+		err = DB.Model(channel).Updates(channel).Error
+	}
 	if err != nil {
 		return err
 	}

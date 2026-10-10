@@ -72,6 +72,8 @@ type ChannelOtherSettings struct {
 	MistralConsoleCodeInterpreterEnabled  *bool         `json:"mistral_console_code_interpreter_enabled,omitempty"`
 	MistralConsoleImageGenerationEnabled  *bool         `json:"mistral_console_image_generation_enabled,omitempty"`
 	MistralConsoleWebSearchEnabled        *bool         `json:"mistral_console_web_search_enabled,omitempty"`
+	OpenCodeClientHeadersEnabled          *bool         `json:"opencode_client_headers_enabled,omitempty"` // 未配置时默认将客户端标识统一为 OpenCode
+	OpenCodeFreeModelSyncEnabled          bool          `json:"opencode_auto_sync_free_models_enabled,omitempty"`
 	XAICodexCompatibilityEnabled          bool          `json:"xai_codex_compatibility_enabled,omitempty"`
 	ConversationLogEnabled                bool          `json:"conversation_log_enabled,omitempty"` // Root-only: capture full conversation payloads for distillation
 	AwsKeyType                            AwsKeyType    `json:"aws_key_type,omitempty"`
@@ -96,6 +98,15 @@ type ChannelOtherSettings struct {
 	KiloFreeModelManagedModels             []string          `json:"kilo_free_model_managed_models,omitempty"`
 	KiloFreeModelGeneratedMappings         map[string]string `json:"kilo_free_model_generated_mappings,omitempty"`
 	KiloFreeModelPendingMappings           map[string]string `json:"kilo_free_model_pending_mappings,omitempty"`
+
+	ClineFreeModelSyncEnabled     *bool             `json:"cline_auto_sync_free_models_enabled,omitempty"`
+	ClineFreeModelManagedModels   []string          `json:"cline_free_model_managed_models,omitempty"`
+	ClineModelGeneratedMappings   map[string]string `json:"cline_model_generated_mappings,omitempty"`
+	ClineFreeModelPendingMappings map[string]string `json:"cline_free_model_pending_mappings,omitempty"`
+}
+
+func (s ChannelOtherSettings) ShouldSyncClineFreeModels() bool {
+	return s.ClineFreeModelSyncEnabled == nil || *s.ClineFreeModelSyncEnabled
 }
 
 func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {
@@ -110,15 +121,19 @@ func (s ChannelOtherSettings) ShouldRemoveGifImages() bool {
 }
 
 func (s ChannelOtherSettings) ShouldEnableMistralConsoleCodeInterpreter() bool {
-	return s.MistralConsoleCodeInterpreterEnabled == nil || *s.MistralConsoleCodeInterpreterEnabled
+	return s.MistralConsoleCodeInterpreterEnabled != nil && *s.MistralConsoleCodeInterpreterEnabled
 }
 
 func (s ChannelOtherSettings) ShouldEnableMistralConsoleImageGeneration() bool {
-	return s.MistralConsoleImageGenerationEnabled == nil || *s.MistralConsoleImageGenerationEnabled
+	return s.MistralConsoleImageGenerationEnabled != nil && *s.MistralConsoleImageGenerationEnabled
 }
 
 func (s ChannelOtherSettings) ShouldEnableMistralConsoleWebSearch() bool {
-	return s.MistralConsoleWebSearchEnabled == nil || *s.MistralConsoleWebSearchEnabled
+	return s.MistralConsoleWebSearchEnabled != nil && *s.MistralConsoleWebSearchEnabled
+}
+
+func (s ChannelOtherSettings) ShouldFillOpenCodeClientHeaders() bool {
+	return s.OpenCodeClientHeadersEnabled == nil || *s.OpenCodeClientHeadersEnabled
 }
 
 func (s ChannelOtherSettings) ModalKeepaliveInterval() int {

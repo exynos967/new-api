@@ -1,0 +1,112 @@
+# OpenCode 渠道
+
+## 自动更新免费模型列表
+
+OpenCode Zen 的“上游模型管理”中提供“自动更新 OpenCode 免费模型列表”开关，默认关闭，保存于 `settings.opencode_auto_sync_free_models_enabled`。OpenCode Go 不提供此开关。
+
+开启并保存后，渠道参加现有后台巡检，默认每 30 分钟拉取一次模型目录（由 `CHANNEL_UPSTREAM_MODEL_UPDATE_TASK_INTERVAL_MINUTES` 配置）。也可手动检测更新。免费列表来自该渠道配置的地址、密钥、代理及自定义模型列表接口。
+
+- 自动加入新上线的免费对话模型，移除目录中已下线的免费对话模型；按 `-free` 后缀及 `big-pickle` 识别，排除 JEV／SystemOne 等不支持当前流式对话路径的模型。
+- 保留其他模型与手动映射，遵守“已忽略模型”的精确匹配及 `regex:` 规则。
+- 请求失败、返回空列表或没有符合条件的免费模型时保留当前列表，记录检测失败。
+- 免费同步优先于全部模型巡检，避免自动混入付费模型；关闭后停止免费列表自动维护，保留已加入的模型。
+- 新建、编辑页的“获取模型列表”跟随当前开关筛选，预览不会修改已保存的开关。模型列表及渠道可用能力一并更新，站内计费仍使用现有定价。
+
+## 客户端标识
+
+OpenCode Zen 和 Go 共用“统一使用 OpenCode 客户端标识”开关，保存在渠道 `settings.opencode_client_headers_enabled`。缺省或 `null` 默认开启，显式 `false` 关闭，旧渠道无需迁移。
+
+| 请求头 | 开启时的行为 |
+| --- | --- |
+| `User-Agent` | 覆盖为 `opencode/1.18.34` |
+| `x-opencode-client` | 覆盖为 `cli` |
+| `x-opencode-project` | 覆盖为 `global` |
+| `x-opencode-session`、`x-opencode-session-id` | 覆盖为同一个生成的 OpenCode 格式 `ses_` 标识 |
+| `x-opencode-request` | 覆盖为生成的 OpenCode 格式 `msg_` 标识 |
+| `x-parent-session-id`、`x-opencode-parent-session-id` | 网关生成新的请求会话，不携带调用方的父会话标识 |
+
+生成的标识在同一次入口请求的重试中保持不变，不继承调用方的跨轮会话身份。需要自行管理上游会话时，关闭此开关后使用显式渠道请求头配置。
+
+关闭开关后仅透传已有标识，自定义请求头仍生效。开启时，在通配符、正则、显式渠道／运行时请求头覆盖全部应用之后，再统一 UA、`x-opencode-*`、父会话、`x-session-id`、`x-session-affinity`、`x-stainless-*`、`x-cline-*`、`x-app`、`x-title`，确保最终出站身份不被旧配置覆盖。鉴权和其他自定义头仍按原有规则生效。
+
+请求头定义对照 [OpenCode 官方源码 907b3bc 的 request.ts](https://github.com/anomalyco/opencode/blob/907b3bc518fa48e90e8ec24dd327d13eee71c36c/packages/opencode/src/session/llm/request.ts#L187)，其中新增的 `x-opencode-session-id` 与 `x-opencode-session` 使用相同值。
+
+## 免费对话模型兼容
+
+仅补请求头不足以解决本次 `FreeTierError`。实现参考 [piexian/new-api 的免费请求兼容代码](https://github.com/piexian/new-api/tree/afd0be51b8e70b922cbd6cd1cc94e1c3a43cf55f/relay/channel/opencode)，按 AGPL-3.0 保留来源说明，适配本项目现有转发路径。
+
+Zen 的 Chat Completions／Responses 免费模型（`-free` 后缀及 `big-pickle`）默认执行以下处理：
+
+- 上游始终使用 `stream: true`；后台测试或非流式调用方的响应由网关汇总为 JSON，保留用量。
+- 保留原有工具及其参数，只补缺少的 `bash`、`edit`、`glob`、`grep`、`read` 函数声明，不添加系统提示词。
+- Chat 请求开启流式用量；没有客户端工具且未指定 `tool_choice` 时设为 `none`。Responses 保留客户端原有选择。
+- 模型若调用仅为兼容而补充的工具，返回明确错误；调用方原本声明的同名工具正常透传。
+- 校验 SSE 错误、结束事件、工具名分片、超时和取消；错误或截断后不补成功结束标记。单事件限 8 MiB，非流式汇总限 32 MiB。
+- Zen 付费模型、Go、Messages／Gemini 上游不应用此兼容逻辑。客户端使用 Claude／Gemini 协议、但转为免费 Chat 上游的请求仍应用兼容处理。
+
+这部分处理独立于请求头开关，全局或渠道请求体透传均不会将其关闭。OpenCode 按模型选择协议，Chat、Messages、Gemini 及 Responses 入口均须经过相应转换及模型映射。既有 Chat／Messages → Responses 转换也经过同一响应校验；`muse-spark-*` 使用 `/v1/responses`。
+
+## 403 回归修复：2026-10-05
+
+修复前，转发层对 OpenCode 强制执行协议转换，但适配器仍在全局／渠道请求体透传开启时跳过免费模型的流式和工具兼容，导致处理不一致。使用 `public` 匿名凭据、`mimo-v2.6-flash-free`、流式请求及全局透传，实测复现 HTTP 403 `FreeTierError`。修复后，同时开启全局和渠道透传，并传入第三方客户端 UA 与冲突的身份请求头，同一模型返回 HTTP 200、`OK` 和正常结束事件。
+
+MiMo-V2.6-Flash Free 与 Muse Spark 1.3 Contributor Free 的流式工具调用也均返回 HTTP 200，原有 `read` 工具及参数正常返回。最新免费目录的修复前抽测中，9 个对话模型正常，DeepSeek V4 Flash、Fledge Alpha、Ling 3.0 Flash Fin、Ling 3.1 Flash 分别返回上游模型／端点不可用错误（400、502、400、429），未出现 `FreeTierError`；这些服务可用性错误仍原样保留。
+
+官方目录中的模型 ID 是 `mimo-v2.6-flash-free`。如果对外使用 `mimo-v2.6-flash`，应配置模型映射 `{"mimo-v2.6-flash":"mimo-v2.6-flash-free"}`；本次直接请求无后缀 ID 得到的是上游 `ModelError`，而非 `FreeTierError`，不应混为同一故障。
+
+## 最终出站请求头修复：2026-10-07
+
+再次核对官方源码 `ecc4916b5a9608c30e6dd58a67f2137b594407ca`，请求头定义未变化。此前统一身份仅在 `SetupRequestHeader` 中执行，之后显式渠道／运行时请求头仍能覆盖它。将 `User-Agent` 自定义为 `Go-http-client/2.0`，即使身份开关开启、流式及工具兼容已执行，实测 MiMo 返回 HTTP 403 `FreeTierError`。
+
+现在在所有请求头覆盖完成后执行适配器的最终校验，仅统一 OpenCode 身份字段，保留鉴权和其他自定义头。同一配置复测 HTTP 200、`OK`、正常结束。自动测试覆盖 Zen／Go 各协议、开关关闭时的自定义头、普通和后台测试请求。可选实测入口 `OPENCODE_LIVE_CHANNEL_TEST=1 go test ./controller -run '^TestOpenCodeLiveDashboardChannel$' -count=1 -v` 使用隔离内存数据库，验证后台非流式及流式测试、模型别名、透传设置和冲突的身份覆盖；上游生成请求始终为流式。密钥仅从 `OPENCODE_LIVE_API_KEY` 读取，缺省使用 `public`。
+
+这些结果验证了可复现的请求头覆盖缺陷；线上渠道的地址、配置和部署版本尚需分别核对，不能仅凭本地成功判断线上已恢复。
+
+`jev-1.13-free` 属于非流式 SystemOne 原生模型，不属于上述 Chat／Responses 兼容范围。本次不把它映射为普通对话模型。上游的权限、地域、额度及服务故障仍可能导致失败，非 2xx 原始错误会保留。
+
+## 流式实测：2026-09-24
+
+使用用户提供的 key，从当前出口调用官方模型目录，并通过本项目 Go 适配器发送请求。模拟第三方客户端 `User-Agent: claude-code/2.0`，同时启用通配符请求头透传。出站使用上表默认标识，无需额外账号组织头或 SDK UA 后缀。所有上游生成请求均为流式。
+
+| 模型 | HTTP | 返回文本 | 正常结束 | 总 tokens |
+| --- | --- | --- | --- | --- |
+| big-pickle | 200 | OK | 是 | 487 |
+| ling-3.0-flash-fin-free | 200 | OK | 是 | 218 |
+| mimo-v2.5-free | 200 | OK | 是 | 638 |
+| mimo-v2.6-flash-free | 200 | OK | 是 | 236 |
+| muse-spark-1.2-contributor-free | 200 | OK | 是 | 703 |
+| muse-spark-1.3-contributor-free | 200 | OK | 是 | 691 |
+| nemotron-3-ultra-free | 200 | OK | 是 | 58 |
+| nemotron-3.5-lightning-free | 200 | OK | 是 | 187 |
+| space-bunny-free | 200 | OK | 是 | 518 |
+
+目录中的另一个免费模型 `jev-1.13-free` 在先前 SDK 流式 Chat 尝试中返回 503 `Endpoint is unavailable`；适配器流式套件将其列为不适用，未发送非流式请求。匿名目录曾包含、但本次 key 目录不包含的模型不计入这 9 个成功结果。
+
+另外通过 Go 适配器对 MiMo 2.5 和 Muse 1.3 发起客户端自带 `read(path)` 工具的流式请求，均返回 HTTP 200、`read({"path":"opencode-test.txt"})` 和正常结束事件。测试只验证工具调用传递，不执行工具或读取文件。
+
+对照结果：官方 OpenCode 1.18.32 使用同一 key 调用 MiMo 成功；仅补五个标识头、SDK UA 后缀及组织头的流式请求仍为 403；加入参考项目的免费兼容请求形状后成功。此前只补 header 的修改确实没有解决这次问题。
+
+## 复现测试
+
+普通单元测试不访问上游：
+
+```powershell
+go test ./relay/channel/opencode ./relay/channel/openai ./relay/channel ./relay ./service ./dto
+```
+
+实测需要从环境注入凭据，禁止将 key 写入源码或提交：
+
+```powershell
+$env:OPENCODE_LIVE_TEST = '1'
+$env:OPENCODE_LIVE_ALL_FREE = '1'
+# OPENCODE_LIVE_API_KEY 由测试环境注入；缺省为 public。
+go test ./relay/channel/opencode -run '^TestOpenCodeLiveClientIdentifiers$' -count=1 -v
+```
+
+`OPENCODE_LIVE_MODEL` 可指定单个免费模型；`OPENCODE_LIVE_TOOL=1` 验证客户端声明的 read 工具；`OPENCODE_LIVE_REPORT` 可指定脱敏 JSON 报告路径。报告不记录鉴权头。账号目录、出口、上游模型及限额变化可能改变结果。
+
+## 官方源码依据
+
+- [OpenCode v1.18.32 请求头组装](https://github.com/anomalyco/opencode/blob/v1.18.32/packages/opencode/src/session/llm/request.ts)
+- [会话及消息 ID 格式](https://github.com/anomalyco/opencode/blob/v1.18.32/packages/schema/src/identifier.ts)
+- [参考项目固定版本](https://github.com/piexian/new-api/commit/afd0be51b8e70b922cbd6cd1cc94e1c3a43cf55f)

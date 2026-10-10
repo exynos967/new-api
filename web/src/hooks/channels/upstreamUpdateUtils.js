@@ -24,6 +24,31 @@ export const normalizeModelList = (models = []) =>
     ),
   );
 
+// Collapse upstream IDs already represented by a Cline short-name mapping.
+// Keep the original mapping and any separately mapped full ID intact.
+export const collapseClineMappedModels = (models, modelMapping) => {
+  const normalized = normalizeModelList(models);
+  let mapping = modelMapping;
+  if (typeof mapping === 'string') {
+    try {
+      mapping = JSON.parse(mapping);
+    } catch {
+      return normalized;
+    }
+  }
+  if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) {
+    return normalized;
+  }
+  return normalizeModelList(
+    normalized.map((id) => {
+      const slash = id.indexOf('/');
+      if (slash <= 0 || Object.hasOwn(mapping, id)) return id;
+      const alias = id.slice(slash + 1).trim();
+      return alias && mapping[alias] === id ? alias : id;
+    }),
+  );
+};
+
 export const parseUpstreamUpdateMeta = (settings, channelType) => {
   let parsed = null;
   if (settings && typeof settings === 'object') {
@@ -38,7 +63,7 @@ export const parseUpstreamUpdateMeta = (settings, channelType) => {
 
   if (!parsed || typeof parsed !== 'object') {
     return {
-      enabled: false,
+      enabled: Number(channelType) === 73,
       pendingAddModels: [],
       pendingRemoveModels: [],
     };
@@ -46,6 +71,10 @@ export const parseUpstreamUpdateMeta = (settings, channelType) => {
 
   return {
     enabled:
+      (Number(channelType) === 63 &&
+        parsed.opencode_auto_sync_free_models_enabled === true) ||
+      (Number(channelType) === 73 &&
+        parsed.cline_auto_sync_free_models_enabled !== false) ||
       parsed.upstream_model_update_check_enabled === true ||
       (Number(channelType) === 20 &&
         parsed.openrouter_auto_sync_free_and_alpha_models_enabled === true),

@@ -5,6 +5,10 @@ import "github.com/QuantumNous/new-api/constant"
 func ChannelType2APIType(channelType int) (int, bool) {
 	apiType := -1
 	switch channelType {
+	case constant.ChannelTypeVLLM:
+		apiType = constant.APITypeVLLM
+	case constant.ChannelTypeLiteLLM:
+		apiType = constant.APITypeLiteLLM
 	case constant.ChannelTypeTypeSafe:
 		apiType = constant.APITypeTypeSafe
 	case constant.ChannelTypeOpenAI:
@@ -21,6 +25,8 @@ func ChannelType2APIType(channelType int) (int, bool) {
 		apiType = constant.APITypeAli
 	case constant.ChannelTypeXunfei:
 		apiType = constant.APITypeXunfei
+	case constant.ChannelTypeXunfeiMaas:
+		apiType = constant.APITypeXunfeiMaas
 	case constant.ChannelTypeAIProxyLibrary:
 		apiType = constant.APITypeAIProxyLibrary
 	case constant.ChannelTypeTencent:
@@ -101,7 +107,7 @@ func ChannelType2APIType(channelType int) (int, bool) {
 		apiType = constant.APITypeVyceAI
 	case constant.ChannelTypeMiMo:
 		apiType = constant.APITypeMiMo
-	case constant.ChannelTypeModal, constant.ChannelTypeKilo:
+	case constant.ChannelTypeModal, constant.ChannelTypeKilo, constant.ChannelTypeCline:
 		apiType = constant.APITypeOpenAI
 	}
 	if apiType == -1 {

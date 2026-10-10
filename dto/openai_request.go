@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/openaimodel"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/samber/lo"
 
@@ -37,6 +38,7 @@ type GeneralOpenAIRequest struct {
 	MaxTokens           *uint             `json:"max_tokens,omitempty"`
 	MaxCompletionTokens *uint             `json:"max_completion_tokens,omitempty"`
 	ReasoningEffort     string            `json:"reasoning_effort,omitempty"`
+	AllowedOpenAIParams []string          `json:"allowed_openai_params,omitempty"`
 	Verbosity           json.RawMessage   `json:"verbosity,omitempty"` // gpt-5
 	Temperature         *float64          `json:"temperature,omitempty"`
 	TopP                *float64          `json:"top_p,omitempty"`
@@ -138,13 +140,7 @@ func (r *GeneralOpenAIRequest) GetTokenCountMeta() *types.TokenCountMeta {
 		texts = append(texts, inputs...)
 	}
 
-	maxTokens := lo.FromPtrOr(r.MaxTokens, uint(0))
-	maxCompletionTokens := lo.FromPtrOr(r.MaxCompletionTokens, uint(0))
-	if maxCompletionTokens > maxTokens {
-		tokenCountMeta.MaxTokens = int(maxCompletionTokens)
-	} else {
-		tokenCountMeta.MaxTokens = int(maxTokens)
-	}
+	tokenCountMeta.MaxTokens = int(r.GetMaxTokens())
 
 	for _, message := range r.Messages {
 		tokenCountMeta.MessagesCount++
@@ -219,11 +215,7 @@ func (r *GeneralOpenAIRequest) ToMap() map[string]any {
 }
 
 func (r *GeneralOpenAIRequest) GetSystemRoleName() string {
-	if strings.HasPrefix(r.Model, "o") {
-		if !strings.HasPrefix(r.Model, "o1-mini") && !strings.HasPrefix(r.Model, "o1-preview") {
-			return "developer"
-		}
-	} else if strings.HasPrefix(r.Model, "gpt-5") {
+	if _, _, capabilities, known := openaimodel.Resolve(r.Model); known && capabilities.DeveloperRole {
 		return "developer"
 	}
 	return "system"
@@ -272,9 +264,8 @@ func (s *StreamOptions) GetIncludeUsage() bool {
 }
 
 func (r *GeneralOpenAIRequest) GetMaxTokens() uint {
-	maxCompletionTokens := lo.FromPtrOr(r.MaxCompletionTokens, uint(0))
-	if maxCompletionTokens != 0 {
-		return maxCompletionTokens
+	if r.MaxCompletionTokens != nil {
+		return *r.MaxCompletionTokens
 	}
 	return lo.FromPtrOr(r.MaxTokens, uint(0))
 }
@@ -906,7 +897,9 @@ type OpenAIResponsesRequest struct {
 	MaxToolCalls     *uint           `json:"max_tool_calls,omitempty"`
 	Prompt           json.RawMessage `json:"prompt,omitempty"`
 	// qwen
-	EnableThinking json.RawMessage `json:"enable_thinking,omitempty"`
+	EnableThinking     json.RawMessage `json:"enable_thinking,omitempty"`
+	ChatTemplateKwargs json.RawMessage `json:"chat_template_kwargs,omitempty"`
+	ExtraBody          json.RawMessage `json:"extra_body,omitempty"`
 	// perplexity
 	Preset json.RawMessage `json:"preset,omitempty"`
 }

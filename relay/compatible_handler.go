@@ -76,6 +76,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	passThrough := shouldPassThroughTextRequest(info, model_setting.GetGlobalSettings().PassThroughRequestEnabled)
 	if info.RelayMode == relayconstant.RelayModeChatCompletions &&
 		!passThrough &&
+		info.ChannelType != constant.ChannelTypeOpenAI &&
 		shouldChatCompletionsUseResponses(info) {
 		applySystemPromptIfNeeded(c, info, request)
 		usage, newApiErr := chatCompletionsViaResponses(c, info, adaptor, request)
@@ -119,7 +120,9 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		}
 		relaycommon.AppendRequestConversionFromRequest(info, convertedRequest)
 
-		if info.ChannelSetting.SystemPrompt != "" {
+		if info.ChannelType == constant.ChannelTypeOpenAI {
+			applySystemPromptIfNeeded(c, info, request)
+		} else if info.ChannelSetting.SystemPrompt != "" {
 			// 如果有系统提示，则将其添加到请求中
 			request, ok := convertedRequest.(*dto.GeneralOpenAIRequest)
 			if ok {
@@ -180,6 +183,27 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 			}
 		}
 
+		if info.ChannelType == constant.ChannelTypeOpenAI && info.RelayMode == relayconstant.RelayModeChatCompletions {
+			var requiresResponses bool
+			jsonData, requiresResponses, err = normalizeOfficialChatRequest(info, jsonData)
+			if err != nil {
+				return invalidOpenAIModelRequest(err)
+			}
+			if requiresResponses || shouldChatCompletionsUseResponses(info) {
+				usage, apiErr := chatCompletionsViaResponsesBody(c, info, adaptor, jsonData)
+				if apiErr != nil {
+					return apiErr
+				}
+				if (usage.CompletionTokenDetails.AudioTokens > 0 || usage.PromptTokensDetails.AudioTokens > 0) &&
+					(ratio_setting.ContainsAudioRatio(info.OriginModelName) || ratio_setting.ContainsAudioCompletionRatio(info.OriginModelName)) {
+					service.PostAudioConsumeQuota(c, info, usage, "")
+				} else {
+					service.PostTextConsumeQuota(c, info, usage, nil)
+				}
+				return nil
+			}
+		}
+
 		logger.LogDebug(c, fmt.Sprintf("text request body: %s", string(jsonData)))
 
 		relaycommon.SetReasoningEffortFromRequest(info, jsonData)
@@ -192,6 +216,9 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		return adaptor.DoRequest(c, info, requestBody)
 	})
 	if err != nil {
+		if apiErr, ok := err.(*types.NewAPIError); ok {
+			return apiErr
+		}
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}
 
@@ -199,7 +226,10 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 
 	if resp != nil {
 		httpResp = resp.(*http.Response)
-		info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
+		// Cline always streams upstream; keep the client's response mode.
+		if info.ChannelType != constant.ChannelTypeCline {
+			info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
+		}
 		if httpResp.StatusCode != http.StatusOK {
 			newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
 			// reset status code 重置状态码

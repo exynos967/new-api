@@ -1,5 +1,11 @@
 package opencode
 
+const (
+	defaultUserAgent = "opencode/1.18.34"
+	defaultClient    = "cli"
+	defaultProject   = "global"
+)
+
 var ModelList = []string{
 	"claude-fable-5",
 	"claude-opus-5",
@@ -56,8 +62,14 @@ var ModelList = []string{
 	"big-pickle",
 	"deepseek-v4-flash-free",
 	"mimo-v2.5-free",
+	"mimo-v2.6-flash-free",
+	"muse-spark-1.2-contributor-free",
+	"muse-spark-1.3-contributor-free",
 	"ling-3.0-flash-free",
+	"ling-3.0-flash-fin-free",
 	"nemotron-3-ultra-free",
+	"nemotron-3.5-lightning-free",
+	"space-bunny-free",
 	"north-mini-code-free",
 	"laguna-s-2.1-free",
 	"longcat-2.0-free",

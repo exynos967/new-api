@@ -4,12 +4,35 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/pkg/openaimodel"
 )
 
 // GetEndpointTypesByChannelType returns the preferred endpoint types for a channel/model pair.
 func GetEndpointTypesByChannelType(channelType int, modelName string) []constant.EndpointType {
+	if channelType == constant.ChannelTypeMistral && strings.HasPrefix(strings.ToLower(modelName), "mistral-moderation-") {
+		return []constant.EndpointType{constant.EndpointTypeModerations}
+	}
 	var endpointTypes []constant.EndpointType
 	switch channelType {
+	case constant.ChannelTypeVLLM, constant.ChannelTypeLiteLLM:
+		return []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse}
+	case constant.ChannelTypeXunfeiMaas:
+		name := strings.ToLower(modelName)
+		if strings.Contains(name, "embedding") {
+			return []constant.EndpointType{constant.EndpointTypeEmbeddings}
+		}
+		if strings.Contains(name, "rerank") {
+			return []constant.EndpointType{constant.EndpointTypeJinaRerank}
+		}
+		if name == "xopzimageturbo" || name == "xopqwentti20b" || IsImageGenerationModel(modelName) || strings.Contains(name, "kolors") || strings.Contains(name, "flux") {
+			return []constant.EndpointType{constant.EndpointTypeImageGeneration}
+		}
+		switch name {
+		case "xop3qwen32bvl", "xopkimik27code", "xopkimik26", "xopkimik25",
+			"xopqwen36v35b", "xopqwen35397b", "xoppaddleocrv16", "xophunyuanocr", "xopdeepseekocr":
+			return []constant.EndpointType{constant.EndpointTypeOpenAI}
+		}
+		return []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse, constant.EndpointTypeAnthropic}
 	case constant.ChannelTypeMiMo:
 		return []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeAnthropic}
 	case constant.ChannelTypeTypeSafe:
@@ -34,10 +57,12 @@ func GetEndpointTypesByChannelType(channelType int, modelName string) []constant
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeGemini, constant.EndpointTypeOpenAI}
 	case constant.ChannelTypeOpenRouter:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI}
-	case constant.ChannelTypeModal, constant.ChannelTypeKilo:
+	case constant.ChannelTypeModal, constant.ChannelTypeKilo, constant.ChannelTypeCline:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI}
 	case constant.ChannelTypeGMICloud:
-		if strings.EqualFold(strings.TrimSpace(modelName), "Gemini-batch-inference") {
+		if strings.TrimSpace(modelName) == "hy-image-v3.5-preview" {
+			return []constant.EndpointType{constant.EndpointTypeImageGeneration}
+		} else if strings.EqualFold(strings.TrimSpace(modelName), "Gemini-batch-inference") {
 			endpointTypes = []constant.EndpointType{constant.EndpointTypeBatchGeneration}
 		} else {
 			endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI}
@@ -89,7 +114,8 @@ func GetEndpointTypesByChannelType(channelType int, modelName string) []constant
 			endpointTypes = []constant.EndpointType{constant.EndpointTypeAudioSpeech, constant.EndpointTypeAudioTranscription}
 		}
 	default:
-		if IsOpenAIResponseOnlyModel(modelName) {
+		_, _, capabilities, known := openaimodel.Resolve(modelName)
+		if known && (capabilities.LegacyResponsesOnly || (channelType == constant.ChannelTypeOpenAI && capabilities.ResponsesOnly)) {
 			endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAIResponse}
 		} else {
 			endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI}

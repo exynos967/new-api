@@ -106,12 +106,12 @@ func TestChannelOtherSettingsRemoveGifImagesExplicitValueRoundTrip(t *testing.T)
 	}
 }
 
-func TestChannelOtherSettingsMistralConsoleToolsDefaultOn(t *testing.T) {
+func TestChannelOtherSettingsMistralConsoleToolsDefaultOff(t *testing.T) {
 	var settings dto.ChannelOtherSettings
 	require.NoError(t, common.Unmarshal([]byte(`{}`), &settings))
-	require.True(t, settings.ShouldEnableMistralConsoleCodeInterpreter())
-	require.True(t, settings.ShouldEnableMistralConsoleImageGeneration())
-	require.True(t, settings.ShouldEnableMistralConsoleWebSearch())
+	require.False(t, settings.ShouldEnableMistralConsoleCodeInterpreter())
+	require.False(t, settings.ShouldEnableMistralConsoleImageGeneration())
+	require.False(t, settings.ShouldEnableMistralConsoleWebSearch())
 }
 
 func TestChannelOtherSettingsMistralConsoleToolsExplicitValues(t *testing.T) {
@@ -137,4 +137,31 @@ func TestChannelOtherSettingsModalKeepaliveInterval(t *testing.T) {
 
 	settings.ModalKeepaliveIntervalSeconds = 45
 	require.Equal(t, 45, settings.ModalKeepaliveInterval())
+}
+
+func TestChannelOtherSettingsOpenCodeClientHeaders(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    bool
+		encoded string
+	}{
+		{name: "missing", payload: `{}`, want: true, encoded: `{}`},
+		{name: "null", payload: `{"opencode_client_headers_enabled":null}`, want: true, encoded: `{}`},
+		{name: "enabled", payload: `{"opencode_client_headers_enabled":true}`, want: true, encoded: `{"opencode_client_headers_enabled":true}`},
+		{name: "disabled", payload: `{"opencode_client_headers_enabled":false}`, want: false, encoded: `{"opencode_client_headers_enabled":false}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var settings dto.ChannelOtherSettings
+			require.NoError(t, common.Unmarshal([]byte(tt.payload), &settings))
+			require.Equal(t, tt.want, settings.ShouldFillOpenCodeClientHeaders())
+			encoded, err := common.Marshal(settings)
+			require.NoError(t, err)
+			require.JSONEq(t, tt.encoded, string(encoded))
+			var roundTrip dto.ChannelOtherSettings
+			require.NoError(t, common.Unmarshal(encoded, &roundTrip))
+			require.Equal(t, tt.want, roundTrip.ShouldFillOpenCodeClientHeaders())
+		})
+	}
 }

@@ -34,6 +34,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/palm"
 	"github.com/QuantumNous/new-api/relay/channel/perplexity"
 	"github.com/QuantumNous/new-api/relay/channel/replicate"
+	"github.com/QuantumNous/new-api/relay/channel/selfhost"
 	"github.com/QuantumNous/new-api/relay/channel/siliconflow"
 	"github.com/QuantumNous/new-api/relay/channel/submodel"
 	taskagnes "github.com/QuantumNous/new-api/relay/channel/task/agnes"
@@ -56,6 +57,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/volcengine"
 	"github.com/QuantumNous/new-api/relay/channel/vyceai"
 	"github.com/QuantumNous/new-api/relay/channel/xai"
+	"github.com/QuantumNous/new-api/relay/channel/xfyun_maas"
 	"github.com/QuantumNous/new-api/relay/channel/xunfei"
 	"github.com/QuantumNous/new-api/relay/channel/zhipu"
 	"github.com/QuantumNous/new-api/relay/channel/zhipu_4v"
@@ -64,6 +66,12 @@ import (
 
 func GetAdaptor(apiType int) channel.Adaptor {
 	switch apiType {
+	case constant.APITypeVLLM:
+		return &selfhost.VLLMAdaptor{}
+	case constant.APITypeLiteLLM:
+		return &selfhost.LiteLLMAdaptor{}
+	case constant.APITypeXunfeiMaas:
+		return &xfyun_maas.Adaptor{}
 	case constant.APITypeMiMo:
 		return &mimo.Adaptor{}
 	case constant.APITypeTypeSafe:

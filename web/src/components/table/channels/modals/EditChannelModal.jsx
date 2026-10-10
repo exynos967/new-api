@@ -28,6 +28,7 @@ import {
   verifyJSON,
 } from '../../../../helpers';
 import { useIsMobile } from '../../../../hooks/common/useIsMobile';
+import { collapseClineMappedModels } from '../../../../hooks/channels/upstreamUpdateUtils';
 import { CHANNEL_OPTIONS, MODEL_FETCHABLE_CHANNEL_TYPES, isManualModelFetchSupported } from '../../../../constants';
 import {
   SideSheet,
@@ -134,6 +135,9 @@ const MODAL_CHANNEL_TYPE = 69;
 const KILO_CHANNEL_TYPE = 70;
 const TYPESAFE_CHANNEL_TYPE = 71;
 const MIMO_CHANNEL_TYPE = 72;
+const CLINE_CHANNEL_TYPE = 73;
+const XFYUN_MAAS_CHANNEL_TYPE = 74;
+const isSelfHostedChannel = (type) => [75, 76].includes(Number(type));
 const MIMO_TEST_MODEL = 'mimo-v2.6-pro-ultraspeed';
 
 const isVertexChannel = (type) => Number(type) === VERTEX_CHANNEL_TYPE;
@@ -145,6 +149,9 @@ const getServiceAccountKeyType = (type, keyType) =>
 function type2secretPrompt(type) {
   // inputs.type === 15 ? '按照如下格式输入：APIKey|SecretKey' : (inputs.type === 18 ? '按照如下格式输入：APPID|APISecret|APIKey' : '请输入渠道对应的鉴权密钥')
   switch (type) {
+    case 75:
+    case 76:
+      return '上游 API Key（可选）';
     case 15:
       return '按照如下格式输入：APIKey|SecretKey';
     case 18:
@@ -230,9 +237,11 @@ const EditChannelModal = (props) => {
     allow_safety_identifier: false,
     allow_include_obfuscation: false,
     remove_gif_images_enabled: true,
-    mistral_console_code_interpreter_enabled: true,
-    mistral_console_image_generation_enabled: true,
-    mistral_console_web_search_enabled: true,
+    mistral_console_code_interpreter_enabled: false,
+    mistral_console_image_generation_enabled: false,
+    mistral_console_web_search_enabled: false,
+    opencode_client_headers_enabled: true,
+    opencode_auto_sync_free_models_enabled: false,
     conversation_log_enabled: false,
     allow_inference_geo: false,
     allow_speed: false,
@@ -243,9 +252,11 @@ const EditChannelModal = (props) => {
     modal_keepalive_interval_seconds: 30,
     openrouter_auto_sync_free_and_alpha_models_enabled: false,
     openrouter_free_model_name_simplification_enabled: false,
+    clear_key: false,
     kilo_anonymous_enabled: false,
     kilo_auto_sync_free_models_enabled: false,
     kilo_free_model_name_simplification_enabled: false,
+    cline_auto_sync_free_models_enabled: true,
     upstream_model_update_check_enabled: false,
     upstream_model_update_auto_sync_enabled: false,
     upstream_model_update_last_check_time: 0,
@@ -260,6 +271,9 @@ const EditChannelModal = (props) => {
   const isKiloAnonymous =
     inputs.type === KILO_CHANNEL_TYPE && inputs.kilo_anonymous_enabled;
   const isManagedFreeSync =
+    (inputs.type === 63 && inputs.opencode_auto_sync_free_models_enabled) ||
+    (inputs.type === CLINE_CHANNEL_TYPE &&
+      inputs.cline_auto_sync_free_models_enabled !== false) ||
     (inputs.type === 20 &&
       inputs.openrouter_auto_sync_free_and_alpha_models_enabled) ||
     (inputs.type === KILO_CHANNEL_TYPE &&
@@ -630,18 +644,22 @@ const EditChannelModal = (props) => {
     ) {
       return;
     }
-    if (formApiRef.current) {
-      formApiRef.current.setValue(name, value);
-    }
     if (name === 'models' && Array.isArray(value)) {
       value = Array.from(new Set(value.map((m) => (m || '').trim())));
+      if (inputs.type === CLINE_CHANNEL_TYPE) {
+        value = collapseClineMappedModels(value, inputs.model_mapping);
+      }
+    }
+    if (formApiRef.current) {
+      formApiRef.current.setValue(name, value);
     }
 
     if (
       name === 'base_url' &&
       value.endsWith('/v1') &&
       inputs.type !== TYPESAFE_CHANNEL_TYPE &&
-      inputs.type !== MIMO_CHANNEL_TYPE
+      inputs.type !== MIMO_CHANNEL_TYPE &&
+      inputs.type !== CLINE_CHANNEL_TYPE
     ) {
       Modal.confirm({
         title: '警告',
@@ -657,6 +675,35 @@ const EditChannelModal = (props) => {
     if (name === 'type') {
       let localModels = [];
       switch (value) {
+        case XFYUN_MAAS_CHANNEL_TYPE:
+          localModels = getChannelModels(value);
+          setInputs((prev) => ({
+            ...prev,
+            base_url: 'https://maas-api.cn-huabei-1.xf-yun.com',
+            models: [],
+            upstream_model_update_check_enabled: false,
+            upstream_model_update_auto_sync_enabled: false,
+          }));
+          formApiRef.current?.setValue('base_url', 'https://maas-api.cn-huabei-1.xf-yun.com');
+          formApiRef.current?.setValue('models', []);
+          formApiRef.current?.setValue('upstream_model_update_check_enabled', false);
+          formApiRef.current?.setValue('upstream_model_update_auto_sync_enabled', false);
+          break;
+        case CLINE_CHANNEL_TYPE:
+          localModels = [];
+          setInputs((prev) => ({
+            ...prev,
+            base_url: 'https://api.cline.bot/api',
+            models: [],
+            cline_auto_sync_free_models_enabled: true,
+          }));
+          formApiRef.current?.setValue('base_url', 'https://api.cline.bot/api');
+          formApiRef.current?.setValue('models', []);
+          formApiRef.current?.setValue(
+            'cline_auto_sync_free_models_enabled',
+            true,
+          );
+          break;
         case MIMO_CHANNEL_TYPE:
           localModels = getChannelModels(value);
           if (!isEdit) {
@@ -741,8 +788,13 @@ const EditChannelModal = (props) => {
           localModels = getChannelModels(value);
           break;
       }
-      if (value !== MODAL_CHANNEL_TYPE &&
-        value !== KILO_CHANNEL_TYPE && inputs.models.length === 0) {
+      if (
+        value !== MODAL_CHANNEL_TYPE &&
+        value !== KILO_CHANNEL_TYPE &&
+        value !== CLINE_CHANNEL_TYPE &&
+        value !== XFYUN_MAAS_CHANNEL_TYPE &&
+        inputs.models.length === 0
+      ) {
         setInputs((inputs) => ({ ...inputs, models: localModels }));
       }
       setBasicModels(localModels);
@@ -1006,11 +1058,15 @@ const EditChannelModal = (props) => {
           data.remove_gif_images_enabled =
             parsedSettings.remove_gif_images_enabled !== false;
           data.mistral_console_code_interpreter_enabled =
-            parsedSettings.mistral_console_code_interpreter_enabled !== false;
+            parsedSettings.mistral_console_code_interpreter_enabled === true;
           data.mistral_console_image_generation_enabled =
-            parsedSettings.mistral_console_image_generation_enabled !== false;
+            parsedSettings.mistral_console_image_generation_enabled === true;
           data.mistral_console_web_search_enabled =
-            parsedSettings.mistral_console_web_search_enabled !== false;
+            parsedSettings.mistral_console_web_search_enabled === true;
+          data.opencode_client_headers_enabled =
+            parsedSettings.opencode_client_headers_enabled !== false;
+          data.opencode_auto_sync_free_models_enabled =
+            parsedSettings.opencode_auto_sync_free_models_enabled === true;
           data.conversation_log_enabled =
             parsedSettings.conversation_log_enabled === true;
           data.allow_inference_geo =
@@ -1038,6 +1094,8 @@ const EditChannelModal = (props) => {
             parsedSettings.kilo_auto_sync_free_models_enabled === true;
           data.kilo_free_model_name_simplification_enabled =
             parsedSettings.kilo_free_model_name_simplification_enabled === true;
+          data.cline_auto_sync_free_models_enabled =
+            parsedSettings.cline_auto_sync_free_models_enabled !== false;
           data.openrouter_free_model_name_simplification_enabled =
             parsedSettings.openrouter_free_model_name_simplification_enabled ===
             true;
@@ -1069,9 +1127,11 @@ const EditChannelModal = (props) => {
           data.allow_safety_identifier = false;
           data.allow_include_obfuscation = false;
           data.remove_gif_images_enabled = true;
-          data.mistral_console_code_interpreter_enabled = true;
-          data.mistral_console_image_generation_enabled = true;
-          data.mistral_console_web_search_enabled = true;
+          data.mistral_console_code_interpreter_enabled = false;
+          data.mistral_console_image_generation_enabled = false;
+          data.mistral_console_web_search_enabled = false;
+          data.opencode_client_headers_enabled = true;
+          data.opencode_auto_sync_free_models_enabled = false;
           data.conversation_log_enabled = false;
           data.allow_inference_geo = false;
           data.allow_speed = false;
@@ -1085,6 +1145,7 @@ const EditChannelModal = (props) => {
           data.kilo_anonymous_enabled = false;
           data.kilo_auto_sync_free_models_enabled = false;
           data.kilo_free_model_name_simplification_enabled = false;
+          data.cline_auto_sync_free_models_enabled = true;
           data.upstream_model_update_check_enabled = false;
           data.upstream_model_update_auto_sync_enabled = false;
           data.upstream_model_update_last_check_time = 0;
@@ -1101,9 +1162,11 @@ const EditChannelModal = (props) => {
         data.allow_safety_identifier = false;
         data.allow_include_obfuscation = false;
         data.remove_gif_images_enabled = true;
-        data.mistral_console_code_interpreter_enabled = true;
-        data.mistral_console_image_generation_enabled = true;
-        data.mistral_console_web_search_enabled = true;
+        data.mistral_console_code_interpreter_enabled = false;
+        data.mistral_console_image_generation_enabled = false;
+        data.mistral_console_web_search_enabled = false;
+        data.opencode_client_headers_enabled = true;
+        data.opencode_auto_sync_free_models_enabled = false;
         data.conversation_log_enabled = false;
         data.allow_inference_geo = false;
         data.allow_speed = false;
@@ -1117,6 +1180,7 @@ const EditChannelModal = (props) => {
         data.kilo_anonymous_enabled = false;
         data.kilo_auto_sync_free_models_enabled = false;
         data.kilo_free_model_name_simplification_enabled = false;
+        data.cline_auto_sync_free_models_enabled = true;
         data.upstream_model_update_check_enabled = false;
         data.upstream_model_update_auto_sync_enabled = false;
         data.upstream_model_update_last_check_time = 0;
@@ -1133,6 +1197,7 @@ const EditChannelModal = (props) => {
       }
 
       initialBaseUrlRef.current = data.base_url || '';
+      data.clear_key = false;
       setInputs(data);
       if (formApiRef.current) {
         formApiRef.current.setValues(data);
@@ -1193,12 +1258,22 @@ const EditChannelModal = (props) => {
     let err = false;
     let errorMessage = '';
 
-    if (isEdit) {
+    if (isEdit && !(isSelfHostedChannel(inputs.type) && inputs.clear_key)) {
       // 如果是编辑模式，使用已有的 channelId 获取模型列表
       try {
         const res = await API.get('/api/channel/fetch_models/' + channelId, {
           params:
-            inputs.type === KILO_CHANNEL_TYPE
+            inputs.type === 63
+              ? {
+                  opencode_free_only:
+                    !!inputs.opencode_auto_sync_free_models_enabled,
+                }
+              : inputs.type === CLINE_CHANNEL_TYPE
+              ? {
+                  cline_free_only:
+                    inputs.cline_auto_sync_free_models_enabled !== false,
+                }
+              : inputs.type === KILO_CHANNEL_TYPE
               ? {
                   kilo_free_only: !!inputs.kilo_auto_sync_free_models_enabled,
                 }
@@ -1217,7 +1292,10 @@ const EditChannelModal = (props) => {
       }
     } else {
       // 如果是新建模式，通过后端代理获取模型列表
-      let fetchKey = inputs?.['key'] || '';
+      let fetchKey =
+        isSelfHostedChannel(inputs.type) && inputs.clear_key
+          ? ''
+          : inputs?.['key'] || '';
       if (
         isVertexChannel(inputs.type) &&
         getServiceAccountKeyType(inputs.type, inputs.vertex_key_type) === 'json'
@@ -1244,7 +1322,7 @@ const EditChannelModal = (props) => {
         }
       }
 
-      if (!fetchKey && !isKiloAnonymous) {
+      if (!fetchKey && !isKiloAnonymous && !isSelfHostedChannel(inputs.type)) {
         errorMessage = errorMessage || t('请填写密钥');
         err = true;
       } else {
@@ -1265,6 +1343,12 @@ const EditChannelModal = (props) => {
                 inputs.type === KILO_CHANNEL_TYPE &&
                 !!inputs.kilo_auto_sync_free_models_enabled,
               kilo_anonymous_enabled: isKiloAnonymous,
+              opencode_free_only:
+                inputs.type === 63 && !!inputs.opencode_auto_sync_free_models_enabled,
+              cline_free_only:
+                inputs.type === CLINE_CHANNEL_TYPE
+                  ? inputs.cline_auto_sync_free_models_enabled !== false
+                  : undefined,
             },
             { skipErrorHandler: true },
           );
@@ -1736,6 +1820,15 @@ const EditChannelModal = (props) => {
   const submit = async () => {
     const formValues = formApiRef.current ? formApiRef.current.getValues() : {};
     let localInputs = { ...formValues };
+    if (isSelfHostedChannel(localInputs.type)) {
+      if (!isEdit && batch && !(localInputs.key || '').trim()) {
+        showInfo(t('无上游密钥时仅支持单渠道创建'));
+        return;
+      }
+      if (isEdit && localInputs.clear_key) delete localInputs.key;
+    } else {
+      delete localInputs.clear_key;
+    }
     localInputs.param_override = inputs.param_override;
     const kiloAnonymous =
       localInputs.type === KILO_CHANNEL_TYPE &&
@@ -1853,7 +1946,11 @@ const EditChannelModal = (props) => {
     }
     delete localInputs.vertex_files;
 
-    if (!isEdit && (!localInputs.name || !localInputs.key)) {
+    if (
+      !isEdit &&
+      (!localInputs.name ||
+        (!localInputs.key && !isSelfHostedChannel(localInputs.type)))
+    ) {
       showInfo(t('请填写渠道名称和渠道密钥！'));
       return;
     }
@@ -1862,7 +1959,9 @@ const EditChannelModal = (props) => {
       return;
     }
     if (
-      (localInputs.type === 45 || localInputs.type === MODAL_CHANNEL_TYPE) &&
+      (localInputs.type === 45 ||
+        localInputs.type === MODAL_CHANNEL_TYPE ||
+        isSelfHostedChannel(localInputs.type)) &&
       (!localInputs.base_url || localInputs.base_url.trim() === '')
     ) {
       showInfo(t('请输入API地址！'));
@@ -1991,6 +2090,21 @@ const EditChannelModal = (props) => {
     }
 
     // type === 20: 设置企业账户标识，无论是true还是false都要传到后端
+    if (localInputs.type === 63) {
+      settings.opencode_auto_sync_free_models_enabled =
+        localInputs.opencode_auto_sync_free_models_enabled === true;
+    } else {
+      delete settings.opencode_auto_sync_free_models_enabled;
+    }
+    if (localInputs.type === CLINE_CHANNEL_TYPE) {
+      settings.cline_auto_sync_free_models_enabled =
+        localInputs.cline_auto_sync_free_models_enabled !== false;
+    } else {
+      delete settings.cline_auto_sync_free_models_enabled;
+      delete settings.cline_free_model_managed_models;
+      delete settings.cline_model_generated_mappings;
+      delete settings.cline_free_model_pending_mappings;
+    }
     if (localInputs.type === KILO_CHANNEL_TYPE) {
       settings.kilo_anonymous_enabled = kiloAnonymous;
       settings.kilo_auto_sync_free_models_enabled =
@@ -2089,15 +2203,21 @@ const EditChannelModal = (props) => {
     }
     if (localInputs.type === MISTRAL_CONSOLE_CHANNEL_TYPE) {
       settings.mistral_console_code_interpreter_enabled =
-        localInputs.mistral_console_code_interpreter_enabled !== false;
+        localInputs.mistral_console_code_interpreter_enabled === true;
       settings.mistral_console_image_generation_enabled =
-        localInputs.mistral_console_image_generation_enabled !== false;
+        localInputs.mistral_console_image_generation_enabled === true;
       settings.mistral_console_web_search_enabled =
-        localInputs.mistral_console_web_search_enabled !== false;
+        localInputs.mistral_console_web_search_enabled === true;
     } else {
       delete settings.mistral_console_code_interpreter_enabled;
       delete settings.mistral_console_image_generation_enabled;
       delete settings.mistral_console_web_search_enabled;
+    }
+    if ([63, 64].includes(localInputs.type)) {
+      settings.opencode_client_headers_enabled =
+        localInputs.opencode_client_headers_enabled !== false;
+    } else {
+      delete settings.opencode_client_headers_enabled;
     }
     if (isRoot()) {
       settings.conversation_log_enabled =
@@ -2120,8 +2240,13 @@ const EditChannelModal = (props) => {
     if (
       !Array.isArray(settings.upstream_model_update_last_detected_models) ||
       (!settings.upstream_model_update_check_enabled &&
+        !settings.opencode_auto_sync_free_models_enabled &&
         !settings.openrouter_auto_sync_free_and_alpha_models_enabled &&
-        !settings.kilo_auto_sync_free_models_enabled)
+        !settings.kilo_auto_sync_free_models_enabled &&
+        !(
+          localInputs.type === CLINE_CHANNEL_TYPE &&
+          settings.cline_auto_sync_free_models_enabled !== false
+        ))
     ) {
       settings.upstream_model_update_last_detected_models = [];
     }
@@ -2158,6 +2283,8 @@ const EditChannelModal = (props) => {
     delete localInputs.mistral_console_code_interpreter_enabled;
     delete localInputs.mistral_console_image_generation_enabled;
     delete localInputs.mistral_console_web_search_enabled;
+    delete localInputs.opencode_client_headers_enabled;
+    delete localInputs.opencode_auto_sync_free_models_enabled;
     delete localInputs.conversation_log_enabled;
     delete localInputs.allow_inference_geo;
     delete localInputs.allow_speed;
@@ -2171,6 +2298,7 @@ const EditChannelModal = (props) => {
     delete localInputs.kilo_anonymous_enabled;
     delete localInputs.kilo_auto_sync_free_models_enabled;
     delete localInputs.kilo_free_model_name_simplification_enabled;
+    delete localInputs.cline_auto_sync_free_models_enabled;
     delete localInputs.upstream_model_update_check_enabled;
     delete localInputs.upstream_model_update_auto_sync_enabled;
     delete localInputs.upstream_model_update_last_check_time;
@@ -2203,8 +2331,27 @@ const EditChannelModal = (props) => {
         : 0;
     }
     localInputs.auto_ban = localInputs.auto_ban ? 1 : 0;
+    const preserveClineModels =
+      isEdit &&
+      localInputs.type === CLINE_CHANNEL_TYPE &&
+      localInputs.models.length === initialModelsRef.current.length &&
+      localInputs.models.every(
+        (model, index) => model === initialModelsRef.current[index],
+      );
     localInputs.models = localInputs.models.join(',');
     localInputs.group = (localInputs.groups || []).join(',');
+    if (preserveClineModels) {
+      // Background sync may have updated the list while this form was open.
+      delete localInputs.models;
+    }
+    if (
+      isEdit &&
+      localInputs.type === CLINE_CHANNEL_TYPE &&
+      (localInputs.model_mapping || '').trim() ===
+        (initialModelMappingRef.current || '').trim()
+    ) {
+      delete localInputs.model_mapping;
+    }
 
     let mode = 'single';
     if (batch) {
@@ -2564,7 +2711,41 @@ const EditChannelModal = (props) => {
                   <Text className='text-sm font-medium text-gray-500 mb-3 block'>
                     {t('上游模型管理')}
                   </Text>
+                  {inputs.type === 63 && (
+                    <Form.Switch
+                      field='opencode_auto_sync_free_models_enabled'
+                      label={t('自动更新 OpenCode 免费模型列表')}
+                      checkedText={t('开')}
+                      uncheckedText={t('关')}
+                      onChange={(value) =>
+                        handleChannelOtherSettingsChange(
+                          'opencode_auto_sync_free_models_enabled',
+                          value,
+                        )
+                      }
+                      extraText={t(
+                        '默认关闭，开启后定时增删 OpenCode Zen 的免费对话模型，保留其他模型和手动映射；不自动加入 JEV 等非对话模型，站内计费使用现有定价。',
+                      )}
+                    />
+                  )}
 
+                  {inputs.type === CLINE_CHANNEL_TYPE && (
+                    <Form.Switch
+                      field='cline_auto_sync_free_models_enabled'
+                      label={t('自动更新 Cline 免费模型列表')}
+                      checkedText={t('开')}
+                      uncheckedText={t('关')}
+                      onChange={(value) =>
+                        handleChannelOtherSettingsChange(
+                          'cline_auto_sync_free_models_enabled',
+                          value,
+                        )
+                      }
+                      extraText={t(
+                        '默认开启，自动增删 Cline 官方免费专区模型，保留其他手动模型和映射；站内计费使用现有定价。',
+                      )}
+                    />
+                  )}
                   {inputs.type === KILO_CHANNEL_TYPE && (
                     <>
                       <Form.Switch
@@ -2642,7 +2823,11 @@ const EditChannelModal = (props) => {
                     label={t('是否检测上游模型更新')}
                     checkedText={t('开')}
                     uncheckedText={t('关')}
-                    disabled={isManagedFreeSync}
+                    disabled={
+                      isManagedFreeSync ||
+                      (inputs.type === XFYUN_MAAS_CHANNEL_TYPE &&
+                        !inputs.custom_model_list_url?.trim())
+                    }
                     onChange={(value) =>
                       handleChannelOtherSettingsChange(
                         'upstream_model_update_check_enabled',
@@ -2651,7 +2836,11 @@ const EditChannelModal = (props) => {
                     }
                     extraText={t(
                       isManagedFreeSync
-                        ? inputs.type === KILO_CHANNEL_TYPE
+                        ? inputs.type === 63
+                          ? 'OpenCode 免费模型同步已开启，全部模型巡检设置暂时停用'
+                          : inputs.type === CLINE_CHANNEL_TYPE
+                          ? 'Cline 免费模型同步已开启，全部模型巡检设置暂时停用'
+                          : inputs.type === KILO_CHANNEL_TYPE
                           ? 'Kilo 免费模型同步已开启，全部模型巡检设置暂时停用'
                           : 'OpenRouter 免费及 Alpha 测试模型同步已开启，全部模型巡检设置暂时停用'
                         : '开启后由后端定时任务检测该渠道上游模型变化',
@@ -3088,10 +3277,39 @@ const EditChannelModal = (props) => {
                     />
                   )}
 
+                  {[63, 64].includes(inputs.type) && (
+                    <Form.Switch
+                      field='opencode_client_headers_enabled'
+                      label={t('统一使用 OpenCode 客户端标识')}
+                      checkedText={t('开')}
+                      uncheckedText={t('关')}
+                      onChange={(value) =>
+                        handleChannelOtherSettingsChange(
+                          'opencode_client_headers_enabled',
+                          value,
+                        )
+                      }
+                      extraText={t(
+                        '默认开启，在请求头覆盖处理完成后统一使用 OpenCode 客户端身份，并生成会话、请求标识。关闭后可自定义身份；鉴权和其他自定义头保持生效。',
+                      )}
+                    />
+                  )}
+
+                  {inputs.type === 63 && (
+                    <div className='text-xs text-gray-500'>
+                      {t(
+                        'Zen 免费对话模型始终使用上游流式请求并补充必要的工具声明，保留调用方原有工具；全局或渠道请求体透传不会关闭此兼容处理。',
+                      )}
+                    </div>
+                  )}
+
                   {inputs.type === MISTRAL_CONSOLE_CHANNEL_TYPE && (
                     <>
                       <div className='mt-4 mb-2 text-sm font-medium text-gray-700'>
                         {t('内置工具')}
+                      </div>
+                      <div className='mb-2 text-xs text-gray-500'>
+                        {t('内置工具仅对支持的模型生效，不支持的模型会自动跳过。')}
                       </div>
                       <Form.Switch
                         field='mistral_console_code_interpreter_enabled'
@@ -3105,7 +3323,7 @@ const EditChannelModal = (props) => {
                           )
                         }
                         extraText={t(
-                          '允许模型运行代码进行计算、数据处理和文件分析，默认开启。',
+                          '允许模型运行代码进行计算、数据处理和文件分析，默认关闭。',
                         )}
                       />
                       <Form.Switch
@@ -3120,7 +3338,7 @@ const EditChannelModal = (props) => {
                           )
                         }
                         extraText={t(
-                          '允许模型根据提示词生成图片，默认开启。',
+                          '允许模型根据提示词生成图片，默认关闭。',
                         )}
                       />
                       <Form.Switch
@@ -3135,7 +3353,7 @@ const EditChannelModal = (props) => {
                           )
                         }
                         extraText={t(
-                          '允许模型搜索网页并获取最新信息，默认开启。',
+                          '允许模型搜索网页并获取最新信息，默认关闭。',
                         )}
                       />
                     </>
@@ -3153,7 +3371,24 @@ const EditChannelModal = (props) => {
                   )}
 
                   <Form.Input field='proxy' label={t('代理地址')} placeholder={t('例如: socks5://user:pass@host:port')} onChange={(value) => handleChannelSettingsChange('proxy', value)} showClear extraText={t('用于配置网络代理，支持 socks5 协议')} />
-                  <Form.Input field='custom_model_list_url' label={t('自定义模型列表 API')} placeholder={t('例如：https://api.kilo.ai/api/gateway/models')} onChange={(value) => handleChannelOtherSettingsChange('custom_model_list_url', value)} showClear extraText={t('留空使用默认模型列表接口，例如 {base_url}/v1/models')} />
+                  <Form.Input
+                    field='custom_model_list_url'
+                    label={t('自定义模型列表 API')}
+                    placeholder={t('例如：https://api.kilo.ai/api/gateway/models')}
+                    onChange={(value) =>
+                      handleChannelOtherSettingsChange(
+                        'custom_model_list_url',
+                        value,
+                      )
+                    }
+                    showClear
+                    extraText={t(
+                      inputs.type === CLINE_CHANNEL_TYPE &&
+                        inputs.cline_auto_sync_free_models_enabled !== false
+                        ? '留空使用 Cline 官方免费目录；自定义接口须返回 free 数组，每项包含 id。'
+                        : '留空使用默认模型列表接口，例如 {base_url}/v1/models',
+                    )}
+                  />
 
                   <Form.TextArea field='system_prompt' label={t('系统提示词')} placeholder={t('输入系统提示词，用户的系统提示词将优先于此设置')} onChange={(value) => handleChannelSettingsChange('system_prompt', value)} autosize showClear extraText={t('用户优先：如果用户在请求中指定了系统提示词，将优先使用用户的设置')} />
                   <Form.Switch field='system_prompt_override' label={t('系统提示词拼接')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelSettingsChange('system_prompt_override', value)} extraText={t('如果用户请求中包含系统提示词，则使用此设置拼接到用户的系统提示词前面')} />
@@ -3724,9 +3959,14 @@ const EditChannelModal = (props) => {
                                     )
                                 : t(type2secretPrompt(inputs.type))
                             }
-                            disabled={isKiloAnonymous}
+                            disabled={
+                              isKiloAnonymous ||
+                              (isSelfHostedChannel(inputs.type) && inputs.clear_key)
+                            }
                             rules={
-                              isEdit || isKiloAnonymous
+                              isEdit ||
+                              isKiloAnonymous ||
+                              isSelfHostedChannel(inputs.type)
                                 ? []
                                 : [{ required: true, message: t('请输入密钥') }]
                             }
@@ -3879,6 +4119,18 @@ const EditChannelModal = (props) => {
                       />
                     )}
 
+                    {isEdit &&
+                      isSelfHostedChannel(inputs.type) &&
+                      !isMultiKeyChannel && (
+                      <Form.Switch
+                        field='clear_key'
+                        label={t('清除上游密钥')}
+                        extraText={t(
+                          '保存后删除现有上游密钥；未开启时留空表示保留密钥。',
+                        )}
+                        onChange={(value) => handleInputChange('clear_key', value)}
+                      />
+                    )}
                     {inputs.type === 1 && (
                       <Form.Input
                         field='openai_organization'
@@ -4011,6 +4263,15 @@ const EditChannelModal = (props) => {
                         />
                       )}
 
+                      {isSelfHostedChannel(inputs.type) && (
+                        <Banner
+                          type='info'
+                          description={t(
+                            'vLLM / LiteLLM 支持 Chat Completions 和 Responses。填写部署地址，可包含路径前缀、/v1 或完整接口路径；上游未启用鉴权时密钥可留空。模型可获取或手动填写，简称请配置模型映射。Qwen3.8 的 high 将映射为 medium。',
+                          )}
+                          className='!rounded-lg'
+                        />
+                      )}
                       {inputs.type === MODAL_CHANNEL_TYPE && (
                         <Banner
                           type='info'
@@ -4026,6 +4287,25 @@ const EditChannelModal = (props) => {
                           type='info'
                           description={t(
                             'TypeSafe 默认地址为 https://api.typesafe.ai，支持 /v1/systemone 原生评估和模型列表获取，不支持聊天或流式请求。',
+                          )}
+                          className='!rounded-lg'
+                        />
+                      )}
+
+                      {inputs.type === CLINE_CHANNEL_TYPE && (
+                        <Banner
+                          type='info'
+                          description={t(
+                            'Cline 默认地址为 https://api.cline.bot/api，支持普通及流式对话；开启免费模型同步时仅获取官方免费专区模型。',
+                          )}
+                          className='!rounded-lg'
+                        />
+                      )}
+                      {inputs.type === XFYUN_MAAS_CHANNEL_TYPE && (
+                        <Banner
+                          type='info'
+                          description={t(
+                            '讯飞星辰 MaaS：填写 APIKEY，可在同一渠道添加该密钥已启用的多个模型 ID；支持模型映射。模型预设不代表授权列表，请手动选择。支持 Chat、Responses、Anthropic、视觉、向量和重排序；生图仅支持单张 Base64，Kolors 请另建渠道使用 xingchen-api 域名。测试时请选择对应接口，价格需自行配置。',
                           )}
                           className='!rounded-lg'
                         />
@@ -4104,8 +4384,12 @@ const EditChannelModal = (props) => {
                                   : t('API地址')
                               }
                               placeholder={
-                                inputs.type === TYPESAFE_CHANNEL_TYPE
+                                isSelfHostedChannel(inputs.type)
+                                  ? 'https://your-server.example/prefix/v1'
+                                  : inputs.type === TYPESAFE_CHANNEL_TYPE
                                   ? 'https://api.typesafe.ai'
+                                  : inputs.type === CLINE_CHANNEL_TYPE
+                                  ? 'https://api.cline.bot/api'
                                   : inputs.type === MIMO_CHANNEL_TYPE
                                   ? 'https://api.xiaomimimo.com'
                                   : inputs.type === KILO_CHANNEL_TYPE
@@ -4117,11 +4401,14 @@ const EditChannelModal = (props) => {
                                     )
                               }
                               rules={
-                                inputs.type === MODAL_CHANNEL_TYPE
+                                inputs.type === MODAL_CHANNEL_TYPE ||
+                                isSelfHostedChannel(inputs.type)
                                   ? [
                                       {
                                         required: true,
-                                        message: t('请输入 Modal 部署地址'),
+                                        message: inputs.type === MODAL_CHANNEL_TYPE
+                                          ? t('请输入 Modal 部署地址')
+                                          : t('请输入API地址！'),
                                       },
                                     ]
                                   : []
@@ -4132,7 +4419,11 @@ const EditChannelModal = (props) => {
                               showClear
                               disabled={isIonetLocked}
                               extraText={
-                                inputs.type === MODAL_CHANNEL_TYPE
+                                isSelfHostedChannel(inputs.type)
+                                  ? t(
+                                      '请填写上游模型的完整名称，或使用模型映射配置别名。',
+                                    )
+                                  : inputs.type === MODAL_CHANNEL_TYPE
                                   ? t(
                                       '模型由你的 Modal 部署决定，可手动填写或尝试获取模型列表。',
                                     )
