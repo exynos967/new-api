@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -57,6 +58,49 @@ func ValidateRegionConfig(other string) error {
 		}
 	}
 	return nil
+}
+
+// ResolveModelListRegions 提取区域配置中的全部去重区域（升序），用于按区域合并拉取模型列表。
+// 纯字符串配置返回单区域；JSON 映射返回其全部有效区域（不要求包含 default）；空配置等价于 global。
+func ResolveModelListRegions(other string) ([]string, error) {
+	other = strings.TrimSpace(other)
+	if other == "" {
+		return []string{"global"}, nil
+	}
+	if !common.IsJsonObject(other) {
+		region, err := validateVertexRegion(other)
+		if err != nil {
+			return nil, err
+		}
+		return []string{region}, nil
+	}
+	regionMap, err := parseVertexRegionMap(other)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Vertex region mapping: %w", err)
+	}
+	regions := make([]string, 0, len(regionMap))
+	seen := make(map[string]struct{}, len(regionMap))
+	for modelName, rawRegion := range regionMap {
+		region, ok := rawRegion.(string)
+		if !ok {
+			return nil, fmt.Errorf("Vertex region for %q must be a string", modelName)
+		}
+		region, err = validateVertexRegion(region)
+		if err != nil {
+			return nil, fmt.Errorf("Vertex region for %q is invalid: %w", modelName, err)
+		}
+		if _, exists := seen[region]; exists {
+			continue
+		}
+		seen[region] = struct{}{}
+		regions = append(regions, region)
+	}
+	if len(regions) == 0 {
+		// 空映射按既有的 ResolveModelRegion 行为回退到 global
+		return []string{"global"}, nil
+	}
+	sort.Strings(regions)
+	return regions, nil
 }
 
 func ResolveModelRegion(other string, localModelName string) (string, error) {

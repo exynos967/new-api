@@ -56,7 +56,9 @@ func FetchGoogleModels(ctx context.Context, baseURL, credentialJSON, regionConfi
 	if err != nil {
 		return nil, err
 	}
-	region, err := ResolveModelRegion(regionConfig, "")
+	// 多区域映射时分别拉取各区域的模型名单并合并去重：
+	// Google 各区域上架的模型不完全一致，单取 default 区域会漏掉限定区域的模型
+	regions, err := ResolveModelListRegions(regionConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -74,70 +76,79 @@ func FetchGoogleModels(ctx context.Context, baseURL, credentialJSON, regionConfi
 		return nil, fmt.Errorf("new proxy http client failed: %w", err)
 	}
 
-	models := make([]string, 0)
-	seenModels := make(map[string]struct{})
+	modelSet := make(map[string]struct{})
+	for _, region := range regions {
+		if err := fetchGoogleModelsPageByPage(ctx, client, token, baseURL, region, modelSet); err != nil {
+			return nil, fmt.Errorf("fetch Vertex model list in region %s: %w", region, err)
+		}
+	}
+	if len(modelSet) == 0 {
+		return nil, errors.New("Vertex model list returned no Google publisher models")
+	}
+	models := make([]string, 0, len(modelSet))
+	for modelName := range modelSet {
+		models = append(models, modelName)
+	}
+	sort.Strings(models)
+	return models, nil
+}
+
+// fetchGoogleModelsPageByPage 分页拉取单个区域的 Google 发布方模型并把模型名写入 set（跨区域去重）。
+func fetchGoogleModelsPageByPage(ctx context.Context, client *http.Client, token, baseURL, region string, modelSet map[string]struct{}) error {
 	seenPageTokens := make(map[string]struct{})
 	pageToken := ""
 	for page := 0; page < maxModelListPages; page++ {
 		fetchURL, err := BuildGoogleModelsListURL(baseURL, region, pageToken)
 		if err != nil {
-			return nil, fmt.Errorf("failed to build Vertex model list URL: %w", err)
+			return fmt.Errorf("failed to build Vertex model list URL: %w", err)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := client.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("request Vertex model list failed: %w", err)
+			return fmt.Errorf("request Vertex model list failed: %w", err)
 		}
 		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if readErr != nil {
-			return nil, fmt.Errorf("failed to read Vertex model list response: %w", readErr)
+			return fmt.Errorf("failed to read Vertex model list response: %w", readErr)
 		}
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 			var apiError googleAPIErrorResponse
 			if err := common.Unmarshal(body, &apiError); err == nil && strings.TrimSpace(apiError.Error.Message) != "" {
-				return nil, fmt.Errorf("Vertex model list returned HTTP %d: %s", resp.StatusCode, apiError.Error.Message)
+				return fmt.Errorf("Vertex model list returned HTTP %d: %s", resp.StatusCode, apiError.Error.Message)
 			}
-			return nil, fmt.Errorf("Vertex model list returned HTTP %d", resp.StatusCode)
+			return fmt.Errorf("Vertex model list returned HTTP %d", resp.StatusCode)
 		}
 
 		var result publisherModelsResponse
 		if err := common.Unmarshal(body, &result); err != nil {
-			return nil, fmt.Errorf("failed to decode Vertex model list response: %w", err)
+			return fmt.Errorf("failed to decode Vertex model list response: %w", err)
 		}
 		for _, item := range result.PublisherModels {
 			modelName, ok := normalizeGooglePublisherModelName(item.Name)
 			if !ok {
 				continue
 			}
-			if _, exists := seenModels[modelName]; exists {
-				continue
-			}
-			seenModels[modelName] = struct{}{}
-			models = append(models, modelName)
+			modelSet[modelName] = struct{}{}
 		}
 
 		nextPageToken := strings.TrimSpace(result.NextPageToken)
 		if nextPageToken == "" {
-			break
+			return nil
 		}
 		if _, exists := seenPageTokens[nextPageToken]; exists {
-			return nil, errors.New("Vertex model list returned a repeated page token")
+			return errors.New("Vertex model list returned a repeated page token")
 		}
 		seenPageTokens[nextPageToken] = struct{}{}
 		pageToken = nextPageToken
 		if page == maxModelListPages-1 {
-			return nil, fmt.Errorf("Vertex model list exceeded %d pages", maxModelListPages)
+			return fmt.Errorf("Vertex model list exceeded %d pages", maxModelListPages)
 		}
 	}
-	if len(models) == 0 {
-		return nil, errors.New("Vertex model list returned no Google publisher models")
-	}
-	sort.Strings(models)
-	return models, nil
+	return nil
 }

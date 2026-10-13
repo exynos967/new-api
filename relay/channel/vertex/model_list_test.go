@@ -2,6 +2,7 @@ package vertex
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -70,6 +71,81 @@ func TestFetchGoogleModelsPaginatesNormalizesAndSorts(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Equal(t, []string{"gemini-2.5-flash-001", "gemini-a", "gemini-z"}, models)
+}
+
+func TestResolveModelListRegions(t *testing.T) {
+	tests := []struct {
+		name  string
+		other string
+		want  []string
+	}{
+		{name: "empty falls back to global", other: "", want: []string{"global"}},
+		{name: "plain string stays single region", other: "us-central1", want: []string{"us-central1"}},
+		{name: "json map returns distinct sorted regions", other: `{"default":"us-central1","gemini-x":"us-east1","gemini-y":"us-central1"}`, want: []string{"us-central1", "us-east1"}},
+		{name: "empty map falls back to global", other: `{}`, want: []string{"global"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := ResolveModelListRegions(test.other)
+			require.NoError(t, err)
+			require.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestResolveModelListRegionsRejectsInvalidEntries(t *testing.T) {
+	for _, other := range []string{
+		`not-a-region!`,
+		`{"default":"us-central1","gemini-x": 1}`,
+		`{"default":"UPPER-CASE"}`,
+		`{broken`,
+	} {
+		_, err := ResolveModelListRegions(other)
+		require.Error(t, err, other)
+	}
+}
+
+func TestFetchGoogleModelsMergesModelsAcrossRegions(t *testing.T) {
+	withModelListTokenStub(t)
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1beta1/publishers/google/models", r.URL.Path)
+		requestCount++
+		_, _ = w.Write([]byte(fmt.Sprintf(`{
+            "publisherModels":[
+                {"name":"publishers/google/models/gemini-shared"},
+                {"name":"publishers/google/models/gemini-region-%d"}
+            ]
+        }`, requestCount)))
+	}))
+	defer server.Close()
+
+	models, err := FetchGoogleModels(
+		context.Background(),
+		server.URL,
+		modelListCredentialJSON(t),
+		`{"default":"us-central1","gemini-x":"us-east1"}`,
+		"",
+	)
+	require.NoError(t, err)
+	require.Equal(t, 2, requestCount)
+	require.Equal(t, []string{"gemini-region-1", "gemini-region-2", "gemini-shared"}, models)
+}
+
+func TestFetchGoogleModelsRepeatedPageTokenPerRegionIsIndependent(t *testing.T) {
+	withModelListTokenStub(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{
+            "publisherModels":[{"name":"publishers/google/models/gemini-a"}],
+            "nextPageToken":"same-token"
+        }`))
+	}))
+	defer server.Close()
+
+	_, err := FetchGoogleModels(context.Background(), server.URL, modelListCredentialJSON(t),
+		`{"default":"us-central1","gemini-x":"us-east1"}`, "")
+	require.ErrorContains(t, err, "region us-central1")
+	require.ErrorContains(t, err, "repeated page token")
 }
 
 func TestFetchGoogleModelsRejectsRepeatedPageToken(t *testing.T) {
