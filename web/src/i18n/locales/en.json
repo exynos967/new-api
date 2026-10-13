@@ -4590,5 +4590,10 @@
   "?????????????????????": "External users can view the site-wide model status page after enabled",
   "??????????": "The administrator has not enabled public embed",
   "?????%?": "Yellow threshold (%)",
-  "????????????": "Green threshold cannot be lower than yellow threshold"
+  "????????????": "Green threshold cannot be lower than yellow threshold",
+  "服务层级 (Service Tier)": "Service tier",
+  "请选择服务层级": "Please select a service tier",
+  "Gemini 官方原生模型的计费调度层级；Flex / Priority 会强制使用 global 区域，仅对 gemini-* 模型生效": "Billing scheduling tier for Gemini native models; Flex / Priority forces the global region and only applies to gemini-* models",
+  "PayGo-only（绕过预置吞吐量）": "PayGo-only (bypass Provisioned Throughput)",
+  "强制走共享按量计费通道，可与 Flex / Priority 叠加使用；仅对 gemini-* 模型生效": "Force the shared pay-as-you-go channel; can be combined with Flex / Priority and only applies to gemini-* models"
 }

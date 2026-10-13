@@ -4493,5 +4493,10 @@
   "?????????????????????": "Une fois activ?, les utilisateurs externes peuvent consulter la page de statut des mod?les du site",
   "??????????": "L'administrateur n'a pas activ? l'int?gration publique",
   "?????%?": "Seuil jaune (%)",
-  "????????????": "Le seuil vert ne peut pas ?tre inf?rieur au seuil jaune"
+  "????????????": "Le seuil vert ne peut pas ?tre inf?rieur au seuil jaune",
+  "服务层级 (Service Tier)": "Niveau de service",
+  "请选择服务层级": "Veuillez sélectionner un niveau de service",
+  "Gemini 官方原生模型的计费调度层级；Flex / Priority 会强制使用 global 区域，仅对 gemini-* 模型生效": "Niveau de facturation des modèles Gemini natifs ; Flex / Priority force la région global et ne s'applique qu'aux modèles gemini-*",
+  "PayGo-only（绕过预置吞吐量）": "PayGo uniquement (contourner Provisioned Throughput)",
+  "强制走共享按量计费通道，可与 Flex / Priority 叠加使用；仅对 gemini-* 模型生效": "Force le canal partagé à l'usage ; cumulable avec Flex / Priority et applicable uniquement aux modèles gemini-*"
 }

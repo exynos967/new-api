@@ -227,6 +227,9 @@ const EditChannelModal = (props) => {
     settings: '',
     // 仅 Vertex: 密钥格式（存入 settings.vertex_key_type）
     vertex_key_type: 'json',
+    // 仅 Vertex: 服务层级与 PayGo 调度（存入 settings.vertex_service_tier / vertex_paygo_only）
+    vertex_service_tier: 'standard',
+    vertex_paygo_only: false,
     // 仅 AWS: 密钥格式和区域（存入 settings.aws_key_type 和 settings.aws_region）
     aws_key_type: 'ak_sk',
     // 企业账户设置
@@ -1043,6 +1046,10 @@ const EditChannelModal = (props) => {
             parsedSettings.azure_responses_version || '';
           // 读取 Vertex 密钥格式
           data.vertex_key_type = parsedSettings.vertex_key_type || 'json';
+          // 读取 Vertex 服务层级与 PayGo 调度设置
+          data.vertex_service_tier =
+            parsedSettings.vertex_service_tier || 'standard';
+          data.vertex_paygo_only = parsedSettings.vertex_paygo_only === true;
           // 读取 AWS 密钥格式和区域
           data.aws_key_type = parsedSettings.aws_key_type || 'ak_sk';
           // 读取企业账户设置
@@ -2148,6 +2155,24 @@ const EditChannelModal = (props) => {
       delete settings.vertex_key_type;
     }
 
+    // Vertex: 保存服务层级与 PayGo 调度设置（standard / 关闭均为默认值，不落库）
+    if (isVertexChannel(localInputs.type)) {
+      const vertexServiceTier = localInputs.vertex_service_tier || 'standard';
+      if (vertexServiceTier === 'standard') {
+        delete settings.vertex_service_tier;
+      } else {
+        settings.vertex_service_tier = vertexServiceTier;
+      }
+      if (localInputs.vertex_paygo_only === true) {
+        settings.vertex_paygo_only = true;
+      } else {
+        delete settings.vertex_paygo_only;
+      }
+    } else {
+      delete settings.vertex_service_tier;
+      delete settings.vertex_paygo_only;
+    }
+
     const customModelListUrl = String(
       localInputs.custom_model_list_url || '',
     ).trim();
@@ -2272,6 +2297,9 @@ const EditChannelModal = (props) => {
     delete localInputs.is_enterprise_account;
     // 顶层的 vertex_key_type 不应发送给后端
     delete localInputs.vertex_key_type;
+    // 顶层的 Vertex 调度设置不应发送给后端
+    delete localInputs.vertex_service_tier;
+    delete localInputs.vertex_paygo_only;
     // 顶层的 aws_key_type 不应发送给后端
     delete localInputs.aws_key_type;
     // 清理字段透传控制的临时字段
@@ -3612,6 +3640,45 @@ const EditChannelModal = (props) => {
                             : t('JSON 模式支持手动输入或上传服务账号 JSON')
                         }
                       />
+                    )}
+                    {isVertexChannel(inputs.type) && (
+                      <>
+                        <Form.Select
+                          field='vertex_service_tier'
+                          label={t('服务层级 (Service Tier)')}
+                          placeholder={t('请选择服务层级')}
+                          optionList={[
+                            { label: 'Standard', value: 'standard' },
+                            { label: 'Flex', value: 'flex' },
+                            { label: 'Priority', value: 'priority' },
+                          ]}
+                          style={{ width: '100%' }}
+                          value={inputs.vertex_service_tier || 'standard'}
+                          onChange={(value) => {
+                            handleChannelOtherSettingsChange(
+                              'vertex_service_tier',
+                              value,
+                            );
+                          }}
+                          extraText={t(
+                            'Gemini 官方原生模型的计费调度层级；Flex / Priority 会强制使用 global 区域，仅对 gemini-* 模型生效',
+                          )}
+                        />
+                        <Form.Switch
+                          field='vertex_paygo_only'
+                          label={t('PayGo-only（绕过预置吞吐量）')}
+                          checked={inputs.vertex_paygo_only === true}
+                          onChange={(value) => {
+                            handleChannelOtherSettingsChange(
+                              'vertex_paygo_only',
+                              value,
+                            );
+                          }}
+                          extraText={t(
+                            '强制走共享按量计费通道，可与 Flex / Priority 叠加使用；仅对 gemini-* 模型生效',
+                          )}
+                        />
+                      </>
                     )}
                     {batch ? (
                       isServiceAccountChannel(inputs.type) &&
