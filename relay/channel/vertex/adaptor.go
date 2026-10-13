@@ -127,6 +127,10 @@ func (a *Adaptor) getRequestUrl(info *relaycommon.RelayInfo, modelName, suffix s
 	if err != nil {
 		return "", err
 	}
+	if a.serviceTierRequiresGlobal(info) {
+		// Flex / Priority 层级由 Google 在全球池调度，区域必须固定为 global
+		region = "global"
+	}
 	if info.ChannelOtherSettings.VertexKeyType != dto.VertexKeyTypeAPIKey {
 		adc, err := ParseCredentials(info.ApiKey)
 		if err != nil {
@@ -215,6 +219,7 @@ func (a *Adaptor) SetupRequestHeader(c *gin.Context, req *http.Header, info *rel
 	if strings.Contains(info.UpstreamModelName, "claude") {
 		claude.CommonClaudeHeadersOperation(c, req, info)
 	}
+	a.applyServiceTierHeaders(req, info)
 	return nil
 }
 

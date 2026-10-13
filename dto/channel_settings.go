@@ -48,6 +48,15 @@ const (
 	VertexKeyTypeAPIKey VertexKeyType = "api_key"
 )
 
+// VertexServiceTier Vertex AI 共享服务的计费调度层级（仅 gemini-* 官方原生模型生效）
+type VertexServiceTier string
+
+const (
+	VertexServiceTierStandard VertexServiceTier = "standard" // 默认标准层级
+	VertexServiceTierFlex     VertexServiceTier = "flex"     // 弹性低价层级（排队时间较长，仅 global 区域）
+	VertexServiceTierPriority VertexServiceTier = "priority" // 高优先级层级（仅 global 区域）
+)
+
 type AwsKeyType string
 
 const (
@@ -58,34 +67,36 @@ const (
 const ModalKeepaliveDefaultIntervalSeconds = 30
 
 type ChannelOtherSettings struct {
-	AzureResponsesVersion                 string        `json:"azure_responses_version,omitempty"`
-	VertexKeyType                         VertexKeyType `json:"vertex_key_type,omitempty"` // "json" or "api_key"
-	OpenRouterEnterprise                  *bool         `json:"openrouter_enterprise,omitempty"`
-	ClaudeBetaQuery                       bool          `json:"claude_beta_query,omitempty"`         // Claude 渠道是否强制追加 ?beta=true
-	AllowServiceTier                      bool          `json:"allow_service_tier,omitempty"`        // 是否允许 service_tier 透传（默认过滤以避免额外计费）
-	AllowInferenceGeo                     bool          `json:"allow_inference_geo,omitempty"`       // 是否允许 inference_geo 透传（仅 Claude，默认过滤以满足数据驻留合规
-	AllowSpeed                            bool          `json:"allow_speed,omitempty"`               // 是否允许 speed 透传（仅 Claude，默认过滤以避免意外切换推理速度模式）
-	AllowSafetyIdentifier                 bool          `json:"allow_safety_identifier,omitempty"`   // 是否允许 safety_identifier 透传（默认过滤以保护用户隐私）
-	DisableStore                          bool          `json:"disable_store,omitempty"`             // 是否禁用 store 透传（默认允许透传，禁用后可能导致 Codex 无法使用）
-	AllowIncludeObfuscation               bool          `json:"allow_include_obfuscation,omitempty"` // 是否允许 stream_options.include_obfuscation 透传（默认过滤以避免关闭流混淆保护）
-	RemoveGifImagesEnabled                *bool         `json:"remove_gif_images_enabled,omitempty"` // 是否移除 Gemini 不支持的 image/gif 输入（未配置时默认开启）
-	MistralConsoleCodeInterpreterEnabled  *bool         `json:"mistral_console_code_interpreter_enabled,omitempty"`
-	MistralConsoleImageGenerationEnabled  *bool         `json:"mistral_console_image_generation_enabled,omitempty"`
-	MistralConsoleWebSearchEnabled        *bool         `json:"mistral_console_web_search_enabled,omitempty"`
-	OpenCodeClientHeadersEnabled          *bool         `json:"opencode_client_headers_enabled,omitempty"` // 未配置时默认将客户端标识统一为 OpenCode
-	OpenCodeFreeModelSyncEnabled          bool          `json:"opencode_auto_sync_free_models_enabled,omitempty"`
-	XAICodexCompatibilityEnabled          bool          `json:"xai_codex_compatibility_enabled,omitempty"`
-	ConversationLogEnabled                bool          `json:"conversation_log_enabled,omitempty"` // Root-only: capture full conversation payloads for distillation
-	AwsKeyType                            AwsKeyType    `json:"aws_key_type,omitempty"`
-	CustomModelListURL                    string        `json:"custom_model_list_url,omitempty"`                      // 自定义模型列表 API 地址
-	ModalKeepaliveEnabled                 bool          `json:"modal_keepalive_enabled,omitempty"`                    // 是否定时请求 Modal 部署以避免实例冷却
-	ModalKeepaliveIntervalSeconds         int           `json:"modal_keepalive_interval_seconds,omitempty"`           // Modal 测活间隔（秒）
-	UpstreamModelUpdateCheckEnabled       bool          `json:"upstream_model_update_check_enabled,omitempty"`        // 是否检测上游模型更新
-	UpstreamModelUpdateAutoSyncEnabled    bool          `json:"upstream_model_update_auto_sync_enabled,omitempty"`    // 是否自动同步上游模型更新
-	UpstreamModelUpdateLastCheckTime      int64         `json:"upstream_model_update_last_check_time,omitempty"`      // 上次检测时间
-	UpstreamModelUpdateLastDetectedModels []string      `json:"upstream_model_update_last_detected_models,omitempty"` // 上次检测到的可加入模型
-	UpstreamModelUpdateLastRemovedModels  []string      `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
-	UpstreamModelUpdateIgnoredModels      []string      `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
+	AzureResponsesVersion                 string            `json:"azure_responses_version,omitempty"`
+	VertexKeyType                         VertexKeyType     `json:"vertex_key_type,omitempty"`     // "json" or "api_key"
+	VertexServiceTier                     VertexServiceTier `json:"vertex_service_tier,omitempty"` // Vertex AI 服务层级：standard/flex/priority
+	VertexPayGoOnly                       bool              `json:"vertex_paygo_only,omitempty"`   // 强制 PayGo 按量计费（绕过预置吞吐量）
+	OpenRouterEnterprise                  *bool             `json:"openrouter_enterprise,omitempty"`
+	ClaudeBetaQuery                       bool              `json:"claude_beta_query,omitempty"`         // Claude 渠道是否强制追加 ?beta=true
+	AllowServiceTier                      bool              `json:"allow_service_tier,omitempty"`        // 是否允许 service_tier 透传（默认过滤以避免额外计费）
+	AllowInferenceGeo                     bool              `json:"allow_inference_geo,omitempty"`       // 是否允许 inference_geo 透传（仅 Claude，默认过滤以满足数据驻留合规
+	AllowSpeed                            bool              `json:"allow_speed,omitempty"`               // 是否允许 speed 透传（仅 Claude，默认过滤以避免意外切换推理速度模式）
+	AllowSafetyIdentifier                 bool              `json:"allow_safety_identifier,omitempty"`   // 是否允许 safety_identifier 透传（默认过滤以保护用户隐私）
+	DisableStore                          bool              `json:"disable_store,omitempty"`             // 是否禁用 store 透传（默认允许透传，禁用后可能导致 Codex 无法使用）
+	AllowIncludeObfuscation               bool              `json:"allow_include_obfuscation,omitempty"` // 是否允许 stream_options.include_obfuscation 透传（默认过滤以避免关闭流混淆保护）
+	RemoveGifImagesEnabled                *bool             `json:"remove_gif_images_enabled,omitempty"` // 是否移除 Gemini 不支持的 image/gif 输入（未配置时默认开启）
+	MistralConsoleCodeInterpreterEnabled  *bool             `json:"mistral_console_code_interpreter_enabled,omitempty"`
+	MistralConsoleImageGenerationEnabled  *bool             `json:"mistral_console_image_generation_enabled,omitempty"`
+	MistralConsoleWebSearchEnabled        *bool             `json:"mistral_console_web_search_enabled,omitempty"`
+	OpenCodeClientHeadersEnabled          *bool             `json:"opencode_client_headers_enabled,omitempty"` // 未配置时默认将客户端标识统一为 OpenCode
+	OpenCodeFreeModelSyncEnabled          bool              `json:"opencode_auto_sync_free_models_enabled,omitempty"`
+	XAICodexCompatibilityEnabled          bool              `json:"xai_codex_compatibility_enabled,omitempty"`
+	ConversationLogEnabled                bool              `json:"conversation_log_enabled,omitempty"` // Root-only: capture full conversation payloads for distillation
+	AwsKeyType                            AwsKeyType        `json:"aws_key_type,omitempty"`
+	CustomModelListURL                    string            `json:"custom_model_list_url,omitempty"`                      // 自定义模型列表 API 地址
+	ModalKeepaliveEnabled                 bool              `json:"modal_keepalive_enabled,omitempty"`                    // 是否定时请求 Modal 部署以避免实例冷却
+	ModalKeepaliveIntervalSeconds         int               `json:"modal_keepalive_interval_seconds,omitempty"`           // Modal 测活间隔（秒）
+	UpstreamModelUpdateCheckEnabled       bool              `json:"upstream_model_update_check_enabled,omitempty"`        // 是否检测上游模型更新
+	UpstreamModelUpdateAutoSyncEnabled    bool              `json:"upstream_model_update_auto_sync_enabled,omitempty"`    // 是否自动同步上游模型更新
+	UpstreamModelUpdateLastCheckTime      int64             `json:"upstream_model_update_last_check_time,omitempty"`      // 上次检测时间
+	UpstreamModelUpdateLastDetectedModels []string          `json:"upstream_model_update_last_detected_models,omitempty"` // 上次检测到的可加入模型
+	UpstreamModelUpdateLastRemovedModels  []string          `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
+	UpstreamModelUpdateIgnoredModels      []string          `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
 
 	OpenRouterFreeAlphaSyncEnabled               bool              `json:"openrouter_auto_sync_free_and_alpha_models_enabled,omitempty"` // OpenRouter 是否自动维护免费及 Alpha 测试模型（以 -alpha 结尾，不限提供商）
 	OpenRouterFreeModelNameSimplificationEnabled bool              `json:"openrouter_free_model_name_simplification_enabled,omitempty"`  // 是否将 provider/model:free 简化为 model 并生成映射
