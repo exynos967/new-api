@@ -33,6 +33,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/opencode"
 	"github.com/QuantumNous/new-api/relay/channel/palm"
 	"github.com/QuantumNous/new-api/relay/channel/perplexity"
+	"github.com/QuantumNous/new-api/relay/channel/qianwen"
 	"github.com/QuantumNous/new-api/relay/channel/replicate"
 	"github.com/QuantumNous/new-api/relay/channel/selfhost"
 	"github.com/QuantumNous/new-api/relay/channel/siliconflow"
@@ -46,6 +47,7 @@ import (
 	taskjimeng "github.com/QuantumNous/new-api/relay/channel/task/jimeng"
 	"github.com/QuantumNous/new-api/relay/channel/task/kling"
 	taskopenailocal "github.com/QuantumNous/new-api/relay/channel/task/openailocal"
+	taskopenrouter "github.com/QuantumNous/new-api/relay/channel/task/openrouter"
 	tasksora "github.com/QuantumNous/new-api/relay/channel/task/sora"
 	"github.com/QuantumNous/new-api/relay/channel/task/suno"
 	taskvertex "github.com/QuantumNous/new-api/relay/channel/task/vertex"
@@ -66,6 +68,8 @@ import (
 
 func GetAdaptor(apiType int) channel.Adaptor {
 	switch apiType {
+	case constant.APITypeQianwenAI:
+		return &qianwen.Adaptor{}
 	case constant.APITypeVLLM:
 		return &selfhost.VLLMAdaptor{}
 	case constant.APITypeLiteLLM:
@@ -183,6 +187,8 @@ func GetTaskAdaptor(platform constant.TaskPlatform) channel.TaskAdaptor {
 		switch channelType {
 		case constant.ChannelTypeAli:
 			return &taskali.TaskAdaptor{}
+		case constant.ChannelTypeQianwenAI:
+			return &qianwen.TaskAdaptor{}
 		case constant.ChannelTypeKling:
 			return &kling.TaskAdaptor{}
 		case constant.ChannelTypeJimeng:
@@ -203,6 +209,8 @@ func GetTaskAdaptor(platform constant.TaskPlatform) channel.TaskAdaptor {
 			return &taskxai.TaskAdaptor{}
 		case constant.ChannelTypeAgnesAI:
 			return &taskagnes.TaskAdaptor{}
+		case constant.ChannelTypeOpenRouter:
+			return &taskopenrouter.TaskAdaptor{}
 		case constant.ChannelTypeOpenAILocal:
 			return &taskopenailocal.TaskAdaptor{}
 		case constant.ChannelTypeGMICloud:

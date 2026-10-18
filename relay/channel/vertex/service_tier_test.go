@@ -61,7 +61,9 @@ func TestServiceTierHeaders(t *testing.T) {
 	}
 }
 
+// 使用服务账号 JSON 模式验证区域保留/强制逻辑：API Key（express）模式本就强制 global
 func TestServiceTierForcesGlobalRegion(t *testing.T) {
+	_, key := adaptorTestCredentialsJSON(t)
 	tests := []struct {
 		name       string
 		model      string
@@ -77,16 +79,27 @@ func TestServiceTierForcesGlobalRegion(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			info := serviceTierRelayInfo(test.model, test.originURL, test.tier, test.paygoOnly)
+			info := vertexRelayInfo(key, test.model, test.originURL)
+			info.ChannelOtherSettings.VertexServiceTier = test.tier
+			info.ChannelOtherSettings.VertexPayGoOnly = test.paygoOnly
 			adaptor := &Adaptor{}
 			adaptor.Init(info)
 			got, err := adaptor.GetRequestURL(info)
 			require.NoError(t, err)
-			base := "https://aiplatform.googleapis.com/v1"
-			if !test.wantGlobal {
-				base = "https://" + test.originURL + "-aiplatform.googleapis.com/v1"
+			region := test.originURL
+			if test.wantGlobal {
+				region = "global"
 			}
-			require.Equal(t, base+"/publishers/google/models/"+test.model+":generateContent?key=api-key", got)
+			require.Equal(t,
+				"https://"+regionHostPrefix(region)+"aiplatform.googleapis.com/v1/projects/vertex-project/locations/"+region+"/publishers/google/models/"+test.model+":generateContent",
+				got)
 		})
 	}
+}
+
+func regionHostPrefix(region string) string {
+	if region == "global" {
+		return ""
+	}
+	return region + "-"
 }

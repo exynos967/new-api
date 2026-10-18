@@ -165,7 +165,9 @@ func Distribute() func(c *gin.Context) {
 			}
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil {
+		// channel 为 nil 时属于任务查询等无需选择渠道的合法流程，不能按渠道错误中断；
+		// 仅在确实选中了渠道但密钥设置失败时（如多 key 全部被禁用）才中断请求
+		if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil && channel != nil {
 			abortWithOpenAiMessage(c, setupErr.StatusCode, setupErr.MaskSensitiveError(), setupErr.GetErrorCode())
 			return
 		}

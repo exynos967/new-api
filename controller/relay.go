@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/vertexmodel"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/mistral"
 	"github.com/QuantumNous/new-api/relay/channel/typesafe"
@@ -34,6 +35,9 @@ import (
 )
 
 func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+	if _, ok := info.Request.(*dto.VertexRequest); ok {
+		return relay.VertexNativeHelper(c, info)
+	}
 	if info.RelayFormat == types.RelayFormatTypeSafe {
 		return relay.TypeSafeHelper(c, info)
 	}
@@ -67,6 +71,9 @@ func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIErro
 }
 
 func geminiRelayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+	if _, ok := info.Request.(*dto.VertexRequest); ok {
+		return relay.VertexNativeHelper(c, info)
+	}
 	var err *types.NewAPIError
 	if strings.Contains(c.Request.URL.Path, "embed") {
 		err = relay.GeminiEmbeddingHandler(c, info)
@@ -77,9 +84,20 @@ func geminiRelayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewA
 }
 
 func Relay(c *gin.Context, relayFormat types.RelayFormat) {
-	if relayFormat == types.RelayFormatOpenAIDecisions && common.GetContextKeyInt(c, constant.ContextKeyChannelType) != constant.ChannelTypeOpenAI {
+	if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeVertexAi {
+		switch vertexmodel.NativeAction(c.Request.URL.Path) {
+		case "predictLongRunning":
+			c.Set("vertex_native_video", true)
+			RelayTask(c)
+			return
+		case "fetchPredictOperation":
+			VertexOperationFetch(c)
+			return
+		}
+	}
+	if relayFormat == types.RelayFormatOpenAIDecisions && common.GetContextKeyInt(c, constant.ContextKeyChannelType) != constant.ChannelTypeOpenAI && common.GetContextKeyInt(c, constant.ContextKeyChannelType) != constant.ChannelTypeOpenRouter {
 		c.JSON(http.StatusBadRequest, gin.H{"error": types.OpenAIError{
-			Message: "/v1/decisions requires an OpenAI channel", Type: "invalid_request_error",
+			Message: "/v1/decisions requires an OpenAI or OpenRouter channel", Type: "invalid_request_error",
 		}})
 		return
 	}
@@ -124,10 +142,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	defer func() {
 		if newAPIError != nil {
 			logger.LogError(c, fmt.Sprintf("relay error: %s", newAPIError.Error()))
+			if c.GetBool("openrouter_response_committed") && c.Writer.Written() {
+				return
+			}
+			if c.GetBool("qianwen_audio_committed") && c.Writer.Written() {
+				return // Do not append JSON to an audio binary stream or an SSE error.
+			}
 			if relayFormat == types.RelayFormatTypeSafe && typesafe.WriteUpstreamError(c, newAPIError) {
 				return
 			}
-			if (relayFormat == types.RelayFormatMistralNative || relayFormat == types.RelayFormatMistralRealtime) && c.Writer.Written() {
+			if (relayFormat == types.RelayFormatMistralNative || relayFormat == types.RelayFormatMistralRealtime || common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeVertexAi) && c.Writer.Written() {
 				return // Native HTTP/SSE/WS errors have already been relayed verbatim.
 			}
 			if !isChannelDailySuccessLimitError(newAPIError) && !service.IsChannelRPMLimitError(newAPIError) {
@@ -166,6 +190,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		return
 	}
 
+	newAPIError = service.CheckProbeGuard(c, relayInfo)
+	if newAPIError != nil {
+		return
+	}
+
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
 	needCountToken := constant.CountToken
 	// Avoid building huge CombineText (strings.Join) when token counting and sensitive check are both disabled.
@@ -185,6 +214,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}
 
+	if request, ok := request.(*dto.VertexRequest); ok && vertexmodel.IsTokenTool(request.Action) {
+		newAPIError = relay.VertexNativeHelper(c, relayInfo)
+		return
+	}
+
 	tokens, err := service.EstimateRequestToken(c, meta, relayInfo)
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeCountTokenFailed)
@@ -192,11 +226,6 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 
 	relayInfo.SetEstimatePromptTokens(tokens)
-
-	newAPIError = service.CheckProbeGuard(c, relayInfo)
-	if newAPIError != nil {
-		return
-	}
 
 	priceData, err := helper.ModelPriceHelper(c, relayInfo, tokens, meta)
 	if err != nil {
@@ -491,6 +520,12 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 }
 
 func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
+	if c.GetBool("openrouter_response_committed") && c.Writer.Written() {
+		return false
+	}
+	if c.GetBool("vertex_batch_started") || (common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeVertexAi && c.Writer.Written()) {
+		return false
+	}
 	if openaiErr == nil {
 		return false
 	}
@@ -752,7 +787,7 @@ func RelayTask(c *gin.Context) {
 		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
 			channel = lockedCh
 			lockedChannel = true
-			if retryParam.GetRetry() > 0 {
+			if retryParam.GetRetry() > 0 || channel.Type == constant.ChannelTypeOpenRouter {
 				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName); setupErr != nil {
 					taskErr = service.TaskErrorWrapperLocal(setupErr.Err, "setup_locked_channel_failed", http.StatusInternalServerError)
 					break
@@ -837,7 +872,7 @@ func RelayTask(c *gin.Context) {
 		deferred := result.Quota < 0 ||
 			(relayInfo.PriceData.UsePrice && relayInfo.PriceData.ModelPrice < 0) ||
 			(!relayInfo.PriceData.UsePrice && relayInfo.PriceData.ModelRatio < 0)
-		if !deferred && result.PendingImageRequest == "" {
+		if !deferred && result.PendingImageRequest == "" && relayInfo.ChannelType != constant.ChannelTypeOpenRouter {
 			if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
 				common.SysError("settle task billing error: " + settleErr.Error())
 			}
@@ -862,7 +897,7 @@ func RelayTask(c *gin.Context) {
 			ModelRatio:         relayInfo.PriceData.ModelRatio,
 			OtherRatios:        relayInfo.PriceData.OtherRatios,
 			OriginModelName:    relayInfo.OriginModelName,
-			PerCallBilling:     common.StringsContains(constant.TaskPricePatches, relayInfo.OriginModelName) || relayInfo.PriceData.UsePrice,
+			PerCallBilling:     relayInfo.ChannelType != constant.ChannelTypeQianwenAI && (common.StringsContains(constant.TaskPricePatches, relayInfo.OriginModelName) || relayInfo.PriceData.UsePrice),
 		}
 		task.Quota = result.Quota
 		if deferred {
@@ -874,6 +909,15 @@ func RelayTask(c *gin.Context) {
 		task.Action = relayInfo.Action
 		if insertErr := task.Insert(); insertErr != nil {
 			common.SysError("insert task error: " + insertErr.Error())
+			if relayInfo.ChannelType == constant.ChannelTypeOpenRouter {
+				taskErr = service.TaskErrorWrapperLocal(insertErr, "task_persist_failed", http.StatusInternalServerError)
+				respondTaskError(c, taskErr)
+				return
+			}
+			if c.GetBool("vertex_native_video") {
+				videoProxyError(c, http.StatusInternalServerError, "task_persist_failed", "Unable to persist Vertex operation")
+				return
+			}
 			if deferred || result.PendingImageRequest != "" {
 				service.RefundBilling(c, relayInfo)
 			}
@@ -881,6 +925,14 @@ func RelayTask(c *gin.Context) {
 				respondGMICloudImageError(c, http.StatusInternalServerError, "image_task_persist_failed", "Unable to persist image task; no upstream generation was submitted", "")
 				return
 			}
+		} else if relayInfo.ChannelType == constant.ChannelTypeOpenRouter {
+			if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
+				common.SysError("settle OpenRouter video: " + settleErr.Error())
+			}
+			service.LogTaskConsumption(c, relayInfo)
+			respondOpenRouterVideoTask(c, task)
+		} else if c.GetBool("vertex_native_video") {
+			c.JSON(http.StatusOK, gin.H{"name": "operations/" + task.TaskID, "done": false})
 		} else if isGMICloudImageTask(relayInfo) {
 			if !deferred {
 				if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
@@ -913,6 +965,9 @@ func respondTaskError(c *gin.Context, taskErr *dto.TaskError) {
 }
 
 func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError, retryTimes int) bool {
+	if c.GetBool("openrouter_video_submitted") {
+		return false
+	}
 	if taskErr == nil {
 		return false
 	}

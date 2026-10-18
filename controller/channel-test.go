@@ -21,9 +21,11 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/vertexmodel"
 	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/relay/channel/gmicloud"
 	"github.com/QuantumNous/new-api/relay/channel/mistral"
+	vertexchannel "github.com/QuantumNous/new-api/relay/channel/vertex"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -267,6 +269,23 @@ func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointTyp
 	if normalized != "" {
 		return normalized
 	}
+	if channel != nil && (channel.Type == constant.ChannelTypeOpenRouter || channel.Type == constant.ChannelTypeVertexAi) {
+		endpoints := common.GetEndpointTypesByChannelType(channel.Type, modelName)
+		if len(endpoints) > 0 {
+			return string(endpoints[0])
+		}
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeQianwenAI {
+		// Select the protocol using the mapped model, while retaining the client
+		// alias on the real request and its billing snapshot.
+		mappingContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+		mappingContext.Set("model_mapping", channel.GetModelMapping())
+		mappingInfo := &relaycommon.RelayInfo{OriginModelName: modelName}
+		if err := helper.ModelMappedHelper(mappingContext, mappingInfo, nil); err == nil {
+			modelName = mappingInfo.UpstreamModelName
+		}
+		return string(common.GetEndpointTypesByChannelType(channel.Type, modelName)[0])
+	}
 	if channel != nil && channel.Type == constant.ChannelTypeTypeSafe {
 		return string(constant.EndpointTypeTypeSafeSystemOne)
 	}
@@ -355,6 +374,13 @@ func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointTyp
 
 func testChannel(channel *model.Channel, testModel string, endpointType string, isStream bool) testResult {
 	tik := time.Now()
+	explicitEndpoint := strings.TrimSpace(endpointType) != ""
+	directEndpoint := false
+	if explicitEndpoint {
+		if _, ok := common.GetDefaultEndpointInfo(constant.EndpointType(strings.TrimSpace(endpointType))); !ok {
+			return testResult{localErr: fmt.Errorf("unknown test endpoint: %s", endpointType)}
+		}
+	}
 	var unsupportedTestChannelTypes = []int{
 		constant.ChannelTypeMidjourney,
 		constant.ChannelTypeMidjourneyPlus,
@@ -364,7 +390,7 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 		constant.ChannelTypeDoubaoVideo,
 		constant.ChannelTypeVidu,
 	}
-	if lo.Contains(unsupportedTestChannelTypes, channel.Type) {
+	if !explicitEndpoint && lo.Contains(unsupportedTestChannelTypes, channel.Type) {
 		channelTypeName := constant.GetChannelTypeName(channel.Type)
 		return testResult{
 			localErr: fmt.Errorf("%s channel test is not supported", channelTypeName),
@@ -391,24 +417,16 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 		}
 	}
 
+	if explicitEndpoint {
+		var err error
+		channel, directEndpoint, err = channelForExplicitEndpointTest(channel, constant.EndpointType(strings.TrimSpace(endpointType)), testModel)
+		if err != nil {
+			return testResult{localErr: err}
+		}
+	}
 	endpointType = normalizeChannelTestEndpoint(channel, testModel, endpointType)
 	if !common.ChannelTestEndpointSupportsStream(constant.EndpointType(endpointType)) {
 		isStream = false
-	}
-	if endpointType == string(constant.EndpointTypeOpenAIDecisions) && channel.Type != constant.ChannelTypeOpenAI {
-		return testResult{localErr: errors.New("/v1/decisions requires an OpenAI channel")}
-	}
-	if endpointType == string(constant.EndpointTypeBatchGeneration) && channel.Type != constant.ChannelTypeGMICloud {
-		return testResult{localErr: errors.New("batch generation tests require a GMICloud channel")}
-	}
-	if channel.Type == constant.ChannelTypeTypeSafe {
-		if endpointType != string(constant.EndpointTypeTypeSafeSystemOne) {
-			return testResult{localErr: errors.New("TypeSafe only supports /v1/systemone")}
-		}
-		isStream = false
-	}
-	if endpointType == string(constant.EndpointTypeTypeSafeSystemOne) && channel.Type != constant.ChannelTypeTypeSafe {
-		return testResult{localErr: errors.New("/v1/systemone requires a TypeSafe channel")}
 	}
 
 	requestPath := "/v1/chat/completions"
@@ -458,6 +476,13 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 		testModel = ratio_setting.WithCompactModelSuffix(testModel)
 	}
 
+	if endpointType == string(constant.EndpointTypeVertexNative) {
+		cap, err := vertexmodel.Resolve(testModel)
+		if err != nil {
+			return testResult{localErr: err}
+		}
+		requestPath = "/v1/models/" + testModel + ":" + cap.Action
+	}
 	c.Request = &http.Request{
 		Method: "POST",
 		URL:    &url.URL{Path: requestPath}, // 使用动态路径
@@ -508,7 +533,7 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 			relayFormat = types.RelayFormatOpenAIResponsesCompaction
 		case constant.EndpointTypeAnthropic:
 			relayFormat = types.RelayFormatClaude
-		case constant.EndpointTypeGemini:
+		case constant.EndpointTypeGemini, constant.EndpointTypeVertexNative:
 			relayFormat = types.RelayFormatGemini
 		case constant.EndpointTypeJinaRerank, constant.EndpointTypeCohereRerank:
 			relayFormat = types.RelayFormatRerank
@@ -555,7 +580,7 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 	if constant.EndpointType(endpointType) == constant.EndpointTypeOpenAIVideo ||
 		constant.EndpointType(endpointType) == constant.EndpointTypeBatchGeneration ||
 		(channel.Type == constant.ChannelTypeGMICloud && gmicloud.IsImageModel(testModel)) {
-		return testTaskChannel(c, channel, testModel, tik)
+		return testTaskChannel(c, channel, testModel, tik, directEndpoint)
 	}
 
 	request := buildTestRequest(testModel, endpointType, channel, isStream)
@@ -594,17 +619,23 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 	testModel = info.UpstreamModelName
 	// 更新请求中的模型名称
 	request.SetModelName(testModel)
-
-	apiType, _ := common.ChannelType2APIType(channel.Type)
-	if info.RelayMode == relayconstant.RelayModeResponsesCompact &&
-		apiType != constant.APITypeOpenAI &&
-		apiType != constant.APITypeCodex {
-		return testResult{
-			context:     c,
-			localErr:    fmt.Errorf("responses compaction test only supports openai/codex channels, got api type %d", apiType),
-			newAPIError: types.NewError(fmt.Errorf("unsupported api type: %d", apiType), types.ErrorCodeInvalidApiType),
+	if channel.Type == constant.ChannelTypeQianwenAI && constant.IsQianwenIntentModel(testModel) {
+		if chat, ok := request.(*dto.GeneralOpenAIRequest); ok && info.RelayMode == relayconstant.RelayModeChatCompletions {
+			// Apply after mapping so aliases get the same intent classification test.
+			chat.Messages = []dto.Message{
+				{Role: "system", Content: "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.\nYou should choose one tag from the tag list:\n{\"greeting\":\"问候\",\"weather\":\"查询天气\"}\nJust reply with the chosen tag."},
+				{Role: "user", Content: "你好"},
+			}
+			// Keep billing inspection aligned with this sample and the client alias.
+			billingRequest := *chat
+			billingRequest.Model = info.OriginModelName
+			if err := attachTestBillingRequestInput(info, &billingRequest); err != nil {
+				return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeJsonMarshalFailed)}
+			}
 		}
 	}
+
+	apiType, _ := common.ChannelType2APIType(channel.Type)
 	adaptor := relay.GetAdaptor(apiType)
 	if adaptor == nil {
 		return testResult{
@@ -612,6 +643,9 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 			localErr:    fmt.Errorf("invalid api type: %d, adaptor is nil", apiType),
 			newAPIError: types.NewError(fmt.Errorf("invalid api type: %d, adaptor is nil", apiType), types.ErrorCodeInvalidApiType),
 		}
+	}
+	if directEndpoint {
+		adaptor = &explicitEndpointTestAdaptor{Adaptor: adaptor, endpoint: constant.EndpointType(endpointType)}
 	}
 
 	//// 创建一个用于日志的 info 副本，移除 ApiKey
@@ -640,7 +674,7 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 		convertedRequest = request
 	case relayconstant.RelayModeAudioSpeech, relayconstant.RelayModeAudioTranscription, relayconstant.RelayModeAudioTranslation:
 		if audioReq, ok := request.(*dto.AudioRequest); ok {
-			if (channel.Type == constant.ChannelTypeMistral || channel.Type == constant.ChannelTypeOpenAI) && info.RelayMode == relayconstant.RelayModeAudioTranscription {
+			if (channel.Type == constant.ChannelTypeMistral || channel.Type == constant.ChannelTypeOpenAI || channel.Type == constant.ChannelTypeOpenRouter || channel.Type == constant.ChannelTypeVertexAi) && info.RelayMode == relayconstant.RelayModeAudioTranscription {
 				if err = prepareTranscriptionTest(c, audioReq.Model); err != nil {
 					return testResult{context: c, localErr: err, newAPIError: types.NewError(err, types.ErrorCodeConvertRequestFailed)}
 				}
@@ -717,6 +751,21 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 			}
 		}
 	default:
+		if native, ok := request.(*dto.VertexRequest); ok {
+			if directEndpoint {
+				convertedRequest = native
+				break
+			}
+			a, ok := adaptor.(*vertexchannel.Adaptor)
+			if !ok {
+				return testResult{localErr: errors.New("Vertex native tests require a Vertex channel")}
+			}
+			if a.RequiresCallPrice() && !info.PriceData.UsePrice {
+				return testResult{localErr: errors.New("configure per-request pricing for this Vertex model")}
+			}
+			convertedAudioReader, err = a.ConvertNativeRequest(c, info, native)
+			break
+		}
 		// Chat/Completion 等其他请求类型
 		if claudeReq, ok := request.(*dto.ClaudeRequest); ok && channel.Type == constant.ChannelTypeXunfeiMaas {
 			convertedRequest, err = adaptor.ConvertClaudeRequest(c, info, claudeReq)
@@ -786,9 +835,12 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 			}
 		}
 	}
-	if channel.Type == constant.ChannelTypeOpenAI {
+	if channel.Type == constant.ChannelTypeOpenAI || info.RelayMode == relayconstant.RelayModeDecisions {
 		if info.RelayMode == relayconstant.RelayModeDecisions {
 			jsonData, err = relaycommon.PrepareDecisionsRequest(info, jsonData)
+		} else if explicitEndpoint && info.RelayMode == relayconstant.RelayModeChatCompletions {
+			// An explicit endpoint must not be silently changed to /responses.
+			jsonData, info.UpstreamModelName, _, err = relaycommon.NormalizeOpenAIRequest(jsonData, false)
 		} else {
 			jsonData, err = prepareOpenAIChannelTestRequest(info, jsonData)
 		}
@@ -1029,7 +1081,7 @@ func buildTaskTestLogOther(info *relaycommon.RelayInfo, taskID, requestPath stri
 	return other
 }
 
-func testTaskChannel(c *gin.Context, channel *model.Channel, testModel string, tik time.Time) testResult {
+func testTaskChannel(c *gin.Context, channel *model.Channel, testModel string, tik time.Time, directEndpoint bool) testResult {
 	taskEndpointType := constant.EndpointTypeOpenAIVideo
 	var jsonData []byte
 	var err error
@@ -1040,7 +1092,7 @@ func testTaskChannel(c *gin.Context, channel *model.Channel, testModel string, t
 			"model":   testModel,
 			"payload": map[string]any{"prompt": "A small red apple on a white background", "size": "1920x1080"},
 		})
-	} else if channel.Type == constant.ChannelTypeGMICloud && gmicloud.IsBatchModel(testModel) {
+	} else if c.Request.URL.Path == "/v1/batch/generations" {
 		taskEndpointType = constant.EndpointTypeBatchGeneration
 		jsonData, err = common.Marshal(map[string]any{
 			"model": testModel,
@@ -1085,6 +1137,9 @@ func testTaskChannel(c *gin.Context, channel *model.Channel, testModel string, t
 		err := fmt.Errorf("invalid api platform: %s", platform)
 		taskErr := service.TaskErrorWrapperLocal(err, "invalid_api_platform", http.StatusBadRequest)
 		return taskErrorToTestResult(c, taskErr)
+	}
+	if directEndpoint {
+		adaptor = &explicitEndpointTaskTestAdaptor{TaskAdaptor: adaptor, endpoint: taskEndpointType, body: jsonData}
 	}
 	adaptor.Init(info)
 	if taskErr := adaptor.ValidateRequestAndSetAction(c, info); taskErr != nil {
@@ -1150,7 +1205,10 @@ func testTaskChannel(c *gin.Context, channel *model.Channel, testModel string, t
 			newAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
 		}
 	}
-	if resp != nil && resp.StatusCode != http.StatusOK {
+	accepted := resp.StatusCode == http.StatusOK ||
+		((directEndpoint || channel.Type == constant.ChannelTypeOpenRouter) && resp.StatusCode == http.StatusAccepted) ||
+		(directEndpoint && resp.StatusCode == http.StatusCreated)
+	if !accepted {
 		err := service.RelayErrorHandler(c.Request.Context(), resp, false)
 		common.SysError(fmt.Sprintf(
 			"channel test bad response: channel_id=%d name=%s type=%d model=%s endpoint_type=%s status=%d err=%v",
@@ -1381,6 +1439,14 @@ func detectErrorMessageFromJSONBytes(jsonBytes []byte) string {
 }
 
 func buildTestRequest(model string, endpointType string, channel *model.Channel, isStream bool) dto.Request {
+	if endpointType == string(constant.EndpointTypeVertexNative) {
+		return buildVertexNativeTestRequest(model)
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeVertexAi {
+		if endpointType == string(constant.EndpointTypeAudioSpeech) {
+			return &dto.AudioRequest{Model: model, Input: "Hello", Voice: dto.AudioVoice{Name: "Kore"}, ResponseFormat: "wav"}
+		}
+	}
 	if channel != nil && channel.Type == constant.ChannelTypeXunfeiMaas && constant.EndpointType(endpointType) == constant.EndpointTypeAnthropic {
 		return &dto.ClaudeRequest{
 			Model: model, MaxTokens: lo.ToPtr(uint(16)), Stream: lo.ToPtr(isStream),
@@ -1400,6 +1466,12 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 	if endpointType != "" {
 		switch constant.EndpointType(endpointType) {
 		case constant.EndpointTypeOpenAIDecisions:
+			if channel != nil && channel.Type == constant.ChannelTypeOpenRouter {
+				return &dto.OpenRouterDecisionsRequest{Model: model, Fields: map[string]json.RawMessage{
+					"state":     json.RawMessage(`"Have a nice day."`),
+					"questions": json.RawMessage(`{"greeting":{"type":"noul","instructions":"Is this a friendly greeting?"}}`),
+				}}
+			}
 			return &dto.OpenAIDecisionsRequest{Model: model, Fields: map[string]json.RawMessage{
 				"input":     json.RawMessage(`"Have a nice day."`),
 				"questions": json.RawMessage(`[{"type":"predicate","name":"greeting","instructions":"Does the text contain a friendly greeting?"}]`),
@@ -1446,6 +1518,21 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 				Input: testResponsesInput,
 			}
 		case constant.EndpointTypeAudioSpeech:
+			if channel != nil && channel.Type == constant.ChannelTypeQianwenAI {
+				voice := "longanhuan_v3.6"
+				if strings.HasPrefix(model, "qwen3-tts-") || strings.HasPrefix(model, "qwen-tts") {
+					voice = "Cherry"
+				}
+				if model == "qwen-audio-3.1-tts-next" || strings.HasPrefix(model, "fun-music-") {
+					voice = ""
+				}
+				request := &dto.AudioRequest{Model: model, Input: "你好，这是一次渠道测试。", Voice: dto.AudioVoice{Name: voice}}
+				if isStream {
+					request.StreamFormat = "sse"
+					request.Stream = lo.ToPtr(true)
+				}
+				return request
+			}
 			voice := "alloy"
 			if channel != nil && channel.Type == constant.ChannelTypeGCP {
 				voice = "cmn-CN-Wavenet-A"

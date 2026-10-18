@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/vertexmodel"
 )
 
 const (
@@ -132,6 +133,9 @@ func fetchGoogleModelsPageByPage(ctx context.Context, client *http.Client, token
 		for _, item := range result.PublisherModels {
 			modelName, ok := normalizeGooglePublisherModelName(item.Name)
 			if !ok {
+				continue
+			}
+			if _, err := vertexmodel.Resolve(modelName); err != nil {
 				continue
 			}
 			modelSet[modelName] = struct{}{}

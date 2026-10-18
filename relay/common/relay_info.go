@@ -158,6 +158,8 @@ type RelayInfo struct {
 	ConversationCapture                   *ConversationCapture
 
 	PriceData types.PriceData
+	// Set only after a successful upstream media response reports billable units.
+	NonTokenUsage bool
 
 	// TieredBillingSnapshot is a frozen snapshot of tiered billing rules
 	// captured at pre-consume time. Non-nil only when billing mode is "tiered_expr".
@@ -316,6 +318,8 @@ func (info *RelayInfo) ToString() string {
 
 // 定义支持流式选项的通道类型
 var streamSupportedChannels = map[int]bool{
+	constant.ChannelTypeOpenRouter:  true, // Accepted; OpenRouter always reports stream usage.
+	constant.ChannelTypeQianwenAI:   true, // https://platform.qianwenai.com/docs/developer-guides/run-and-scale/streaming
 	constant.ChannelTypeVLLM:        true,
 	constant.ChannelTypeLiteLLM:     true,
 	constant.ChannelTypeXunfeiMaas:  true, // Documented for vision; the adaptor strips it for unverified text models.

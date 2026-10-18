@@ -5,6 +5,7 @@ import (
 
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/openaimodel"
+	"github.com/QuantumNous/new-api/pkg/vertexmodel"
 )
 
 // GetEndpointTypesByChannelType returns the preferred endpoint types for a channel/model pair.
@@ -14,6 +15,27 @@ func GetEndpointTypesByChannelType(channelType int, modelName string) []constant
 	}
 	var endpointTypes []constant.EndpointType
 	switch channelType {
+	case constant.ChannelTypeQianwenAI:
+		if constant.IsQianwenDecisionModel(modelName) {
+			return []constant.EndpointType{constant.EndpointTypeTypeSafeSystemOne}
+		}
+		if constant.IsQianwenIntentModel(modelName) {
+			return []constant.EndpointType{constant.EndpointTypeOpenAI}
+		}
+		name := strings.ToLower(modelName)
+		switch {
+		case strings.Contains(name, "embedding"):
+			return []constant.EndpointType{constant.EndpointTypeEmbeddings}
+		case strings.Contains(name, "rerank"):
+			return []constant.EndpointType{constant.EndpointTypeJinaRerank}
+		case strings.Contains(name, "tts") || strings.HasPrefix(name, "cosyvoice") || strings.HasPrefix(name, "fun-music-"):
+			return []constant.EndpointType{constant.EndpointTypeAudioSpeech}
+		case strings.HasPrefix(name, "wan3.") || strings.Contains(name, "-t2v") || strings.Contains(name, "-i2v") || strings.Contains(name, "-r2v"):
+			return []constant.EndpointType{constant.EndpointTypeOpenAIVideo}
+		case strings.HasPrefix(name, "qwen-image") || strings.Contains(name, "wan2.7-image") || strings.Contains(name, "wan2.6-image") || name == "z-image-turbo":
+			return []constant.EndpointType{constant.EndpointTypeImageGeneration}
+		}
+		return []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeAnthropic, constant.EndpointTypeOpenAIResponse}
 	case constant.ChannelTypeVLLM, constant.ChannelTypeLiteLLM:
 		return []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse}
 	case constant.ChannelTypeXunfeiMaas:
@@ -52,11 +74,38 @@ func GetEndpointTypesByChannelType(channelType int, modelName string) []constant
 	case constant.ChannelTypeAnthropic:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeAnthropic, constant.EndpointTypeOpenAI}
 	case constant.ChannelTypeVertexAi:
-		fallthrough
+		cap, err := vertexmodel.Resolve(modelName)
+		if err != nil {
+			return nil
+		}
+		switch cap.Family {
+		case vertexmodel.Embedding, vertexmodel.MultimodalEmbedding:
+			return []constant.EndpointType{constant.EndpointTypeEmbeddings, constant.EndpointTypeVertexNative}
+		case vertexmodel.Imagen, vertexmodel.GeminiImage:
+			return []constant.EndpointType{constant.EndpointTypeImageGeneration, constant.EndpointTypeVertexNative}
+		case vertexmodel.Speech:
+			return []constant.EndpointType{constant.EndpointTypeAudioSpeech, constant.EndpointTypeVertexNative}
+		case vertexmodel.Transcribe:
+			return []constant.EndpointType{constant.EndpointTypeAudioTranscription, constant.EndpointTypeVertexNative}
+		case vertexmodel.Video:
+			return []constant.EndpointType{constant.EndpointTypeOpenAIVideo}
+		case vertexmodel.Claude:
+			return []constant.EndpointType{constant.EndpointTypeAnthropic, constant.EndpointTypeOpenAI}
+		case vertexmodel.Grok:
+			return []constant.EndpointType{constant.EndpointTypeOpenAIResponse, constant.EndpointTypeOpenAI}
+		case vertexmodel.FIM:
+			return []constant.EndpointType{constant.EndpointTypeVertexNative}
+		case vertexmodel.OpenAPI, vertexmodel.PartnerChat:
+			return []constant.EndpointType{constant.EndpointTypeOpenAI}
+		case vertexmodel.OCR, vertexmodel.Music:
+			return []constant.EndpointType{constant.EndpointTypeVertexNative}
+		default:
+			return []constant.EndpointType{constant.EndpointTypeGemini, constant.EndpointTypeOpenAI}
+		}
 	case constant.ChannelTypeGemini:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeGemini, constant.EndpointTypeOpenAI}
 	case constant.ChannelTypeOpenRouter:
-		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI}
+		return openRouterEndpointTypes(modelName)
 	case constant.ChannelTypeModal, constant.ChannelTypeKilo, constant.ChannelTypeCline:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI}
 	case constant.ChannelTypeGMICloud:
@@ -124,7 +173,7 @@ func GetEndpointTypesByChannelType(channelType int, modelName string) []constant
 	if channelType != constant.ChannelTypePoe && (IsImageGenerationModel(modelName) || (channelType == constant.ChannelTypeVolcEngine && IsVolcEngineImageGenerationModel(modelName))) {
 		endpointTypes = append([]constant.EndpointType{constant.EndpointTypeImageGeneration}, endpointTypes...)
 	}
-	if channelType != constant.ChannelTypePoe && (IsVideoGenerationModel(modelName) || (channelType == constant.ChannelTypeVolcEngine && IsVolcEngineContentGenerationTaskModel(modelName))) {
+	if channelType != constant.ChannelTypePoe && channelType != constant.ChannelTypeOpenRouter && (IsVideoGenerationModel(modelName) || (channelType == constant.ChannelTypeVolcEngine && IsVolcEngineContentGenerationTaskModel(modelName))) {
 		endpointTypes = prependEndpointType(endpointTypes, constant.EndpointTypeOpenAIVideo)
 	}
 	if channelType == constant.ChannelTypeOpenAI && modelName == "gpt-6-luna" {
