@@ -62,11 +62,14 @@ type AwsKeyType string
 const (
 	AwsKeyTypeAKSK   AwsKeyType = "ak_sk" // 默认
 	AwsKeyTypeApiKey AwsKeyType = "api_key"
+	AwsKeyTypeSTS    AwsKeyType = "sts"
 )
 
 const ModalKeepaliveDefaultIntervalSeconds = 30
 
 type ChannelOtherSettings struct {
+	BilibiliWebSourceLanguage             string            `json:"bilibili_web_source_language,omitempty"`
+	BilibiliWebTargetLanguage             string            `json:"bilibili_web_target_language,omitempty"`
 	AzureResponsesVersion                 string            `json:"azure_responses_version,omitempty"`
 	VertexKeyType                         VertexKeyType     `json:"vertex_key_type,omitempty"`     // "json" or "api_key"
 	VertexServiceTier                     VertexServiceTier `json:"vertex_service_tier,omitempty"` // Vertex AI 服务层级：standard/flex/priority

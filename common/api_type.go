@@ -5,6 +5,10 @@ import "github.com/QuantumNous/new-api/constant"
 func ChannelType2APIType(channelType int) (int, bool) {
 	apiType := -1
 	switch channelType {
+	case constant.ChannelTypeBilibili:
+		apiType = constant.APITypeBilibili
+	case constant.ChannelTypeBilibiliWeb:
+		apiType = constant.APITypeBilibiliWeb
 	case constant.ChannelTypeQianwenAI:
 		apiType = constant.APITypeQianwenAI
 	case constant.ChannelTypeVLLM:

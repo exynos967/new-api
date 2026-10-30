@@ -36,7 +36,12 @@ func GetEndpointTypesByChannelType(channelType int, modelName string) []constant
 			return []constant.EndpointType{constant.EndpointTypeImageGeneration}
 		}
 		return []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeAnthropic, constant.EndpointTypeOpenAIResponse}
-	case constant.ChannelTypeVLLM, constant.ChannelTypeLiteLLM:
+	case constant.ChannelTypeVLLM, constant.ChannelTypeLiteLLM, constant.ChannelTypeBilibili:
+		return []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse}
+	case constant.ChannelTypeBilibiliWeb:
+		if constant.IsBilibiliWebEchoModel(modelName) {
+			return []constant.EndpointType{constant.EndpointTypeOpenAI}
+		}
 		return []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse}
 	case constant.ChannelTypeXunfeiMaas:
 		name := strings.ToLower(modelName)
