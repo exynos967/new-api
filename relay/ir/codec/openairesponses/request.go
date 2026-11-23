@@ -856,7 +856,7 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 					fn["description"] = td.Description
 				}
 				if !isNullOrEmptyJSON(td.Parameters) {
-					fn["parameters"] = td.Parameters
+					fn["parameters"] = ir.NormalizeJSONSchemaTypes(td.Parameters)
 				}
 				if td.Strict != nil {
 					fn["strict"] = *td.Strict
@@ -987,7 +987,7 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 				fmtObj["description"] = req.ResponseFormat.Description
 			}
 			if !isNullOrEmptyJSON(req.ResponseFormat.Schema) {
-				fmtObj["schema"] = req.ResponseFormat.Schema
+				fmtObj["schema"] = ir.NormalizeJSONSchemaTypes(req.ResponseFormat.Schema)
 			}
 			if req.ResponseFormat.Strict != nil {
 				fmtObj["strict"] = *req.ResponseFormat.Strict

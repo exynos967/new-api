@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/vertex"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relay/ir"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
@@ -439,4 +440,229 @@ func TestOpenCodeClaudeToGeminiAppendsRequestConversionAndBedrockVertexFixes(t *
 	require.NoError(t, vAdaptorPrefixed.SetupRequestHeader(c, &hdrs, vInfoPrefixed))
 	require.Equal(t, "shared", hdrs.Get("X-Vertex-AI-LLM-Request-Type"))
 	require.Equal(t, "flex", hdrs.Get("X-Vertex-AI-LLM-Shared-Request-Type"))
+}
+
+func TestIRStreamUpstream400ClearsPreSetSSEHeadersAndSupportsRetry(t *testing.T) {
+	service.InitHttpClient()
+	setIRToggleForTest(t, true)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"code":"invalid_request_error","message":"secret upstream detail","type":"invalid_request_error"}}`)
+	}))
+	defer server.Close()
+
+	c, rec := newIRTestGinContext(http.MethodPost, "/v1beta/models/gpt-test:streamGenerateContent?alt=sse")
+	common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{ShowErrorDetails: false})
+	info := &relaycommon.RelayInfo{
+		RelayFormat:     types.RelayFormatGemini,
+		RelayMode:       relayconstant.RelayModeGemini,
+		RequestURLPath:  "/v1beta/models/gpt-test:streamGenerateContent?alt=sse",
+		IsStream:        true,
+		OriginModelName: "gpt-test",
+		ClientModelName: "gpt-test",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:         77,
+			ChannelType:       constant.ChannelTypeOpenAI,
+			ApiType:           constant.APITypeOpenAI,
+			ChannelBaseUrl:    server.URL,
+			ApiKey:            "test-key",
+			UpstreamModelName: "gpt-test",
+		},
+	}
+	info.InitRequestConversionChain()
+	relaycommon.SetRelayInfo(c, info)
+	relaycommon.InstallRelayResponseWriter(c)
+
+	var req dto.GeminiChatRequest
+	require.NoError(t, common.UnmarshalJsonStr(`{"contents":[{"role":"user","parts":[{"text":"Reply OK"}]}]}`, &req))
+
+	adaptor := &openai.Adaptor{}
+	adaptor.Init(info)
+
+	handled, usage, apiErr := tryIRCrossProtocolRelay(c, info, adaptor, ir.FormatGoogleGenAI, &req)
+	require.True(t, handled)
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	require.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+
+	// Pre-set SSE headers from DoApiRequest must have been cleared cleanly.
+	require.Empty(t, c.Writer.Header().Get("Content-Type"))
+	require.False(t, c.GetBool("event_stream_headers_set"))
+
+	// Writing JSON error now produces non-empty application/json (NOT 0-byte text/event-stream).
+	c.JSON(apiErr.StatusCode, gin.H{"error": apiErr.ToOpenAIError()})
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Header().Get("Content-Type"), "application/json")
+	require.NotEmpty(t, rec.Body.String())
+	require.NotContains(t, rec.Body.String(), "secret upstream detail")
+
+	// Also verify SetEventStreamHeaders can be applied again on a fresh retry context after ClearEventStreamHeaders.
+	c2, _ := newIRTestGinContext(http.MethodPost, "/v1/messages")
+	helper.SetEventStreamHeaders(c2)
+	require.Equal(t, "text/event-stream", c2.Writer.Header().Get("Content-Type"))
+	helper.ClearEventStreamHeaders(c2)
+	require.Empty(t, c2.Writer.Header().Get("Content-Type"))
+	helper.SetEventStreamHeaders(c2)
+	require.Equal(t, "text/event-stream", c2.Writer.Header().Get("Content-Type"))
+}
+
+func TestIRResponsesPolicyRoutingAndSuffixAdaptation(t *testing.T) {
+	// Enable ChatCompletionsToResponsesPolicy for all channels matching gpt-6*.
+	gs := model_setting.GetGlobalSettings()
+	prevPolicy := gs.ChatCompletionsToResponsesPolicy
+	gs.ChatCompletionsToResponsesPolicy = model_setting.ChatCompletionsToResponsesPolicy{
+		Enabled:       true,
+		AllChannels:   true,
+		ModelPatterns: []string{"^gpt-6.*"},
+	}
+	t.Cleanup(func() { gs.ChatCompletionsToResponsesPolicy = prevPolicy })
+
+	// 1. vLLM / LiteLLM / DeepSeek / Ollama channels must route Gemini -> FormatOpenAIResponses when policy matches.
+	for _, tc := range []struct {
+		name        string
+		channelType int
+		apiType     int
+	}{
+		{"vllm", constant.ChannelTypeVLLM, constant.APITypeVLLM},
+		{"litellm", constant.ChannelTypeLiteLLM, constant.APITypeLiteLLM},
+		{"deepseek", constant.ChannelTypeDeepSeek, constant.APITypeDeepSeek},
+		{"moonshot", constant.ChannelTypeMoonshot, constant.APITypeMoonshot},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := newIRTestGinContext(http.MethodPost, "/v1beta/models/gpt-6-astra:generateContent")
+			info := &relaycommon.RelayInfo{
+				RelayFormat:     types.RelayFormatGemini,
+				RelayMode:       relayconstant.RelayModeGemini,
+				OriginModelName: "gpt-6-astra",
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelId:         88,
+					ChannelType:       tc.channelType,
+					ApiType:           tc.apiType,
+					UpstreamModelName: "gpt-6-astra",
+				},
+			}
+			spec, ok := resolveTargetIRSpec(c, info, &openai.Adaptor{}, ir.FormatGoogleGenAI)
+			require.True(t, ok)
+			require.Equal(t, ir.FormatOpenAIResponses, spec.Format)
+			require.Equal(t, relayconstant.RelayModeResponses, spec.RelayMode)
+			require.Equal(t, "/v1/responses", spec.URLPath)
+		})
+	}
+
+	// 2. Non-ChannelTypeOpenAI Responses target strips OpenAI reasoning effort suffix (e.g. gpt-5-high -> gpt-5 + effort=high).
+	infoResp := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-5-high",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeAzure,
+			UpstreamModelName: "gpt-5-high",
+		},
+	}
+	outResp, err := applyIRModelSuffixAdaptation(
+		[]byte(`{"model":"gpt-5-high","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`),
+		infoResp,
+		irTargetSpec{Format: ir.FormatOpenAIResponses},
+	)
+	require.NoError(t, err)
+	require.Equal(t, "gpt-5", infoResp.UpstreamModelName)
+	require.Equal(t, "high", infoResp.ReasoningEffort)
+	var mResp map[string]any
+	require.NoError(t, json.Unmarshal(outResp, &mResp))
+	require.Equal(t, "gpt-5", mResp["model"])
+	require.Equal(t, "high", mResp["reasoning"].(map[string]any)["effort"])
+}
+
+func TestGeminiHelperNonOpenAIChannelFallbackUsesResponsesPolicy(t *testing.T) {
+	service.InitHttpClient()
+	setIRToggleForTest(t, false) // Exercise GeminiHelper's non-IR fallback directly for non-OpenAI Responses channels.
+
+	gs := model_setting.GetGlobalSettings()
+	prevPolicy := gs.ChatCompletionsToResponsesPolicy
+	gs.ChatCompletionsToResponsesPolicy = model_setting.ChatCompletionsToResponsesPolicy{
+		Enabled:       true,
+		AllChannels:   true,
+		ModelPatterns: []string{"^gpt-6-astra$"},
+	}
+	t.Cleanup(func() { gs.ChatCompletionsToResponsesPolicy = prevPolicy })
+
+	// 1. Verify GeminiHelper routes non-OpenAI channel matching policy to /v1/responses (returning 400 avoids DB quota commit).
+	var gotPath string
+	var gotBody map[string]any
+	probeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","message":"probe stop"}}`)
+	}))
+	defer probeServer.Close()
+
+	c, _ := newIRTestGinContext(http.MethodPost, "/v1beta/models/gpt-6-astra:generateContent")
+	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenRouter)
+	common.SetContextKey(c, constant.ContextKeyChannelId, 99)
+	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, probeServer.URL)
+	common.SetContextKey(c, constant.ContextKeyChannelKey, "sk-test")
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, "gpt-6-astra")
+
+	var req dto.GeminiChatRequest
+	require.NoError(t, common.UnmarshalJsonStr(`{"contents":[{"role":"user","parts":[{"text":"Reply OK"}]}]}`, &req))
+
+	info := &relaycommon.RelayInfo{
+		RelayFormat:     types.RelayFormatGemini,
+		RelayMode:       relayconstant.RelayModeGemini,
+		RequestURLPath:  "/v1beta/models/gpt-6-astra:generateContent",
+		OriginModelName: "gpt-6-astra",
+		ClientModelName: "gpt-6-astra",
+		Request:         &req,
+	}
+	info.InitRequestConversionChain()
+	relaycommon.SetRelayInfo(c, info)
+	relaycommon.InstallRelayResponseWriter(c)
+
+	apiErr := GeminiHelper(c, info)
+	require.NotNil(t, apiErr)
+	require.Equal(t, "/v1/responses", gotPath)
+	require.Equal(t, "gpt-6-astra", gotBody["model"])
+	require.NotNil(t, gotBody["input"])
+
+	// 2. Verify full 200 Responses -> Gemini translation through chatCompletionsViaResponses.
+	okServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/responses", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_gem_1","object":"response","status":"completed","model":"gpt-6-astra","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Gemini via Responses OK"}]}],"usage":{"input_tokens":5,"output_tokens":4,"total_tokens":9}}`)
+	}))
+	defer okServer.Close()
+
+	c2, rec2 := newIRTestGinContext(http.MethodPost, "/v1beta/models/gpt-6-astra:generateContent")
+	info2 := &relaycommon.RelayInfo{
+		RelayFormat:     types.RelayFormatGemini,
+		RelayMode:       relayconstant.RelayModeGemini,
+		RequestURLPath:  "/v1beta/models/gpt-6-astra:generateContent",
+		OriginModelName: "gpt-6-astra",
+		ClientModelName: "gpt-6-astra",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:         99,
+			ChannelType:       constant.ChannelTypeOpenRouter,
+			ApiType:           constant.APITypeOpenRouter,
+			ChannelBaseUrl:    okServer.URL,
+			ApiKey:            "sk-test",
+			UpstreamModelName: "gpt-6-astra",
+		},
+	}
+	info2.InitRequestConversionChain()
+	relaycommon.SetRelayInfo(c2, info2)
+	relaycommon.InstallRelayResponseWriter(c2)
+
+	oaiReq, convErr := service.GeminiToOpenAIRequest(&req, info2)
+	require.NoError(t, convErr)
+	adaptor := &openai.Adaptor{}
+	adaptor.Init(info2)
+	usage, respErr := chatCompletionsViaResponses(c2, info2, adaptor, oaiReq)
+	require.Nil(t, respErr)
+	require.NotNil(t, usage)
+	require.Equal(t, 5, usage.PromptTokens)
+	require.Equal(t, 4, usage.CompletionTokens)
+	require.Contains(t, rec2.Body.String(), "Gemini via Responses OK")
 }

@@ -149,6 +149,21 @@ func GeminiHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *typ
 			return nil
 		}
 	}
+	if !passThrough && info.ChannelType != constant.ChannelTypeOpenAI &&
+		shouldChatCompletionsUseResponses(info) {
+		openAIRequest, convErr := service.GeminiToOpenAIRequest(request, info)
+		if convErr != nil {
+			return types.NewError(convErr, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+
+		usage, newApiErr := chatCompletionsViaResponses(c, info, adaptor, openAIRequest)
+		if newApiErr != nil {
+			return newApiErr
+		}
+
+		service.PostTextConsumeQuota(c, info, usage, nil)
+		return nil
+	}
 
 	var requestBody io.Reader
 	if passThrough {

@@ -168,6 +168,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if !isChannelDailySuccessLimitError(newAPIError) && !service.IsChannelRPMLimitError(newAPIError) {
 				newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			}
+			// Clear any pre-set SSE headers (e.g. set before client.Do on streaming attempts)
+			// so JSON error responses carry application/json and are never trapped in SSE buffers.
+			helper.ClearEventStreamHeaders(c)
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				helper.WssError(c, ws, newAPIError.ToOpenAIError())
@@ -343,6 +346,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if !shouldRetry(c, newAPIError, retryParam.GetRemainingRetryTimes()) {
 			break
 		}
+		helper.ClearEventStreamHeaders(c)
 		retryParam.IncreaseRetry()
 	}
 

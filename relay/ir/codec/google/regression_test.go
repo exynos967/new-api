@@ -239,3 +239,90 @@ func TestFinishReasonUnspecifiedSkippedAndInlineImageEventAndRareFinishReason(t 
 		t.Fatalf("expected IMAGE_SAFETY preserved on round-trip, got %q", got)
 	}
 }
+
+func TestDecodeGoogleUppercaseSchemaTypesNormalizedToJSONSchema(t *testing.T) {
+	c := New()
+	raw := []byte(`{
+		"model": "deepseek-flash",
+		"contents": [{"role": "user", "parts": [{"text": "Return JSON"}]}],
+		"tools": [{
+			"functionDeclarations": [{
+				"name": "save_item",
+				"description": "Save an item",
+				"parameters": {
+					"type": "OBJECT",
+					"properties": {
+						"type": {"type": "STRING"},
+						"tags": {"type": "ARRAY", "items": {"type": "STRING"}},
+						"count": {"type": "INTEGER"},
+						"ratio": {"type": "NUMBER"},
+						"nullable_field": {"type": ["STRING", "NULL"]}
+					},
+					"required": ["type"]
+				}
+			}]
+		}],
+		"generationConfig": {
+			"responseMimeType": "application/json",
+			"responseSchema": {
+				"type": "OBJECT",
+				"properties": {
+					"ok": {"type": "BOOLEAN"},
+					"nested": {
+						"type": "OBJECT",
+						"properties": {
+							"items": {"type": "ARRAY", "items": {"type": "INTEGER"}}
+						}
+					}
+				},
+				"required": ["ok"]
+			}
+		}
+	}`)
+
+	req, err := c.DecodeRequest(raw, ir.NewConversionContext(ir.FormatGoogleGenAI, ir.FormatOpenAIChat))
+	if err != nil {
+		t.Fatalf("DecodeRequest error: %v", err)
+	}
+	if req.ResponseFormat == nil || req.ResponseFormat.Type != "json_schema" {
+		t.Fatalf("expected json_schema ResponseFormat, got %+v", req.ResponseFormat)
+	}
+	var respSchema map[string]any
+	if err := json.Unmarshal(req.ResponseFormat.Schema, &respSchema); err != nil {
+		t.Fatalf("unmarshal response schema: %v", err)
+	}
+	if respSchema["type"] != "object" {
+		t.Fatalf("expected responseSchema root type=object, got %v", respSchema["type"])
+	}
+	props := respSchema["properties"].(map[string]any)
+	if props["ok"].(map[string]any)["type"] != "boolean" {
+		t.Fatalf("expected ok.type=boolean, got %v", props["ok"])
+	}
+	nestedItems := props["nested"].(map[string]any)["properties"].(map[string]any)["items"].(map[string]any)
+	if nestedItems["type"] != "array" || nestedItems["items"].(map[string]any)["type"] != "integer" {
+		t.Fatalf("expected nested array/integer lowercase, got %+v", nestedItems)
+	}
+
+	if len(req.Tools) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(req.Tools))
+	}
+	var toolSchema map[string]any
+	if err := json.Unmarshal(req.Tools[0].Parameters, &toolSchema); err != nil {
+		t.Fatalf("unmarshal tool parameters: %v", err)
+	}
+	if toolSchema["type"] != "object" {
+		t.Fatalf("expected tool parameters root type=object, got %v", toolSchema["type"])
+	}
+	toolProps := toolSchema["properties"].(map[string]any)
+	// User property literally named "type" MUST be preserved as a property with lowercase type="string".
+	if typeProp, ok := toolProps["type"].(map[string]any); !ok || typeProp["type"] != "string" {
+		t.Fatalf("expected user property 'type' preserved with type=string, got %+v", toolProps["type"])
+	}
+	if toolProps["count"].(map[string]any)["type"] != "integer" || toolProps["ratio"].(map[string]any)["type"] != "number" {
+		t.Fatalf("expected integer/number lowercase, got %+v", toolProps)
+	}
+	nullableTypes := toolProps["nullable_field"].(map[string]any)["type"].([]any)
+	if len(nullableTypes) != 2 || nullableTypes[0] != "string" || nullableTypes[1] != "null" {
+		t.Fatalf("expected union type [string, null], got %+v", nullableTypes)
+	}
+}

@@ -253,6 +253,14 @@ func resolveTargetIRSpec(c *gin.Context, info *relaycommon.RelayInfo, adaptor ch
 		if sourceFormat != ir.FormatGoogleGenAI {
 			return irTargetSpec{}, false
 		}
+		if shouldChatCompletionsUseResponses(info) {
+			return irTargetSpec{
+				Format:      ir.FormatOpenAIResponses,
+				RelayMode:   relayconstant.RelayModeResponses,
+				URLPath:     "/v1/responses",
+				RelayFormat: types.RelayFormatOpenAIResponses,
+			}, true
+		}
 		return irTargetSpec{
 			Format:      ir.FormatOpenAIChat,
 			Shim:        ir.DeepSeekChatShim,
@@ -264,7 +272,18 @@ func resolveTargetIRSpec(c *gin.Context, info *relaycommon.RelayInfo, adaptor ch
 	case constant.APITypeVLLM,
 		constant.APITypeLiteLLM:
 		// Self-hosted vLLM/LiteLLM natively support both OpenAI Chat and Responses endpoints.
-		if sourceFormat == ir.FormatOpenAIChat || sourceFormat == ir.FormatOpenAIResponses {
+		if sourceFormat == ir.FormatOpenAIResponses {
+			return irTargetSpec{}, false
+		}
+		if shouldChatCompletionsUseResponses(info) {
+			return irTargetSpec{
+				Format:      ir.FormatOpenAIResponses,
+				RelayMode:   relayconstant.RelayModeResponses,
+				URLPath:     "/v1/responses",
+				RelayFormat: types.RelayFormatOpenAIResponses,
+			}, true
+		}
+		if sourceFormat == ir.FormatOpenAIChat {
 			return irTargetSpec{}, false
 		}
 		return irTargetSpec{
@@ -284,6 +303,14 @@ func resolveTargetIRSpec(c *gin.Context, info *relaycommon.RelayInfo, adaptor ch
 		constant.APITypeBaiduV2,
 		constant.APITypeTencent,
 		constant.APITypeSubmodel:
+		if sourceFormat != ir.FormatOpenAIResponses && shouldChatCompletionsUseResponses(info) {
+			return irTargetSpec{
+				Format:      ir.FormatOpenAIResponses,
+				RelayMode:   relayconstant.RelayModeResponses,
+				URLPath:     "/v1/responses",
+				RelayFormat: types.RelayFormatOpenAIResponses,
+			}, true
+		}
 		return irTargetSpec{
 			Format:      ir.FormatOpenAIChat,
 			RelayMode:   relayconstant.RelayModeChatCompletions,
@@ -756,6 +783,29 @@ func applyIRModelSuffixAdaptation(raw []byte, info *relaycommon.RelayInfo, spec 
 				},
 			}, nil)
 		}
+
+	case ir.FormatOpenAIResponses:
+		// Official ChannelTypeOpenAI runs normalizeOfficialResponsesRequest separately;
+		// for other Responses-capable channels, mirror openai.Adaptor.ConvertOpenAIResponsesRequest
+		// suffix extraction (e.g. gpt-5-high -> model="gpt-5", reasoning.effort="high").
+		if info.ChannelType != constant.ChannelTypeOpenAI {
+			if effort, originModel := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(modelName); effort != "" && originModel != "" {
+				info.UpstreamModelName = originModel
+				info.ReasoningEffort = effort
+				return ir.ApplyJSONTransforms(raw, []ir.JSONTransform{
+					func(payload map[string]any, _ *ir.ConversionContext) error {
+						payload["model"] = originModel
+						rCfg, _ := payload["reasoning"].(map[string]any)
+						if rCfg == nil {
+							rCfg = make(map[string]any)
+							payload["reasoning"] = rCfg
+						}
+						rCfg["effort"] = effort
+						return nil
+					},
+				}, nil)
+			}
+		}
 	}
 
 	return raw, nil
@@ -1011,6 +1061,7 @@ func executeIRHTTPRelay(
 		return adaptor.DoRequest(c, info, bytes.NewReader(targetJSON))
 	})
 	if err != nil {
+		helper.ClearEventStreamHeaders(c)
 		if apiErr, ok := err.(*types.NewAPIError); ok {
 			return nil, apiErr
 		}
@@ -1019,6 +1070,7 @@ func executeIRHTTPRelay(
 
 	httpResp, ok := resp.(*http.Response)
 	if !ok || httpResp == nil {
+		helper.ClearEventStreamHeaders(c)
 		return nil, types.NewError(fmt.Errorf("ir: unexpected response type %T", resp), types.ErrorCodeDoRequestFailed)
 	}
 	if httpResp.Body != nil {
@@ -1026,10 +1078,12 @@ func executeIRHTTPRelay(
 	}
 
 	if httpResp.StatusCode != http.StatusOK {
+		helper.ClearEventStreamHeaders(c)
 		newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
 		return nil, newApiErr
 	}
 	if httpResp.Body == nil {
+		helper.ClearEventStreamHeaders(c)
 		return nil, types.NewError(errors.New("ir: upstream returned nil response body"), types.ErrorCodeReadResponseBodyFailed)
 	}
 
@@ -1286,6 +1340,7 @@ func writeIRNonStreamResponse(
 ) *dto.Usage {
 	info.SetFirstResponseTime()
 	c.Set("ir_response_committed", true)
+	helper.ClearEventStreamHeaders(c)
 	c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	service.IOCopyBytesGracefully(c, nil, outBytes)
 	info.SendResponseCount++

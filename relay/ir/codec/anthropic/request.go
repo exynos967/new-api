@@ -1159,51 +1159,13 @@ func ensureInputSchemaObject(raw json.RawMessage) json.RawMessage {
 	if err := json.Unmarshal(trimmed, &schema); err != nil || schema == nil {
 		return json.RawMessage(`{"type":"object","properties":{}}`)
 	}
-	normalizeSchemaTypesLower(schema)
+	ir.NormalizeJSONSchemaTypesInPlace(schema)
 	schema["type"] = "object"
 	b, err := json.Marshal(schema)
 	if err != nil {
 		return json.RawMessage(`{"type":"object","properties":{}}`)
 	}
 	return json.RawMessage(b)
-}
-
-func normalizeSchemaTypesLower(node any) {
-	switch v := node.(type) {
-	case map[string]any:
-		if t, ok := v["type"].(string); ok && t != "" {
-			v["type"] = strings.ToLower(t)
-		}
-		if props, ok := v["properties"].(map[string]any); ok {
-			for _, child := range props {
-				normalizeSchemaTypesLower(child)
-			}
-		}
-		if items, ok := v["items"]; ok {
-			normalizeSchemaTypesLower(items)
-		}
-		for _, k := range []string{"anyOf", "oneOf", "allOf"} {
-			if list, ok := v[k].([]any); ok {
-				for _, child := range list {
-					normalizeSchemaTypesLower(child)
-				}
-			}
-		}
-		for _, k := range []string{"$defs", "definitions"} {
-			if defs, ok := v[k].(map[string]any); ok {
-				for _, child := range defs {
-					normalizeSchemaTypesLower(child)
-				}
-			}
-		}
-		if addProps, ok := v["additionalProperties"].(map[string]any); ok {
-			normalizeSchemaTypesLower(addProps)
-		}
-	case []any:
-		for _, child := range v {
-			normalizeSchemaTypesLower(child)
-		}
-	}
 }
 
 func encodeToolChoice(tc *ir.ToolChoice, parallelToolCalls *bool, hasTools bool) *wireToolChoice {

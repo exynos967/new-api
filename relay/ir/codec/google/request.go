@@ -656,6 +656,9 @@ func decodeGoogleTools(raw json.RawMessage) ([]ir.ToolDefinition, error) {
 					if isNullOrEmptyRaw(params) {
 						params = d.ParametersJSONSchema
 					}
+					if !isNullOrEmptyRaw(params) {
+						params = ir.NormalizeJSONSchemaTypes(params)
+					}
 					defs = append(defs, ir.ToolDefinition{
 						Type:        "function",
 						Name:        d.Name,
@@ -753,7 +756,7 @@ func decodeGoogleGenerationConfig(gc *googleGenerationConfig, req *ir.Request) {
 	if !isNullOrEmptyRaw(schema) {
 		req.ResponseFormat = &ir.ResponseFormat{
 			Type:   "json_schema",
-			Schema: schema,
+			Schema: ir.NormalizeJSONSchemaTypes(schema),
 		}
 	} else if strings.EqualFold(gc.ResponseMimeType, "application/json") {
 		req.ResponseFormat = &ir.ResponseFormat{
