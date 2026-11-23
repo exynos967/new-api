@@ -1,6 +1,7 @@
 package aws
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -8,7 +9,10 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/ir"
+	_ "github.com/QuantumNous/new-api/relay/ir/codec/all"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/pkg/errors"
@@ -22,9 +26,11 @@ type Adaptor struct {
 	IsNova    bool
 }
 
-func (a *Adaptor) ConvertGeminiRequest(*gin.Context, *relaycommon.RelayInfo, *dto.GeminiChatRequest) (any, error) {
-	//TODO implement me
-	return nil, errors.New("not implemented")
+func (a *Adaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error) {
+	if !model_setting.IsIRConversionEnabled() {
+		return nil, errors.New("not implemented")
+	}
+	return a.convertCrossProtocolViaIR(c, info, ir.FormatGoogleGenAI, request)
 }
 
 func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
@@ -119,8 +125,39 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 }
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
-	// TODO implement me
-	return nil, errors.New("not implemented")
+	if !model_setting.IsIRConversionEnabled() {
+		return nil, errors.New("not implemented")
+	}
+	return a.convertCrossProtocolViaIR(c, info, ir.FormatOpenAIResponses, &request)
+}
+
+func (a *Adaptor) convertCrossProtocolViaIR(c *gin.Context, info *relaycommon.RelayInfo, sourceFormat ir.Format, request any) (any, error) {
+	scope := ""
+	opts := map[string]any{}
+	if info != nil {
+		if info.ChannelId > 0 {
+			scope = fmt.Sprintf("channel:%d", info.ChannelId)
+		}
+		if dm := model_setting.GetClaudeSettings().GetDefaultMaxTokens(info.UpstreamModelName); dm > 0 {
+			opts["default_max_tokens"] = dm
+		}
+	}
+	raw, err := ir.ConvertPayload(sourceFormat, ir.FormatAnthropic, request, nil, scope, opts)
+	if err != nil {
+		return nil, err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	if err := inlineBedrockURLImages(c, payload); err != nil {
+		return nil, err
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(out), nil
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {

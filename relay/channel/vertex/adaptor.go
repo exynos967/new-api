@@ -2,7 +2,9 @@ package vertex
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -16,6 +18,8 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relay/ir"
+	_ "github.com/QuantumNous/new-api/relay/ir/codec/all"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/QuantumNous/new-api/types"
@@ -64,6 +68,11 @@ type Adaptor struct {
 }
 
 func (a *Adaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error) {
+	if model_setting.IsIRConversionEnabled() && a.RequestMode != RequestModeGemini {
+		if target, ok := a.ResolveIRTarget(info); ok && target.Format != ir.FormatGoogleGenAI {
+			return a.convertViaIR(info, ir.FormatGoogleGenAI, target, request)
+		}
+	}
 	// Vertex AI does not support functionResponse.id; keep it stripped here for consistency.
 	if model_setting.GetGeminiSettings().RemoveFunctionResponseIdEnabled {
 		removeFunctionResponseID(request)
@@ -106,6 +115,11 @@ func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayIn
 		return nil, a.initErr
 	}
 	if a.capability.Family != vertexmodel.Claude {
+		if model_setting.IsIRConversionEnabled() {
+			if target, ok := a.ResolveIRTarget(info); ok {
+				return a.convertViaIR(info, ir.FormatAnthropic, target, request)
+			}
+		}
 		return nil, errors.New("Vertex messages requires a Claude model")
 	}
 	request.Model = a.capability.Model
@@ -365,7 +379,40 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 }
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
+	if a.capability.Family != vertexmodel.Grok && model_setting.IsIRConversionEnabled() {
+		if target, ok := a.ResolveIRTarget(info); ok {
+			return a.convertViaIR(info, ir.FormatOpenAIResponses, target, &request)
+		}
+	}
 	return a.convertResponses(c, info, request)
+}
+
+func (a *Adaptor) convertViaIR(info *relaycommon.RelayInfo, sourceFormat ir.Format, target IRTarget, sourceReq any) (json.RawMessage, error) {
+	scope := ""
+	opts := map[string]any{
+		"attach_thought_signature": model_setting.GetGeminiSettings().FunctionCallThoughtSignatureEnabled,
+		"disable_stream_options":   target.ClearStream,
+	}
+	if info != nil {
+		if info.ChannelId > 0 {
+			scope = fmt.Sprintf("channel:%d", info.ChannelId)
+		}
+		if dm := model_setting.GetClaudeSettings().GetDefaultMaxTokens(info.UpstreamModelName); dm > 0 {
+			opts["default_max_tokens"] = dm
+		}
+	}
+	raw, err := ir.ConvertPayload(sourceFormat, target.Format, sourceReq, target.Shim, scope, opts)
+	if err != nil {
+		return nil, err
+	}
+	if target.ModelRewrite != "" {
+		out, err := ir.ApplyJSONTransforms(raw, []ir.JSONTransform{ir.SetField("model", target.ModelRewrite)}, nil)
+		if err != nil {
+			return nil, err
+		}
+		return json.RawMessage(out), nil
+	}
+	return raw, nil
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {
