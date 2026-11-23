@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 
-import { useCallback } from 'react';
+import { useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { SSE } from 'sse.js';
 import {
@@ -31,6 +31,15 @@ import {
   processThinkTags,
   processIncompleteThinkTags,
 } from '../../helpers';
+import {
+  playgroundReply,
+  playgroundStreamEvents,
+  playgroundUsage,
+  replyStatistics,
+} from '../../helpers/playgroundResponse';
+
+const messageIndex = (messages, id) =>
+  id == null ? messages.length - 1 : messages.findIndex((msg) => msg.id === id);
 
 export const useApiRequest = (
   setMessage,
@@ -40,6 +49,7 @@ export const useApiRequest = (
   saveMessages,
 ) => {
   const { t } = useTranslation();
+  const activeRequestRef = useRef(null);
 
   // 处理消息自动关闭逻辑的公共函数
   const applyAutoCollapseLogic = useCallback(
@@ -59,9 +69,10 @@ export const useApiRequest = (
 
   // 流式消息更新
   const streamMessageUpdate = useCallback(
-    (textChunk, type) => {
+    (textChunk, type, id) => {
       setMessage((prevMessage) => {
-        const lastMessage = prevMessage[prevMessage.length - 1];
+        const index = messageIndex(prevMessage, id);
+        const lastMessage = prevMessage[index];
         if (!lastMessage) return prevMessage;
         if (lastMessage.role !== 'assistant') return prevMessage;
         if (lastMessage.status === MESSAGE_STATUS.ERROR) {
@@ -125,7 +136,9 @@ export const useApiRequest = (
             };
           }
 
-          return [...prevMessage.slice(0, -1), newMessage];
+          return prevMessage.map((item, i) =>
+            i === index ? newMessage : item,
+          );
         }
 
         return prevMessage;
@@ -136,10 +149,12 @@ export const useApiRequest = (
 
   // 完成消息
   const completeMessage = useCallback(
-    (status = MESSAGE_STATUS.COMPLETE) => {
+    (status = MESSAGE_STATUS.COMPLETE, id, fields = {}) => {
       setMessage((prevMessage) => {
-        const lastMessage = prevMessage[prevMessage.length - 1];
+        const index = messageIndex(prevMessage, id);
+        const lastMessage = prevMessage[index];
         if (
+          !lastMessage ||
           lastMessage.status === MESSAGE_STATUS.COMPLETE ||
           lastMessage.status === MESSAGE_STATUS.ERROR
         ) {
@@ -148,14 +163,23 @@ export const useApiRequest = (
 
         const autoCollapseState = applyAutoCollapseLogic(lastMessage, true);
 
-        const updatedMessages = [
-          ...prevMessage.slice(0, -1),
-          {
-            ...lastMessage,
-            status: status,
-            ...autoCollapseState,
-          },
-        ];
+        const updatedMessages = prevMessage.map((item, i) =>
+          i === index
+            ? {
+                ...lastMessage,
+                ...fields,
+                ...(fields.errorMessage
+                  ? {
+                      content: [lastMessage.content, fields.errorMessage]
+                        .filter(Boolean)
+                        .join('\n\n'),
+                    }
+                  : {}),
+                status: status,
+                ...autoCollapseState,
+              }
+            : item,
+        );
 
         // 在消息完成时保存，传入更新后的消息列表
         if (
@@ -173,7 +197,7 @@ export const useApiRequest = (
 
   // 非流式请求
   const handleNonStreamRequest = useCallback(
-    async (payload) => {
+    async (payload, { url, id, started, controller }) => {
       setDebugData((prev) => ({
         ...prev,
         request: payload,
@@ -185,8 +209,9 @@ export const useApiRequest = (
       setActiveDebugTab(DEBUG_TABS.REQUEST);
 
       try {
-        const response = await fetch(API_ENDPOINTS.CHAT_COMPLETIONS, {
+        const response = await fetch(url, {
           method: 'POST',
+          signal: controller.signal,
           headers: {
             'Content-Type': 'application/json',
             'New-Api-User': getUserIdFromLocalStorage(),
@@ -232,6 +257,12 @@ export const useApiRequest = (
         }
 
         const data = await response.json();
+        if (controller.signal.aborted) return;
+        if (data.error || data.status === 'failed') {
+          const err = new Error(data.error?.message || t('请求发生错误'));
+          err.errorCode = data.error?.code;
+          throw err;
+        }
 
         setDebugData((prev) => ({
           ...prev,
@@ -239,37 +270,18 @@ export const useApiRequest = (
         }));
         setActiveDebugTab(DEBUG_TABS.RESPONSE);
 
-        if (data.choices?.[0]) {
-          const choice = data.choices[0];
-          let content = choice.message?.content || '';
-          let reasoningContent =
-            choice.message?.reasoning_content ||
-            choice.message?.reasoning ||
-            '';
-
-          const processed = processThinkTags(content, reasoningContent);
-
-          setMessage((prevMessage) => {
-            const newMessages = [...prevMessage];
-            const lastMessage = newMessages[newMessages.length - 1];
-            if (lastMessage?.status === MESSAGE_STATUS.LOADING) {
-              const autoCollapseState = applyAutoCollapseLogic(
-                lastMessage,
-                true,
-              );
-
-              newMessages[newMessages.length - 1] = {
-                ...lastMessage,
-                content: processed.content,
-                reasoningContent: processed.reasoningContent,
-                status: MESSAGE_STATUS.COMPLETE,
-                ...autoCollapseState,
-              };
-            }
-            return newMessages;
-          });
-        }
+        const { content = '', reasoning = '' } = playgroundReply(data);
+        const processed = processThinkTags(content, reasoning);
+        completeMessage(MESSAGE_STATUS.COMPLETE, id, {
+          ...processed,
+          statistics: replyStatistics(
+            playgroundUsage(data),
+            started,
+            performance.now(),
+          ),
+        });
       } catch (error) {
+        if (controller.signal.aborted) return;
         console.error('Non-stream request error:', error);
 
         const errorInfo = handleApiError(error);
@@ -279,30 +291,21 @@ export const useApiRequest = (
         }));
         setActiveDebugTab(DEBUG_TABS.RESPONSE);
 
-        setMessage((prevMessage) => {
-          const newMessages = [...prevMessage];
-          const lastMessage = newMessages[newMessages.length - 1];
-          if (lastMessage?.status === MESSAGE_STATUS.LOADING) {
-            const autoCollapseState = applyAutoCollapseLogic(lastMessage, true);
-
-            newMessages[newMessages.length - 1] = {
-              ...lastMessage,
-              content: t('请求发生错误: ') + error.message,
-              errorCode: error.errorCode || null,
-              status: MESSAGE_STATUS.ERROR,
-              ...autoCollapseState,
-            };
-          }
-          return newMessages;
+        completeMessage(MESSAGE_STATUS.ERROR, id, {
+          content: t('请求发生错误: ') + error.message,
+          errorCode: error.errorCode ?? null,
         });
+      } finally {
+        if (activeRequestRef.current?.controller === controller)
+          activeRequestRef.current = null;
       }
     },
-    [setDebugData, setActiveDebugTab, setMessage, t, applyAutoCollapseLogic],
+    [setDebugData, setActiveDebugTab, completeMessage, t],
   );
 
   // SSE请求
   const handleSSE = useCallback(
-    (payload) => {
+    (payload, { url, id, endpoint, started, controller }) => {
       setDebugData((prev) => ({
         ...prev,
         request: payload,
@@ -313,153 +316,180 @@ export const useApiRequest = (
       }));
       setActiveDebugTab(DEBUG_TABS.REQUEST);
 
-      const source = new SSE(API_ENDPOINTS.CHAT_COMPLETIONS, {
+      const source = new SSE(url, {
         headers: {
           'Content-Type': 'application/json',
           'New-Api-User': getUserIdFromLocalStorage(),
         },
         method: 'POST',
         payload: JSON.stringify(payload),
+        start: false,
       });
 
       sseSourceRef.current = source;
 
       let responseData = '';
       let hasReceivedFirstResponse = false;
-      let isStreamComplete = false; // 添加标志位跟踪流是否正常完成
+      let isStreamFinished = false;
+      let first;
+      let last;
+      let geminiFinished = false;
+      const usage = {};
+      const release = () => {
+        if (activeRequestRef.current?.controller === controller)
+          activeRequestRef.current = null;
+        if (sseSourceRef.current === source) sseSourceRef.current = null;
+      };
 
-      source.addEventListener('message', (e) => {
-        if (e.data === '[DONE]') {
-          isStreamComplete = true; // 标记流正常完成
-          source.close();
-          sseSourceRef.current = null;
-          setDebugData((prev) => ({
-            ...prev,
-            response: responseData,
-            sseMessages: [...(prev.sseMessages || []), '[DONE]'], // 添加 DONE 标记
-            isStreaming: false,
-          }));
-          completeMessage();
+      const finishStream = (error = null, response = null) => {
+        if (isStreamFinished) return;
+        const errorInfo = error && {
+          ...handleApiError(error, response),
+          readyState: source.readyState,
+        };
+        // Closing the connection can synchronously dispatch abort/closed events.
+        isStreamFinished = true;
+        release();
+        if (source.xhr) source.close();
+
+        setDebugData((prev) => ({
+          ...prev,
+          response: error
+            ? responseData +
+              '\n\nSSE Error:\n' +
+              JSON.stringify(errorInfo, null, 2)
+            : responseData,
+          isStreaming: false,
+        }));
+        setActiveDebugTab(DEBUG_TABS.RESPONSE);
+
+        completeMessage(
+          error ? MESSAGE_STATUS.ERROR : MESSAGE_STATUS.COMPLETE,
+          id,
+          error
+            ? {
+                errorMessage: error.message,
+                errorCode: error.errorCode ?? null,
+              }
+            : {
+                statistics: replyStatistics(
+                  usage,
+                  started,
+                  performance.now(),
+                  first,
+                  last,
+                ),
+              },
+        );
+      };
+
+      const onMessage = (e) => {
+        // sse.js emits an empty message for comment-only keep-alive frames.
+        if (isStreamFinished || !e.data?.trim()) return;
+
+        setDebugData((prev) => ({
+          ...prev,
+          sseMessages: [...(prev.sseMessages || []), e.data],
+        }));
+        if (e.data.trim() === '[DONE]') {
+          finishStream();
           return;
         }
 
+        responseData += e.data + '\n';
         try {
           const payload = JSON.parse(e.data);
-          responseData += e.data + '\n';
+          const event = payload.type || e.type;
+
+          if (
+            payload?.error ||
+            event === 'response.failed' ||
+            payload.choices?.[0]?.finish_reason === 'error'
+          ) {
+            const details = payload.error ?? payload.response?.error;
+            const error = new Error(details?.message || t('请求发生错误'));
+            error.errorCode = details?.code ?? null;
+            finishStream(error);
+            return;
+          }
 
           if (!hasReceivedFirstResponse) {
             setActiveDebugTab(DEBUG_TABS.RESPONSE);
             hasReceivedFirstResponse = true;
           }
 
-          // 新增：将 SSE 消息添加到数组
-          setDebugData((prev) => ({
-            ...prev,
-            sseMessages: [...(prev.sseMessages || []), e.data],
-          }));
-
-          const delta = payload.choices?.[0]?.delta;
-          if (delta) {
-            if (delta.reasoning_content) {
-              streamMessageUpdate(delta.reasoning_content, 'reasoning');
-            }
-            if (delta.reasoning) {
-              streamMessageUpdate(delta.reasoning, 'reasoning');
-            }
-            if (delta.content) {
-              streamMessageUpdate(delta.content, 'content');
-            }
+          for (const [key, value] of Object.entries(playgroundUsage(payload))) {
+            if (value !== undefined) usage[key] = value;
           }
+          const { content, reasoning } = playgroundReply(payload, event);
+          if (content?.trim() || reasoning?.trim()) {
+            last = performance.now();
+            first ??= last;
+          }
+          if (reasoning) streamMessageUpdate(reasoning, 'reasoning', id);
+          if (content) streamMessageUpdate(content, 'content', id);
+          if (
+            event === 'message_stop' ||
+            event === 'response.completed' ||
+            event === 'response.incomplete'
+          )
+            finishStream();
+          if (
+            endpoint === 'gemini' &&
+            (payload.candidates?.[0]?.finishReason ||
+              payload.promptFeedback?.blockReason)
+          )
+            geminiFinished = true;
         } catch (error) {
           console.error('Failed to parse SSE message:', error);
-          const errorInfo = `解析错误: ${error.message}`;
-
-          setDebugData((prev) => ({
-            ...prev,
-            response: responseData + `\n\nError: ${errorInfo}`,
-            sseMessages: [...(prev.sseMessages || []), e.data], // 即使解析失败也保存原始数据
-            isStreaming: false,
-          }));
-          setActiveDebugTab(DEBUG_TABS.RESPONSE);
-
-          streamMessageUpdate(t('解析响应数据时发生错误'), 'content');
-          completeMessage(MESSAGE_STATUS.ERROR);
+          finishStream(
+            new Error(`${t('解析响应数据时发生错误')}: ${error.message}`),
+          );
         }
-      });
+      };
+      source.addEventListener('message', onMessage);
+      for (const event of playgroundStreamEvents)
+        source.addEventListener(event, onMessage);
 
       source.addEventListener('error', (e) => {
-        // 只有在流没有正常完成且连接状态异常时才处理错误
-        if (!isStreamComplete && source.readyState !== 2) {
-          console.error('SSE Error:', e);
-          let errorMessage = e.data || t('请求发生错误');
-          let errorCode = null;
-
-          if (e.data) {
-            try {
-              const errorJson = JSON.parse(e.data);
-              if (errorJson?.error) {
-                errorMessage = errorJson.error.message || errorMessage;
-                errorCode = errorJson.error.code || null;
-              }
-            } catch (_) {
-              // not JSON, use raw data as error message
-            }
-          }
-
-          const errorInfo = handleApiError(new Error(errorMessage));
-          errorInfo.readyState = source.readyState;
-
-          setDebugData((prev) => ({
-            ...prev,
-            response:
-              responseData +
-              '\n\nSSE Error:\n' +
-              JSON.stringify(errorInfo, null, 2),
-          }));
-          setActiveDebugTab(DEBUG_TABS.RESPONSE);
-
-          setMessage((prevMessage) => {
-            const newMessages = [...prevMessage];
-            const lastMessage = newMessages[newMessages.length - 1];
-            if (lastMessage && lastMessage.status !== MESSAGE_STATUS.COMPLETE && lastMessage.status !== MESSAGE_STATUS.ERROR) {
-              newMessages[newMessages.length - 1] = {
-                ...lastMessage,
-                content: (lastMessage.content || '') + errorMessage,
-                errorCode: errorCode,
-                status: MESSAGE_STATUS.ERROR,
-              };
-            }
-            return newMessages;
-          });
-          sseSourceRef.current = null;
-          source.close();
+        if (isStreamFinished) return;
+        if (e.data && e.responseCode == null) {
+          onMessage(e);
+          return;
         }
+        let errorMessage = e.data || t('请求发生错误');
+        let errorCode = null;
+
+        if (e.data) {
+          try {
+            const errorJson = JSON.parse(e.data);
+            if (errorJson?.error) {
+              errorMessage = errorJson.error.message || errorMessage;
+              errorCode = errorJson.error.code ?? null;
+            }
+          } catch (_) {
+            // Non-JSON HTTP errors retain their original message.
+          }
+        }
+        const error = new Error(errorMessage);
+        error.errorCode = errorCode;
+        finishStream(error, { status: e.responseCode });
+      });
+
+      source.addEventListener('abort', () => {
+        if (isStreamFinished) return;
+        isStreamFinished = true;
+        release();
+        setDebugData((prev) => ({
+          ...prev,
+          response: responseData,
+          isStreaming: false,
+        }));
       });
 
       source.addEventListener('readystatechange', (e) => {
-        // 检查 HTTP 状态错误，但避免与正常关闭重复处理
-        if (
-          e.readyState >= 2 &&
-          source.status !== undefined &&
-          source.status !== 200 &&
-          !isStreamComplete
-        ) {
-          const errorInfo = handleApiError(new Error('HTTP状态错误'));
-          errorInfo.status = source.status;
-          errorInfo.readyState = source.readyState;
-
-          setDebugData((prev) => ({
-            ...prev,
-            response:
-              responseData +
-              '\n\nHTTP Error:\n' +
-              JSON.stringify(errorInfo, null, 2),
-          }));
-          setActiveDebugTab(DEBUG_TABS.RESPONSE);
-
-          source.close();
-          streamMessageUpdate(t('连接已断开'), 'content');
-          completeMessage(MESSAGE_STATUS.ERROR);
+        if (e.readyState === SSE.CLOSED && !isStreamFinished) {
+          finishStream(geminiFinished ? null : new Error(t('连接已断开')));
         }
       });
 
@@ -467,16 +497,7 @@ export const useApiRequest = (
         source.stream();
       } catch (error) {
         console.error('Failed to start SSE stream:', error);
-        const errorInfo = handleApiError(error);
-
-        setDebugData((prev) => ({
-          ...prev,
-          response: 'Stream启动失败:\n' + JSON.stringify(errorInfo, null, 2),
-        }));
-        setActiveDebugTab(DEBUG_TABS.RESPONSE);
-
-        streamMessageUpdate(t('建立连接时发生错误'), 'content');
-        completeMessage(MESSAGE_STATUS.ERROR);
+        finishStream(new Error(`${t('建立连接时发生错误')}: ${error.message}`));
       }
     },
     [
@@ -486,12 +507,15 @@ export const useApiRequest = (
       streamMessageUpdate,
       completeMessage,
       t,
-      applyAutoCollapseLogic,
+      sseSourceRef,
     ],
   );
 
   // 停止生成
   const onStopGenerator = useCallback(() => {
+    const request = activeRequestRef.current;
+    activeRequestRef.current = null;
+    request?.controller.abort();
     // 如果仍有活动的 SSE 连接，首先关闭
     if (sseSourceRef.current) {
       sseSourceRef.current.close();
@@ -501,7 +525,9 @@ export const useApiRequest = (
     // 无论是否存在 SSE 连接，都尝试处理最后一条正在生成的消息
     setMessage((prevMessage) => {
       if (prevMessage.length === 0) return prevMessage;
-      const lastMessage = prevMessage[prevMessage.length - 1];
+      const index = messageIndex(prevMessage, request?.id);
+      const lastMessage = prevMessage[index];
+      if (!lastMessage) return prevMessage;
 
       if (
         lastMessage.status === MESSAGE_STATUS.LOADING ||
@@ -514,16 +540,17 @@ export const useApiRequest = (
 
         const autoCollapseState = applyAutoCollapseLogic(lastMessage, true);
 
-        const updatedMessages = [
-          ...prevMessage.slice(0, -1),
-          {
-            ...lastMessage,
-            status: MESSAGE_STATUS.COMPLETE,
-            reasoningContent: processed.reasoningContent || null,
-            content: processed.content,
-            ...autoCollapseState,
-          },
-        ];
+        const updatedMessages = prevMessage.map((item, i) =>
+          i === index
+            ? {
+                ...lastMessage,
+                status: MESSAGE_STATUS.COMPLETE,
+                reasoningContent: processed.reasoningContent || null,
+                content: processed.content,
+                ...autoCollapseState,
+              }
+            : item,
+        );
 
         // 停止生成时也保存，传入更新后的消息列表
         setTimeout(() => saveMessages(updatedMessages), 0);
@@ -532,16 +559,37 @@ export const useApiRequest = (
       }
       return prevMessage;
     });
-  }, [setMessage, applyAutoCollapseLogic, saveMessages]);
+    setDebugData((prev) => ({ ...prev, isStreaming: false }));
+  }, [
+    setMessage,
+    setDebugData,
+    applyAutoCollapseLogic,
+    saveMessages,
+    sseSourceRef,
+  ]);
 
   // 发送请求
   const sendRequest = useCallback(
-    (payload, isStream) => {
+    (
+      payload,
+      isStream,
+      { url = API_ENDPOINTS.CHAT_COMPLETIONS, endpoint = '', id } = {},
+    ) => {
+      if (activeRequestRef.current) return false;
+      const request = {
+        url,
+        endpoint,
+        id,
+        started: performance.now(),
+        controller: new AbortController(),
+      };
+      activeRequestRef.current = request;
       if (isStream) {
-        handleSSE(payload);
+        handleSSE(payload, request);
       } else {
-        handleNonStreamRequest(payload);
+        handleNonStreamRequest(payload, request);
       }
+      return true;
     },
     [handleSSE, handleNonStreamRequest],
   );

@@ -109,6 +109,10 @@ func ResolveOriginTask(c *gin.Context, info *relaycommon.RelayInfo) *dto.TaskErr
 	if ch.Status != common.ChannelStatusEnabled {
 		return service.TaskErrorWrapperLocal(errors.New("the channel of the origin task is disabled"), "task_channel_disable", http.StatusBadRequest)
 	}
+	if common.GetContextKeyString(c, constant.ContextKeyPlaygroundEndpoint) != "" &&
+		(!service.PlaygroundAllowsChannel(c, ch.Id) || !model.IsChannelEnabledForGroupModel(info.UsingGroup, info.OriginModelName, ch.Id)) {
+		return service.TaskErrorWrapperLocal(errors.New("原任务渠道不属于当前分组或不支持所选路径"), "invalid_request", http.StatusBadRequest)
+	}
 	info.LockedChannel = ch
 
 	if originTask.ChannelId != info.ChannelId {
@@ -291,6 +295,9 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	c.Header("X-New-Api-Other-Ratios", string(ratiosJSON))
 
 	// 11. 解析响应
+	if common.GetContextKeyString(c, constant.ContextKeyPlaygroundEndpoint) != "" {
+		c.Header("X-New-Api-Task-Id", info.PublicTaskID)
+	}
 	upstreamTaskID, taskData, taskErr := adaptor.DoResponse(c, resp, info)
 	if taskErr != nil {
 		return nil, taskErr
@@ -459,7 +466,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 	if isOpenAIVideoAPI {
 		adaptor := GetTaskAdaptor(originTask.Platform)
 		if adaptor == nil {
-			taskResp = service.TaskErrorWrapperLocal(fmt.Errorf("invalid channel id: %d", originTask.ChannelId), "invalid_channel_id", http.StatusBadRequest)
+			taskResp = service.TaskErrorWrapperLocal(errors.New("task channel unavailable"), "invalid_channel_id", http.StatusBadRequest)
 			return
 		}
 		if converter, ok := adaptor.(channel.OpenAIVideoConverter); ok {
@@ -472,7 +479,7 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 			respBody = openAIVideoData
 			return
 		}
-		taskResp = service.TaskErrorWrapperLocal(fmt.Errorf("not_implemented:%s", originTask.Platform), "not_implemented", http.StatusNotImplemented)
+		taskResp = service.TaskErrorWrapperLocal(errors.New("task format not supported"), "not_implemented", http.StatusNotImplemented)
 		return
 	}
 
@@ -698,7 +705,6 @@ func TaskModel2Dto(task *model.Task, showErrorDetails ...bool) *dto.TaskDto {
 		Platform:   string(task.Platform),
 		UserId:     task.UserId,
 		Group:      task.Group,
-		ChannelId:  task.ChannelId,
 		Quota:      task.Quota,
 		Action:     task.Action,
 		Status:     string(task.Status),

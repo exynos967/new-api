@@ -19,7 +19,7 @@ import (
 const conversationLogCleanupBatchSize = 200
 
 func StartConversationCapture(c *gin.Context, relayInfo *relaycommon.RelayInfo) {
-	if c == nil || relayInfo == nil || relayInfo.ChannelMeta == nil {
+	if c == nil || relayInfo == nil || relayInfo.ChannelMeta == nil || relayInfo.IsPlayground || common.IsPlaygroundRequest(c) {
 		return
 	}
 	if !relayInfo.ChannelOtherSettings.ConversationLogEnabled || !isConversationLogRelayFormat(relayInfo.RelayFormat) {
@@ -54,6 +54,9 @@ func isConversationLogRelayFormat(format types.RelayFormat) bool {
 func RecordConversationLogAfterConsume(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, summary textQuotaSummary, usage *dto.Usage, logModel string, other map[string]interface{}) {
 	if ctx == nil || relayInfo == nil || relayInfo.ConversationCapture == nil {
 		return
+	}
+	if err := relaycommon.FinalizeRelayResponse(ctx); err != nil {
+		logger.LogError(ctx, "failed to finalize conversation response: "+err.Error())
 	}
 	snapshot := relayInfo.ConversationCapture.Snapshot()
 	if len(snapshot.ClientRequestBody) == 0 && len(snapshot.ClientResponseBody) == 0 {

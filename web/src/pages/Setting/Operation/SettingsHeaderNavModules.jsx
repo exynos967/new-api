@@ -47,6 +47,7 @@ export default function SettingsHeaderNavModules(props) {
       requireAuth: false, // 默认不需要登录鉴权
     },
     status: true,
+    rankings: true,
     docs: true,
     about: true,
   });
@@ -88,6 +89,7 @@ export default function SettingsHeaderNavModules(props) {
         requireAuth: false,
       },
       status: true,
+      rankings: true,
       docs: true,
       about: true,
     };
@@ -146,6 +148,10 @@ export default function SettingsHeaderNavModules(props) {
         if (typeof modules.status !== 'boolean') {
           modules.status = true;
         }
+        if (typeof modules.rankings !== 'boolean') {
+          modules.rankings = modules.usage !== false;
+        }
+        delete modules.usage;
 
         setHeaderNavModules(modules);
       } catch (error) {
@@ -158,6 +164,7 @@ export default function SettingsHeaderNavModules(props) {
             requireAuth: false,
           },
           status: true,
+          rankings: true,
           docs: true,
           about: true,
         };
@@ -188,6 +195,11 @@ export default function SettingsHeaderNavModules(props) {
       key: 'status',
       title: t('状态查看'),
       description: t('全站模型状态'),
+    },
+    {
+      key: 'rankings',
+      title: t('排行榜'),
+      description: t('热门模型与供应商排行'),
     },
     {
       key: 'docs',

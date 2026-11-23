@@ -18,7 +18,13 @@ For commercial licensing, please contact support@quantumnous.com
 */
 
 import React, { lazy, Suspense, useContext, useMemo } from 'react';
-import { Route, Routes, useLocation, useParams } from 'react-router-dom';
+import {
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+  useParams,
+} from 'react-router-dom';
 import Loading from './components/common/ui/Loading';
 import User from './pages/User';
 import { AuthRedirect, PrivateRoute, AdminRoute } from './helpers';
@@ -54,6 +60,7 @@ import SetupCheck from './components/layout/SetupCheck';
 
 const Home = lazy(() => import('./pages/Home'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Rankings = lazy(() => import('./pages/Rankings'));
 const About = lazy(() => import('./pages/About'));
 const UserAgreement = lazy(() => import('./pages/UserAgreement'));
 const PrivacyPolicy = lazy(() => import('./pages/PrivacyPolicy'));
@@ -109,6 +116,15 @@ function App() {
           }
         />
         <Route path='/model-status' element={<ModelStatusPublicPage />} />
+        <Route
+          path='/rankings'
+          element={
+            <Suspense fallback={<Loading />}>
+              <Rankings />
+            </Suspense>
+          }
+        />
+        <Route path='/usage' element={<Navigate to='/rankings' replace />} />
         <Route path='/forbidden' element={<Forbidden />} />
         <Route
           path='/console/models'

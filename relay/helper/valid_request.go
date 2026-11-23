@@ -31,6 +31,8 @@ func GetAndValidateRequest(c *gin.Context, format types.RelayFormat) (request dt
 		var r dto.Request = &dto.OpenAIDecisionsRequest{}
 		if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeOpenRouter {
 			r = &dto.OpenRouterDecisionsRequest{}
+		} else if constant.SupportsNamedDecisions(common.GetContextKeyInt(c, constant.ContextKeyChannelType)) {
+			r = &dto.TypeSafeRequest{}
 		}
 		err = common.UnmarshalBodyReusable(c, r)
 		if err != nil && !common.IsRequestBodyTooLargeError(err) {
@@ -131,8 +133,11 @@ func GetAndValidateRerankRequest(c *gin.Context) (*dto.RerankRequest, error) {
 		return nil, types.NewError(err, types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
 
-	if len(rerankRequest.QueryObject) > 0 && common.GetContextKeyInt(c, constant.ContextKeyChannelType) != constant.ChannelTypeQianwenAI {
-		return nil, types.NewError(fmt.Errorf("query objects require a QianwenAI multimodal rerank model"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	if len(rerankRequest.QueryObject) > 0 {
+		channelType := common.GetContextKeyInt(c, constant.ContextKeyChannelType)
+		if channelType != constant.ChannelTypeQianwenAI && channelType != constant.ChannelTypeJina {
+			return nil, types.NewError(fmt.Errorf("query objects require a multimodal rerank model"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+		}
 	}
 	if rerankRequest.Query == "" && len(rerankRequest.QueryObject) == 0 {
 		return nil, types.NewError(fmt.Errorf("query is empty"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())

@@ -222,7 +222,11 @@ func UpdateMidjourneyTaskBulk() {
 				if err != nil {
 					logger.LogError(ctx, "UpdateMidjourneyTask task error: "+err.Error())
 				} else if won && shouldReturnQuota {
-					err = model.IncreaseUserQuota(task.UserId, task.Quota, false)
+					if task.WalletChargeId > 0 {
+						err = model.RefundWalletCharge(task.UserId, task.WalletChargeId)
+					} else {
+						err = model.IncreaseUserQuota(task.UserId, task.Quota, false)
+					}
 					if err != nil {
 						logger.LogError(ctx, "fail to increase user quota: "+err.Error())
 					}
@@ -319,7 +323,7 @@ func GetAllMidjourney(c *gin.Context) {
 			items[i] = midjourney
 		}
 	}
-	items = midjourneyTasksForViewer(items, c.GetInt("role") >= common.RoleRootUser)
+	items = midjourneyTasksForViewer(items, c.GetInt("role") >= common.RoleAdminUser)
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(items)
 	common.ApiSuccess(c, pageInfo)
@@ -346,6 +350,11 @@ func GetUserMidjourney(c *gin.Context) {
 		}
 	}
 	items = midjourneyTasksForViewer(items, false)
+	for _, task := range items {
+		if task != nil {
+			task.ChannelId = 0
+		}
+	}
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(items)
 	common.ApiSuccess(c, pageInfo)

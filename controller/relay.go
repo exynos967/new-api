@@ -39,7 +39,7 @@ func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIErro
 		return relay.VertexNativeHelper(c, info)
 	}
 	if info.RelayFormat == types.RelayFormatTypeSafe {
-		return relay.TypeSafeHelper(c, info)
+		return relay.NamedDecisionsHelper(c, info)
 	}
 	if info.RelayFormat == types.RelayFormatMistralNative || info.RelayFormat == types.RelayFormatMistralRealtime {
 		return relay.MistralNativeHelper(c, info)
@@ -84,6 +84,11 @@ func geminiRelayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewA
 }
 
 func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+	defer func() {
+		if err := relaycommon.FinalizeRelayResponse(c); err != nil {
+			logger.LogError(c, "failed to finalize relay response: "+err.Error())
+		}
+	}()
 	if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeVertexAi {
 		switch vertexmodel.NativeAction(c.Request.URL.Path) {
 		case "predictLongRunning":
@@ -95,16 +100,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			return
 		}
 	}
-	if relayFormat == types.RelayFormatOpenAIDecisions && common.GetContextKeyInt(c, constant.ContextKeyChannelType) != constant.ChannelTypeOpenAI && common.GetContextKeyInt(c, constant.ContextKeyChannelType) != constant.ChannelTypeOpenRouter {
+	if relayFormat == types.RelayFormatOpenAIDecisions && common.GetContextKeyInt(c, constant.ContextKeyChannelType) != constant.ChannelTypeOpenAI && !constant.SupportsNamedDecisions(common.GetContextKeyInt(c, constant.ContextKeyChannelType)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": types.OpenAIError{
-			Message: "/v1/decisions requires an OpenAI or OpenRouter channel", Type: "invalid_request_error",
+			Message: "/v1/decisions requires an OpenAI, OpenRouter, TypeSafe or QianwenAI channel", Type: "invalid_request_error",
 		}})
 		return
 	}
 	// Reject unsupported protocols before any WebSocket upgrade or pre-charge.
-	if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeTypeSafe && relayFormat != types.RelayFormatTypeSafe {
+	if common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeTypeSafe && relayFormat != types.RelayFormatTypeSafe && relayFormat != types.RelayFormatOpenAIDecisions {
 		c.JSON(http.StatusBadRequest, gin.H{"error": types.OpenAIError{
-			Message: "TypeSafe only supports POST /v1/systemone",
+			Message: "TypeSafe only supports POST /v1/systemone or /v1/decisions with state and named questions",
 			Type:    "invalid_request_error", Code: types.ErrorCodeInvalidRequest,
 		}})
 		return
@@ -141,7 +146,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	defer func() {
 		if newAPIError != nil {
-			logger.LogError(c, fmt.Sprintf("relay error: %s", newAPIError.Error()))
+			logger.LogError(c, fmt.Sprintf("relay error: %s", relayErrorLogMessage(c, newAPIError)))
 			if c.GetBool("openrouter_response_committed") && c.Writer.Written() {
 				return
 			}
@@ -151,7 +156,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if c.GetBool("bilibili_web_response_committed") && c.Writer.Written() {
 				return
 			}
-			if relayFormat == types.RelayFormatTypeSafe && typesafe.WriteUpstreamError(c, newAPIError) {
+			if (relayFormat == types.RelayFormatTypeSafe || relayFormat == types.RelayFormatOpenAIDecisions) && typesafe.WriteUpstreamError(c, newAPIError) {
 				return
 			}
 			if (relayFormat == types.RelayFormatMistralNative || relayFormat == types.RelayFormatMistralRealtime || common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeVertexAi) && c.Writer.Written() {
@@ -206,6 +211,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		meta = request.GetTokenCountMeta()
 	} else {
 		meta = fastTokenCountMetaForPricing(request)
+	}
+	if needCountToken {
+		for _, image := range relaycommon.PlaygroundEmbeddingImages(c).Images {
+			meta.Files = append(meta.Files, types.NewImageFileMeta(image.ToFileSource(), "auto"))
+		}
 	}
 
 	if needSensitiveCheck && meta != nil {
@@ -561,11 +571,15 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
-	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, err.Error()))
+	message := relayErrorLogMessage(c, err)
+	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, message))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
 	if service.ShouldDisableChannelError(err, channelError) && channelError.AutoBan {
 		reason := err.ErrorWithStatusCode()
+		if common.IsPlaygroundRequest(c) {
+			reason = message
+		}
 		if channelError.IsMultiKey {
 			if service.DisableChannelStatus(channelError, reason) {
 				markChannelKeyDisabledForRetry(c, channelError.ChannelId)
@@ -616,9 +630,20 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			startTime = time.Now()
 		}
 		useTimeSeconds := int(time.Since(startTime).Seconds())
-		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, relaycommon.SanitizeModelText(relayInfo, err.MaskSensitiveErrorWithStatusCode()), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+		recordMessage := message
+		if !common.IsPlaygroundRequest(c) {
+			recordMessage = relaycommon.SanitizeModelText(relayInfo, err.MaskSensitiveErrorWithStatusCode())
+		}
+		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, recordMessage, tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
 	}
 
+}
+
+func relayErrorLogMessage(c *gin.Context, err *types.NewAPIError) string {
+	if common.IsPlaygroundRequest(c) {
+		return fmt.Sprintf("%s (HTTP %d)", err.GetErrorCode(), err.StatusCode)
+	}
+	return err.Error()
 }
 
 func RelayMidjourney(c *gin.Context) {
@@ -884,12 +909,15 @@ func RelayTask(c *gin.Context) {
 
 		task := model.InitTask(result.Platform, relayInfo)
 		task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
-		task.PrivateData.GMICloudImageRequest = result.PendingImageRequest
+		if !relayInfo.IsPlayground {
+			task.PrivateData.GMICloudImageRequest = result.PendingImageRequest
+		}
 		if result.PendingImageRequest != "" {
 			task.PrivateData.Key = relayInfo.ApiKey
 		}
 		task.PrivateData.UpstreamVideoID = relayInfo.UpstreamVideoID
 		task.PrivateData.BillingSource = relayInfo.BillingSource
+		task.PrivateData.WalletChargeId = relayInfo.WalletChargeId
 		task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 		task.PrivateData.TokenId = relayInfo.TokenId
 		task.PrivateData.BillingContext = &model.TaskBillingContext{
@@ -909,6 +937,9 @@ func RelayTask(c *gin.Context) {
 			task.Quota = relayInfo.FinalPreConsumedQuota
 		}
 		task.Data = result.TaskData
+		if task.PrivateData.Playground {
+			task.Data = service.PlaygroundTaskResponse(task.Data)
+		}
 		task.Action = relayInfo.Action
 		if insertErr := task.Insert(); insertErr != nil {
 			common.SysError("insert task error: " + insertErr.Error())
@@ -943,7 +974,7 @@ func RelayTask(c *gin.Context) {
 				}
 				service.LogTaskConsumption(c, relayInfo)
 			}
-			respondGMICloudImageTask(c, task, relayInfo)
+			respondGMICloudImageTask(c, task, relayInfo, result.PendingImageRequest)
 		}
 	}
 

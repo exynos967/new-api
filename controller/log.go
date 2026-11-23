@@ -11,10 +11,10 @@ import (
 )
 
 func logsForViewer(logs []*model.Log, role int) []*model.Log {
-	if role >= common.RoleRootUser {
+	if role >= common.RoleAdminUser {
 		return logs
 	}
-	return model.SanitizeLogsForNonRoot(logs)
+	return model.SanitizeLogsForUser(logs)
 }
 
 func GetAllLogs(c *gin.Context) {
@@ -131,6 +131,8 @@ func GetLogsStat(c *gin.Context) {
 			"rpm_total":        stat.RpmTotal,
 			"rpm_success_rate": stat.RpmSuccessRate,
 			"tpm":              stat.Tpm,
+			"input_tpm":        stat.InputTpm,
+			"output_tpm":       stat.OutputTpm,
 		},
 	})
 	return
@@ -162,6 +164,8 @@ func GetLogsSelfStat(c *gin.Context) {
 			"rpm_total":        quotaNum.RpmTotal,
 			"rpm_success_rate": quotaNum.RpmSuccessRate,
 			"tpm":              quotaNum.Tpm,
+			"input_tpm":        quotaNum.InputTpm,
+			"output_tpm":       quotaNum.OutputTpm,
 			//"token": tokenNum,
 		},
 	})
