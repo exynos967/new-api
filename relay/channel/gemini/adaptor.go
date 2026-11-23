@@ -50,13 +50,17 @@ func (a *Adaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayIn
 
 func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, req *dto.ClaudeRequest) (any, error) {
 	if model_setting.IsIRConversionEnabled() {
-		scope := ""
-		if info != nil && info.ChannelId > 0 {
-			scope = fmt.Sprintf("channel:%d", info.ChannelId)
-		}
-		return ir.ConvertPayload(ir.FormatAnthropic, ir.FormatGoogleGenAI, req, nil, scope, map[string]any{
+		scope := relaycommon.IRBridgeScope(info)
+		raw, err := ir.ConvertPayload(ir.FormatAnthropic, ir.FormatGoogleGenAI, req, nil, scope, map[string]any{
 			"attach_thought_signature": model_setting.GetGeminiSettings().FunctionCallThoughtSignatureEnabled,
 		})
+		if err != nil {
+			return nil, err
+		}
+		if info != nil {
+			info.AppendRequestConversion(types.RelayFormatGemini)
+		}
+		return raw, nil
 	}
 	adaptor := openai.Adaptor{}
 	oaiReq, err := adaptor.ConvertClaudeRequest(c, info, req)
@@ -256,17 +260,8 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 	}, nil
 }
 
-func (a *Adaptor) ConvertOpenAIResponsesRequest(_ *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
-	if !model_setting.IsIRConversionEnabled() {
-		return nil, errors.New("not implemented")
-	}
-	scope := ""
-	if info != nil && info.ChannelId > 0 {
-		scope = fmt.Sprintf("channel:%d", info.ChannelId)
-	}
-	return ir.ConvertPayload(ir.FormatOpenAIResponses, ir.FormatGoogleGenAI, &request, nil, scope, map[string]any{
-		"attach_thought_signature": model_setting.GetGeminiSettings().FunctionCallThoughtSignatureEnabled,
-	})
+func (a *Adaptor) ConvertOpenAIResponsesRequest(_ *gin.Context, _ *relaycommon.RelayInfo, _ dto.OpenAIResponsesRequest) (any, error) {
+	return nil, errors.New("not implemented")
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {

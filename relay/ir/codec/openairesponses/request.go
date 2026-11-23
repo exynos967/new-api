@@ -20,6 +20,7 @@ type responsesRequestWire struct {
 	MaxOutputTokens      *int                    `json:"max_output_tokens,omitempty"`
 	Temperature          *float64                `json:"temperature,omitempty"`
 	TopP                 *float64                `json:"top_p,omitempty"`
+	TopLogProbs          *int                    `json:"top_logprobs,omitempty"`
 	User                 string                  `json:"user,omitempty"`
 	Store                *bool                   `json:"store,omitempty"`
 	Truncation           string                  `json:"truncation,omitempty"`
@@ -125,6 +126,36 @@ type responsesToolChoiceObj struct {
 	} `json:"tools,omitempty"`
 }
 
+var canonicalResponsesRequestKeys = map[string]struct{}{
+	"model":                  {},
+	"instructions":           {},
+	"input":                  {},
+	"tools":                  {},
+	"tool_choice":            {},
+	"parallel_tool_calls":    {},
+	"max_output_tokens":      {},
+	"temperature":            {},
+	"top_p":                  {},
+	"top_logprobs":           {},
+	"user":                   {},
+	"store":                  {},
+	"truncation":             {},
+	"previous_response_id":   {},
+	"service_tier":           {},
+	"stream":                 {},
+	"include":                {},
+	"metadata":               {},
+	"prompt_cache_key":       {},
+	"prompt_cache_retention": {},
+	"reasoning":              {},
+	"text":                   {},
+}
+
+func isNullOrEmptyJSON(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
+}
+
 // DecodeRequest parses an OpenAI Responses API JSON request into the provider-neutral IR.
 func (c *Codec) DecodeRequest(raw []byte, ctx *ir.ConversionContext) (*ir.Request, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
@@ -134,6 +165,8 @@ func (c *Codec) DecodeRequest(raw []byte, ctx *ir.ConversionContext) (*ir.Reques
 	if err := json.Unmarshal(raw, &wire); err != nil {
 		return nil, fmt.Errorf("openairesponses: decode request: %w", err)
 	}
+	var topLevel map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &topLevel)
 
 	req := &ir.Request{
 		Model:             wire.Model,
@@ -145,6 +178,7 @@ func (c *Codec) DecodeRequest(raw []byte, ctx *ir.ConversionContext) (*ir.Reques
 			MaxTokens:            wire.MaxOutputTokens,
 			Temperature:          wire.Temperature,
 			TopP:                 wire.TopP,
+			TopLogProbs:          wire.TopLogProbs,
 			User:                 wire.User,
 			Store:                wire.Store,
 			Truncation:           wire.Truncation,
@@ -209,6 +243,17 @@ func (c *Codec) DecodeRequest(raw []byte, ctx *ir.ConversionContext) (*ir.Reques
 		req.ToolChoice = tc
 	}
 
+	// Preserve non-canonical Responses fields (e.g. max_tool_calls, background, safety_identifier, stream_options, conversation, prompt).
+	for k, v := range topLevel {
+		if _, canonical := canonicalResponsesRequestKeys[k]; canonical || isNullOrEmptyJSON(v) {
+			continue
+		}
+		if req.ProviderExtensions == nil {
+			req.ProviderExtensions = make(map[string]json.RawMessage)
+		}
+		req.ProviderExtensions[k] = cloneRaw(v)
+	}
+
 	return req, nil
 }
 
@@ -241,6 +286,7 @@ func decodeRequestInput(rawInput json.RawMessage, req *ir.Request) error {
 		return fmt.Errorf("openairesponses: decode input array: %w", err)
 	}
 
+	lastWasPassthrough := false
 	for idx, rawItem := range items {
 		itemTrimmed := bytes.TrimSpace(rawItem)
 		if len(itemTrimmed) == 0 || bytes.Equal(itemTrimmed, []byte("null")) {
@@ -264,20 +310,21 @@ func decodeRequestInput(rawInput json.RawMessage, req *ir.Request) error {
 				return fmt.Errorf("openairesponses: decode input[%d].content: %w", idx, err)
 			}
 			if role == ir.RoleAssistant {
-				appendAssistantParts(req, parts...)
+				appendAssistantParts(req, lastWasPassthrough, parts...)
 			} else {
 				req.Messages = append(req.Messages, ir.Message{
 					Role:  role,
 					Parts: parts,
 				})
 			}
+			lastWasPassthrough = false
 
 		case "function_call":
 			callID := item.CallID
 			if callID == "" {
 				callID = item.ID
 			}
-			appendAssistantParts(req, ir.ContentPart{
+			appendAssistantParts(req, lastWasPassthrough, ir.ContentPart{
 				Type: ir.PartToolCall,
 				ToolCall: &ir.ToolCall{
 					ID:        callID,
@@ -287,6 +334,7 @@ func decodeRequestInput(rawInput json.RawMessage, req *ir.Request) error {
 					Kind:      "function",
 				},
 			})
+			lastWasPassthrough = false
 
 		case "custom_tool_call":
 			callID := item.CallID
@@ -297,7 +345,7 @@ func decodeRequestInput(rawInput json.RawMessage, req *ir.Request) error {
 			if args == "" {
 				args = item.Arguments
 			}
-			appendAssistantParts(req, ir.ContentPart{
+			appendAssistantParts(req, lastWasPassthrough, ir.ContentPart{
 				Type: ir.PartToolCall,
 				ToolCall: &ir.ToolCall{
 					ID:        callID,
@@ -307,6 +355,7 @@ func decodeRequestInput(rawInput json.RawMessage, req *ir.Request) error {
 					Kind:      "custom",
 				},
 			})
+			lastWasPassthrough = false
 
 		case "function_call_output", "custom_tool_call_output":
 			callID := item.CallID
@@ -328,13 +377,15 @@ func decodeRequestInput(rawInput json.RawMessage, req *ir.Request) error {
 				Role:  ir.RoleTool,
 				Parts: []ir.ContentPart{part},
 			})
+			lastWasPassthrough = false
 
 		case "reasoning":
 			reasoning := decodeReasoningItem(item.ID, item.Summary, item.Content, item.EncryptedContent)
-			appendAssistantParts(req, ir.ContentPart{
+			appendAssistantParts(req, lastWasPassthrough, ir.ContentPart{
 				Type:      ir.PartReasoning,
 				Reasoning: reasoning,
 			})
+			lastWasPassthrough = false
 
 		default:
 			req.PassthroughItems = append(req.PassthroughItems, ir.PassthroughItem{
@@ -343,19 +394,22 @@ func decodeRequestInput(rawInput json.RawMessage, req *ir.Request) error {
 				Kind:         itemType,
 				Payload:      cloneRaw(itemTrimmed),
 			})
+			lastWasPassthrough = true
 		}
 	}
 
 	return nil
 }
 
-func appendAssistantParts(req *ir.Request, parts ...ir.ContentPart) {
+func appendAssistantParts(req *ir.Request, breakRun bool, parts ...ir.ContentPart) {
 	if len(parts) == 0 {
 		return
 	}
-	if n := len(req.Messages); n > 0 && req.Messages[n-1].Role == ir.RoleAssistant {
-		req.Messages[n-1].Parts = append(req.Messages[n-1].Parts, parts...)
-		return
+	if !breakRun {
+		if n := len(req.Messages); n > 0 && req.Messages[n-1].Role == ir.RoleAssistant {
+			req.Messages[n-1].Parts = append(req.Messages[n-1].Parts, parts...)
+			return
+		}
 	}
 	req.Messages = append(req.Messages, ir.Message{
 		Role:  ir.RoleAssistant,
@@ -435,6 +489,14 @@ func decodeContentPart(wp responsesContentPartWire) []ir.ContentPart {
 
 	case "input_image", "image_url":
 		img := decodeInputImage(wp.ImageURL, wp.Detail)
+		if img == nil && wp.FileID != "" {
+			img = &ir.ImageSource{
+				FileID: wp.FileID,
+				Detail: wp.Detail,
+			}
+		} else if img != nil && wp.FileID != "" && img.FileID == "" {
+			img.FileID = wp.FileID
+		}
 		if img == nil {
 			return nil
 		}
@@ -469,8 +531,9 @@ func decodeContentPart(wp responsesContentPartWire) []ir.ContentPart {
 		return []ir.ContentPart{{
 			Type: ir.PartAudio,
 			Audio: &ir.AudioSource{
-				Data:   wp.InputAudio.Data,
-				Format: wp.InputAudio.Format,
+				Data:      wp.InputAudio.Data,
+				Format:    wp.InputAudio.Format,
+				MediaType: audioFormatToMediaType(wp.InputAudio.Format),
 			},
 		}}
 
@@ -679,31 +742,86 @@ func decodeToolChoice(raw json.RawMessage) (*ir.ToolChoice, error) {
 	case "function", "custom":
 		return &ir.ToolChoice{
 			Mode:     "tool",
+			ToolType: obj.Type,
 			ToolName: obj.Name,
 		}, nil
 	case "allowed_tools":
 		names := make([]string, 0, len(obj.Tools))
+		types := make(map[string]string)
 		for _, t := range obj.Tools {
 			if t.Name != "" {
 				names = append(names, t.Name)
+				if t.Type != "" && t.Type != "function" {
+					types[t.Name] = t.Type
+				}
+			} else if t.Type != "" {
+				// Built-in tool entry without name (e.g. {"type": "web_search_preview"}).
+				names = append(names, t.Type)
+				types[t.Type] = t.Type
 			}
 		}
 		mode := obj.Mode
 		if mode == "" {
 			mode = "auto"
 		}
-		return &ir.ToolChoice{
+		tc := &ir.ToolChoice{
 			Mode:         mode,
 			AllowedTools: names,
-		}, nil
+		}
+		if len(types) > 0 {
+			tc.AllowedToolTypes = types
+		}
+		return tc, nil
 	default:
 		if obj.Name != "" {
-			return &ir.ToolChoice{Mode: "tool", ToolName: obj.Name}, nil
+			return &ir.ToolChoice{Mode: "tool", ToolType: obj.Type, ToolName: obj.Name}, nil
 		}
 		if obj.Type != "" {
-			return &ir.ToolChoice{Mode: "tool", ToolName: obj.Type}, nil
+			return &ir.ToolChoice{Mode: "tool", ToolType: obj.Type, ToolName: obj.Type}, nil
 		}
 		return &ir.ToolChoice{Mode: "auto"}, nil
+	}
+}
+
+func audioFormatToMediaType(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "mp3", "mpeg":
+		return "audio/mpeg"
+	case "wav":
+		return "audio/wav"
+	case "ogg", "opus":
+		return "audio/ogg"
+	case "flac":
+		return "audio/flac"
+	case "webm":
+		return "audio/webm"
+	case "pcm16", "pcm":
+		return "audio/pcm"
+	default:
+		if format != "" {
+			return "audio/" + strings.ToLower(strings.TrimSpace(format))
+		}
+		return ""
+	}
+}
+
+func mediaTypeToAudioFormat(mediaType string) string {
+	mt := strings.ToLower(strings.TrimSpace(mediaType))
+	switch {
+	case strings.Contains(mt, "mpeg"), strings.Contains(mt, "mp3"):
+		return "mp3"
+	case strings.Contains(mt, "wav"):
+		return "wav"
+	case strings.Contains(mt, "ogg"), strings.Contains(mt, "opus"):
+		return "ogg"
+	case strings.Contains(mt, "flac"):
+		return "flac"
+	case strings.Contains(mt, "webm"):
+		return "webm"
+	case strings.Contains(mt, "pcm"):
+		return "pcm16"
+	default:
+		return "wav"
 	}
 }
 
@@ -737,7 +855,7 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 				if td.Description != "" {
 					fn["description"] = td.Description
 				}
-				if len(bytes.TrimSpace(td.Parameters)) > 0 {
+				if !isNullOrEmptyJSON(td.Parameters) {
 					fn["parameters"] = td.Parameters
 				}
 				if td.Strict != nil {
@@ -794,6 +912,9 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 	if g.TopP != nil {
 		out["top_p"] = *g.TopP
 	}
+	if g.TopLogProbs != nil {
+		out["top_logprobs"] = *g.TopLogProbs
+	}
 	if g.User != "" {
 		out["user"] = g.User
 	}
@@ -815,9 +936,33 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 	if g.PromptCacheRetention != "" {
 		out["prompt_cache_retention"] = g.PromptCacheRetention
 	}
+	if len(g.StopSequences) > 0 {
+		ctx.AddWarning("unsupported_field", "generation.stop_sequences", "OpenAI Responses API does not support stop sequences")
+	}
+	if g.Seed != nil {
+		ctx.AddWarning("unsupported_field", "generation.seed", "OpenAI Responses API does not support seed")
+	}
+	if g.N != nil && *g.N > 1 {
+		ctx.AddWarning("unsupported_field", "generation.n", "OpenAI Responses API does not support n > 1")
+	}
+	if g.FrequencyPenalty != nil {
+		ctx.AddWarning("unsupported_field", "generation.frequency_penalty", "OpenAI Responses API does not support frequency_penalty")
+	}
+	if g.PresencePenalty != nil {
+		ctx.AddWarning("unsupported_field", "generation.presence_penalty", "OpenAI Responses API does not support presence_penalty")
+	}
+	if g.TopK != nil {
+		ctx.AddWarning("unsupported_field", "generation.top_k", "OpenAI Responses API does not support top_k")
+	}
+	if len(g.LogitBias) > 0 {
+		ctx.AddWarning("unsupported_field", "generation.logit_bias", "OpenAI Responses API does not support logit_bias")
+	}
+	if len(g.Modalities) > 0 {
+		ctx.AddWarning("unsupported_field", "generation.modalities", "OpenAI Responses API does not support modalities")
+	}
 
 	if req.Reasoning != nil {
-		if rCfg := encodeReasoningConfig(req.Reasoning); rCfg != nil {
+		if rCfg := encodeReasoningConfig(req.Reasoning, ctx); rCfg != nil {
 			out["reasoning"] = rCfg
 		}
 	}
@@ -831,13 +976,17 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 			fmtObj := map[string]any{
 				"type": req.ResponseFormat.Type,
 			}
-			if req.ResponseFormat.Name != "" {
-				fmtObj["name"] = req.ResponseFormat.Name
+			name := req.ResponseFormat.Name
+			if req.ResponseFormat.Type == "json_schema" && name == "" {
+				name = "response"
+			}
+			if name != "" {
+				fmtObj["name"] = name
 			}
 			if req.ResponseFormat.Description != "" {
 				fmtObj["description"] = req.ResponseFormat.Description
 			}
-			if len(bytes.TrimSpace(req.ResponseFormat.Schema)) > 0 {
+			if !isNullOrEmptyJSON(req.ResponseFormat.Schema) {
 				fmtObj["schema"] = req.ResponseFormat.Schema
 			}
 			if req.ResponseFormat.Strict != nil {
@@ -850,7 +999,7 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 		}
 	}
 
-	if req.Stream {
+	if req.Stream || (ctx != nil && ctx.GetBoolOption("stream", false)) {
 		out["stream"] = true
 	}
 	if len(req.Include) > 0 {
@@ -860,12 +1009,34 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 		out["metadata"] = req.Metadata
 	}
 
+	// Re-emit native Responses extensions when preserving Responses dialect metadata.
+	if len(req.ProviderExtensions) > 0 && shouldPreserveResponsesNative(ir.FormatOpenAIResponses, ctx) {
+		for k, v := range req.ProviderExtensions {
+			if strings.HasPrefix(k, "_") || isNullOrEmptyJSON(v) {
+				continue
+			}
+			if _, exists := out[k]; !exists {
+				out[k] = v
+			}
+		}
+	}
+
 	return json.Marshal(out)
 }
 
 func encodeRequestInput(req *ir.Request, ctx *ir.ConversionContext) []any {
 	items := make([]any, 0, len(req.Messages)+len(req.PassthroughItems))
 	toolCounter := 0
+
+	// Pre-scan custom tool call IDs so cross-protocol custom tool results emit custom_tool_call_output.
+	customCallIDs := make(map[string]bool)
+	for _, msg := range req.Messages {
+		for _, part := range msg.Parts {
+			if part.Type == ir.PartToolCall && part.ToolCall != nil && part.ToolCall.Kind == "custom" && part.ToolCall.ID != "" {
+				customCallIDs[part.ToolCall.ID] = true
+			}
+		}
+	}
 
 	for _, msg := range req.Messages {
 		switch msg.Role {
@@ -895,7 +1066,7 @@ func encodeRequestInput(req *ir.Request, ctx *ir.ConversionContext) []any {
 			for _, part := range msg.Parts {
 				if part.Type == ir.PartToolResult && part.ToolResult != nil {
 					flushUser()
-					items = append(items, encodeToolResultItem(part))
+					items = append(items, encodeToolResultItem(part, customCallIDs))
 					continue
 				}
 				if encoded := encodeUserContentPart(part); encoded != nil {
@@ -956,7 +1127,7 @@ func encodeRequestInput(req *ir.Request, ctx *ir.ConversionContext) []any {
 		case ir.RoleTool:
 			for _, part := range msg.Parts {
 				if part.Type == ir.PartToolResult && part.ToolResult != nil {
-					items = append(items, encodeToolResultItem(part))
+					items = append(items, encodeToolResultItem(part, customCallIDs))
 				}
 			}
 		}
@@ -1018,12 +1189,17 @@ func encodeUserContentPart(part ir.ContentPart) any {
 		if url == "" && part.Image.Data != "" {
 			url = buildDataURL(part.Image.MediaType, part.Image.Data)
 		}
-		if url == "" {
+		if url == "" && part.Image.FileID == "" {
 			return nil
 		}
 		img := map[string]any{
-			"type":      "input_image",
-			"image_url": url,
+			"type": "input_image",
+		}
+		if url != "" {
+			img["image_url"] = url
+		}
+		if part.Image.FileID != "" {
+			img["file_id"] = part.Image.FileID
 		}
 		if part.Image.Detail != "" {
 			img["detail"] = part.Image.Detail
@@ -1032,6 +1208,12 @@ func encodeUserContentPart(part ir.ContentPart) any {
 	case ir.PartFile:
 		if part.File == nil {
 			return nil
+		}
+		if part.File.Text != "" && part.File.FileID == "" && part.File.Data == "" && part.File.URL == "" {
+			return map[string]any{
+				"type": "input_text",
+				"text": part.File.Text,
+			}
 		}
 		f := map[string]any{
 			"type": "input_file",
@@ -1057,11 +1239,15 @@ func encodeUserContentPart(part ir.ContentPart) any {
 		if part.Audio == nil || part.Audio.Data == "" {
 			return nil
 		}
+		format := part.Audio.Format
+		if format == "" {
+			format = mediaTypeToAudioFormat(part.Audio.MediaType)
+		}
 		return map[string]any{
 			"type": "input_audio",
 			"input_audio": map[string]any{
 				"data":   part.Audio.Data,
-				"format": part.Audio.Format,
+				"format": format,
 			},
 		}
 	default:
@@ -1111,6 +1297,13 @@ func encodeRequestReasoningItem(r *ir.Reasoning, ctx *ir.ConversionContext) map[
 		"type":    "reasoning",
 		"summary": summary,
 	}
+	// Preserve distinct full reasoning text when both summary and content were present.
+	if r.Summary != "" && r.Text != "" && r.Text != r.Summary {
+		item["content"] = []map[string]any{{
+			"type": "reasoning_text",
+			"text": r.Text,
+		}}
+	}
 	if r.ItemID != "" {
 		item["id"] = r.ItemID
 	}
@@ -1123,12 +1316,9 @@ func encodeRequestReasoningItem(r *ir.Reasoning, ctx *ir.ConversionContext) map[
 func encodeRequestToolCallItem(tc *ir.ToolCall, idx int) map[string]any {
 	callID := tc.ID
 	if callID == "" {
-		callID = fmt.Sprintf("call_%d", idx)
+		callID = ir.SynthesizeToolCallID("call")
 	}
-	fcID := tc.ItemID
-	if fcID == "" {
-		fcID = synthesizeFunctionCallItemID(callID, idx)
-	}
+	fcID := normalizeResponsesToolItemID(tc.ItemID, callID, tc.Kind, idx)
 
 	if tc.Kind == "custom" {
 		return map[string]any{
@@ -1141,7 +1331,7 @@ func encodeRequestToolCallItem(tc *ir.ToolCall, idx int) map[string]any {
 	}
 
 	args := tc.Arguments
-	if args == "" {
+	if strings.TrimSpace(args) == "" {
 		args = "{}"
 	}
 	return map[string]any{
@@ -1153,7 +1343,7 @@ func encodeRequestToolCallItem(tc *ir.ToolCall, idx int) map[string]any {
 	}
 }
 
-func encodeToolResultItem(part ir.ContentPart) map[string]any {
+func encodeToolResultItem(part ir.ContentPart, customCallIDs map[string]bool) map[string]any {
 	tr := part.ToolResult
 	itemType := "function_call_output"
 	if part.ProviderMetadata != nil {
@@ -1161,14 +1351,24 @@ func encodeToolResultItem(part ir.ContentPart) map[string]any {
 			itemType = "custom_tool_call_output"
 		}
 	}
+	if itemType == "function_call_output" && customCallIDs != nil && customCallIDs[tr.ToolCallID] {
+		itemType = "custom_tool_call_output"
+	}
 
 	var output any
 	if hasMultimodalToolParts(tr.Parts) {
-		arr := make([]any, 0, len(tr.Parts))
+		arr := make([]any, 0, len(tr.Parts)+1)
+		hasTextPart := false
 		for _, p := range tr.Parts {
+			if p.Type == ir.PartText && p.Text != "" {
+				hasTextPart = true
+			}
 			if encoded := encodeUserContentPart(p); encoded != nil {
 				arr = append(arr, encoded)
 			}
+		}
+		if !hasTextPart && tr.Content != "" {
+			arr = append([]any{map[string]any{"type": "input_text", "text": tr.Content}}, arr...)
 		}
 		output = arr
 	} else if tr.Content != "" {
@@ -1201,14 +1401,22 @@ func encodeToolChoice(tc *ir.ToolChoice, customTools map[string]struct{}) any {
 	}
 	if len(tc.AllowedTools) > 0 {
 		mode := tc.Mode
-		if mode == "" || mode == "any" {
+		if mode == "" || mode == "tool" {
+			mode = "auto"
+		} else if mode == "any" {
 			mode = "required"
 		}
 		tools := make([]map[string]any, 0, len(tc.AllowedTools))
 		for _, name := range tc.AllowedTools {
 			t := "function"
-			if _, ok := customTools[name]; ok {
+			if tc.AllowedToolTypes != nil && tc.AllowedToolTypes[name] != "" {
+				t = tc.AllowedToolTypes[name]
+			} else if _, ok := customTools[name]; ok {
 				t = "custom"
+			}
+			if t != "function" && t != "custom" {
+				tools = append(tools, map[string]any{"type": t})
+				continue
 			}
 			tools = append(tools, map[string]any{
 				"type": t,
@@ -1228,11 +1436,21 @@ func encodeToolChoice(tc *ir.ToolChoice, customTools map[string]struct{}) any {
 	case "required", "any":
 		return "required"
 	case "tool":
+		// Built-in tool choice such as {"type": "web_search_preview"} (must not emit type:"function").
+		if tc.ToolType != "" && tc.ToolType != "function" && tc.ToolType != "custom" {
+			obj := map[string]any{"type": tc.ToolType}
+			if tc.ToolName != "" && tc.ToolName != tc.ToolType {
+				obj["name"] = tc.ToolName
+			}
+			return obj
+		}
 		if tc.ToolName == "" {
 			return "required"
 		}
 		t := "function"
-		if _, ok := customTools[tc.ToolName]; ok {
+		if tc.ToolType == "custom" {
+			t = "custom"
+		} else if _, ok := customTools[tc.ToolName]; ok {
 			t = "custom"
 		}
 		return map[string]any{
@@ -1244,23 +1462,28 @@ func encodeToolChoice(tc *ir.ToolChoice, customTools map[string]struct{}) any {
 	}
 }
 
-func encodeReasoningConfig(rc *ir.ReasoningConfig) map[string]any {
-	effort := rc.Effort
-	if effort == "" {
-		if (rc.Enabled != nil && !*rc.Enabled) || rc.Mode == "disabled" {
-			effort = "none"
-		} else if rc.BudgetTokens != nil && *rc.BudgetTokens > 0 {
-			switch {
-			case *rc.BudgetTokens <= 2048:
-				effort = "low"
-			case *rc.BudgetTokens <= 8192:
-				effort = "medium"
-			default:
-				effort = "high"
-			}
-		} else if (rc.Enabled != nil && *rc.Enabled) || rc.Mode == "enabled" || rc.Mode == "adaptive" {
-			effort = "medium"
+func encodeReasoningConfig(rc *ir.ReasoningConfig, ctx *ir.ConversionContext) map[string]any {
+	var effort string
+	// Disabled takes precedence over any residual Effort value.
+	if (rc.Enabled != nil && !*rc.Enabled) || rc.Mode == "disabled" {
+		effort = "none"
+	} else if rc.Effort != "" {
+		effort = strings.ToLower(strings.TrimSpace(rc.Effort))
+		if effort == "max" {
+			ctx.AddWarning("adjusted_reasoning_effort", "reasoning.effort", "mapped Anthropic effort 'max' to OpenAI Responses reasoning.effort 'high'")
+			effort = "high"
 		}
+	} else if rc.BudgetTokens != nil && *rc.BudgetTokens > 0 {
+		switch {
+		case *rc.BudgetTokens <= 2048:
+			effort = "low"
+		case *rc.BudgetTokens <= 8192:
+			effort = "medium"
+		default:
+			effort = "high"
+		}
+	} else if (rc.Enabled != nil && *rc.Enabled) || rc.Mode == "enabled" || rc.Mode == "adaptive" {
+		effort = "medium"
 	}
 
 	out := map[string]any{}

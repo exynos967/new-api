@@ -1,6 +1,7 @@
 package ir
 
 import (
+	"bytes"
 	"encoding/json"
 )
 
@@ -20,12 +21,15 @@ type Shim struct {
 
 // ApplyJSONTransforms runs a transform chain over a JSON object payload.
 // If transforms is empty, raw is returned untouched without parsing.
+// Uses json.Decoder.UseNumber() to preserve 64-bit integer precision (e.g. seed).
 func ApplyJSONTransforms(raw []byte, transforms []JSONTransform, ctx *ConversionContext) ([]byte, error) {
 	if len(transforms) == 0 || len(raw) == 0 {
 		return raw, nil
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(raw, &obj); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&obj); err != nil {
 		return nil, err
 	}
 	if obj == nil {
@@ -60,10 +64,15 @@ func SetField(field string, value any) JSONTransform {
 	}
 }
 
-// SetDefaultField sets a top-level field only if it is absent or nil.
+// SetDefaultField sets a top-level field if it is absent, nil, or an empty string.
 func SetDefaultField(field string, value any) JSONTransform {
 	return func(payload map[string]any, _ *ConversionContext) error {
-		if existing, ok := payload[field]; !ok || existing == nil {
+		existing, ok := payload[field]
+		if !ok || existing == nil {
+			payload[field] = value
+			return nil
+		}
+		if s, isStr := existing.(string); isStr && s == "" {
 			payload[field] = value
 		}
 		return nil
@@ -81,8 +90,8 @@ func RenameField(from, to string) JSONTransform {
 	}
 }
 
-// StripGeminiFunctionResponseID removes functionResponse.id from Google GenAI contents
-// for Vertex AI compatibility.
+// StripGeminiFunctionResponseID removes functionResponse.id and functionCall.id from Google GenAI
+// contents for Vertex AI compatibility.
 func StripGeminiFunctionResponseID() JSONTransform {
 	return func(payload map[string]any, _ *ConversionContext) error {
 		contents, ok := payload["contents"].([]any)
@@ -108,6 +117,12 @@ func StripGeminiFunctionResponseID() JSONTransform {
 				}
 				if fr, ok := partMap["function_response"].(map[string]any); ok {
 					delete(fr, "id")
+				}
+				if fc, ok := partMap["functionCall"].(map[string]any); ok {
+					delete(fc, "id")
+				}
+				if fc, ok := partMap["function_call"].(map[string]any); ok {
+					delete(fc, "id")
 				}
 			}
 		}

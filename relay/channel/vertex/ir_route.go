@@ -24,7 +24,7 @@ type IRTarget struct {
 // It returns ok=false for native pass-through, Imagen/Embedding/TTS/Transcribe/Video/OCR/FIM models,
 // or when initialization failed.
 func (a *Adaptor) ResolveIRTarget(info *relaycommon.RelayInfo) (IRTarget, bool) {
-	if a == nil || info == nil || a.initErr != nil || a.native || a.responseKind != "" {
+	if a == nil || info == nil || info.ChannelMeta == nil || a.initErr != nil || a.native || a.responseKind != "" {
 		return IRTarget{}, false
 	}
 
@@ -40,7 +40,10 @@ func (a *Adaptor) ResolveIRTarget(info *relaycommon.RelayInfo) (IRTarget, bool) 
 		}, true
 
 	case RequestModeGemini:
-		if a.capability.Action != "generateContent" || strings.HasPrefix(info.UpstreamModelName, "imagen") {
+		if a.capability.Action != "generateContent" ||
+			a.capability.Family == vertexmodel.Speech ||
+			a.capability.Family == vertexmodel.Transcribe ||
+			strings.HasPrefix(info.UpstreamModelName, "imagen") {
 			return IRTarget{}, false
 		}
 		var shim *ir.Shim

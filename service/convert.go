@@ -16,10 +16,14 @@ import (
 )
 
 func irBridgeScope(info *relaycommon.RelayInfo) string {
-	if info == nil || info.ChannelMeta == nil || info.ChannelId <= 0 {
-		return ""
+	return relaycommon.IRBridgeScope(info)
+}
+
+func irBridgeForScope(scope string) *ir.TurnBridge {
+	if scope == "" {
+		return nil
 	}
-	return fmt.Sprintf("channel:%d", info.ChannelId)
+	return ir.DefaultTurnBridge()
 }
 
 // ClaudeToOpenAIRequest converts an Anthropic Messages request into an OpenAI Chat Completions request.
@@ -34,13 +38,16 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 		return nil, fmt.Errorf("marshal claude request failed: %w", err)
 	}
 
+	isOpenRouter := info != nil && info.ChannelMeta != nil && info.ChannelType == constant.ChannelTypeOpenRouter
+	scope := irBridgeScope(info)
 	p, err := ir.NewPipeline(ir.PipelineConfig{
-		Bridge:       ir.DefaultTurnBridge(),
-		BridgeScope:  irBridgeScope(info),
+		Bridge:       irBridgeForScope(scope),
+		BridgeScope:  scope,
 		SourceFormat: ir.FormatAnthropic,
 		TargetFormat: ir.FormatOpenAIChat,
 		Options: map[string]any{
 			"disable_stream_options": true, // callers manage StreamOptions based on channel capabilities
+			"preserve_cache_control": isOpenRouter,
 		},
 	})
 	if err != nil {
@@ -58,7 +65,6 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 	}
 
 	// Preserve OpenRouter-specific reasoning/verbosity extensions and non-OpenRouter -thinking suffix semantics.
-	isOpenRouter := info != nil && info.ChannelMeta != nil && info.ChannelType == constant.ChannelTypeOpenRouter
 	if isOpenRouter {
 		if effort := claudeRequest.GetEfforts(); effort != "" {
 			effortBytes, _ := json.Marshal(effort)
@@ -82,6 +88,8 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 					return nil, fmt.Errorf("failed to marshal reasoning: %w", err)
 				}
 				openAIRequest.Reasoning = reasoningJSON
+				// Avoid sending mutually exclusive reasoning_effort alongside OpenRouter's reasoning object.
+				openAIRequest.ReasoningEffort = ""
 			}
 		}
 	} else if info != nil {
@@ -110,9 +118,10 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 		return nil, fmt.Errorf("marshal gemini request failed: %w", err)
 	}
 
+	scope := irBridgeScope(info)
 	p, err := ir.NewPipeline(ir.PipelineConfig{
-		Bridge:       ir.DefaultTurnBridge(),
-		BridgeScope:  irBridgeScope(info),
+		Bridge:       irBridgeForScope(scope),
+		BridgeScope:  scope,
 		SourceFormat: ir.FormatGoogleGenAI,
 		TargetFormat: ir.FormatOpenAIChat,
 		Options: map[string]any{
@@ -132,7 +141,7 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 	if err := common.Unmarshal(outBytes, &openAIRequest); err != nil {
 		return nil, fmt.Errorf("unmarshal converted openai request failed: %w", err)
 	}
-	if openAIRequest.Model == "" && info != nil {
+	if openAIRequest.Model == "" && info != nil && info.ChannelMeta != nil {
 		openAIRequest.Model = info.UpstreamModelName
 	}
 	if info != nil && info.IsStream && openAIRequest.Stream == nil {
@@ -144,7 +153,10 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 
 // ResponseOpenAI2Claude converts a non-streaming OpenAI Chat response into an Anthropic Messages response.
 func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info *relaycommon.RelayInfo) *dto.ClaudeResponse {
-	if !model_setting.IsIRConversionEnabled() || openAIResponse == nil {
+	if openAIResponse == nil {
+		return nil
+	}
+	if !model_setting.IsIRConversionEnabled() {
 		return responseOpenAI2ClaudeLegacy(openAIResponse, info)
 	}
 
@@ -152,9 +164,10 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info *relayco
 	if err != nil {
 		return responseOpenAI2ClaudeLegacy(openAIResponse, info)
 	}
+	scope := irBridgeScope(info)
 	p, err := ir.NewPipeline(ir.PipelineConfig{
-		Bridge:       ir.DefaultTurnBridge(),
-		BridgeScope:  irBridgeScope(info),
+		Bridge:       irBridgeForScope(scope),
+		BridgeScope:  scope,
 		SourceFormat: ir.FormatAnthropic,
 		TargetFormat: ir.FormatOpenAIChat,
 	})
@@ -183,7 +196,10 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info *relayco
 
 // ResponseOpenAI2Gemini converts a non-streaming OpenAI Chat response into a Google GenAI response.
 func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info *relaycommon.RelayInfo) *dto.GeminiChatResponse {
-	if !model_setting.IsIRConversionEnabled() || openAIResponse == nil {
+	if openAIResponse == nil {
+		return nil
+	}
+	if !model_setting.IsIRConversionEnabled() {
 		return responseOpenAI2GeminiLegacy(openAIResponse, info)
 	}
 
@@ -191,9 +207,10 @@ func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info *relayco
 	if err != nil {
 		return responseOpenAI2GeminiLegacy(openAIResponse, info)
 	}
+	scope := irBridgeScope(info)
 	p, err := ir.NewPipeline(ir.PipelineConfig{
-		Bridge:       ir.DefaultTurnBridge(),
-		BridgeScope:  irBridgeScope(info),
+		Bridge:       irBridgeForScope(scope),
+		BridgeScope:  scope,
 		SourceFormat: ir.FormatGoogleGenAI,
 		TargetFormat: ir.FormatOpenAIChat,
 	})

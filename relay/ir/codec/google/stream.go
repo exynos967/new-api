@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/relay/ir"
 )
+
+const metaKeyGoogleUpstreamToolIdx = "_google_tc_upstream_idx"
 
 // DecodeStreamEvent parses one Google GenAI streamGenerateContent SSE JSON chunk into normalized IR StreamEvents.
 func (c *Codec) DecodeStreamEvent(_ string, rawData []byte, ctx *ir.StreamContext) ([]ir.StreamEvent, error) {
@@ -90,7 +93,7 @@ func (c *Codec) DecodeStreamEvent(_ string, rawData []byte, ctx *ir.StreamContex
 					ctx.GoogleSeenToolCallCount++
 					id := p.FunctionCall.ID
 					if id == "" {
-						id = fmt.Sprintf("call_%d", toolIdx)
+						id = ir.SynthesizeToolCallID("call")
 					}
 					args := normalizeJSONArgs(p.FunctionCall.Args)
 					tc, _ := ctx.RegisterToolCall(toolIdx, id, "", p.FunctionCall.Name, "function", p.ThoughtSignature)
@@ -144,20 +147,26 @@ func (c *Codec) DecodeStreamEvent(_ string, rawData []byte, ctx *ir.StreamContex
 
 				case p.InlineData != nil && p.InlineData.Data != "":
 					mime := p.InlineData.MimeType
-					var text string
 					if mime == "" || strings.HasPrefix(strings.ToLower(mime), "image/") {
 						if mime == "" {
 							mime = "image/png"
 						}
-						text = fmt.Sprintf("![image](data:%s;base64,%s)", mime, p.InlineData.Data)
+						events = append(events, ir.StreamEvent{
+							Type:             ir.EventImage,
+							ChoiceIndex:      choiceIdx,
+							Image:            &ir.ImageSource{Data: p.InlineData.Data, MediaType: mime},
+							ThoughtSignature: p.ThoughtSignature,
+							OriginFormat:     ir.FormatGoogleGenAI,
+						})
 					} else {
-						text = fmt.Sprintf("[media](data:%s;base64,%s)", mime, p.InlineData.Data)
+						events = append(events, ir.StreamEvent{
+							Type:             ir.EventTextDelta,
+							ChoiceIndex:      choiceIdx,
+							Text:             fmt.Sprintf("[media](data:%s;base64,%s)", mime, p.InlineData.Data),
+							ThoughtSignature: p.ThoughtSignature,
+							OriginFormat:     ir.FormatGoogleGenAI,
+						})
 					}
-					events = append(events, ir.StreamEvent{
-						Type:        ir.EventTextDelta,
-						ChoiceIndex: choiceIdx,
-						Text:        text,
-					})
 
 				case p.ExecutableCode != nil:
 					events = append(events, ir.StreamEvent{
@@ -175,9 +184,11 @@ func (c *Codec) DecodeStreamEvent(_ string, rawData []byte, ctx *ir.StreamContex
 
 				case p.Text != nil && *p.Text != "":
 					events = append(events, ir.StreamEvent{
-						Type:        ir.EventTextDelta,
-						ChoiceIndex: choiceIdx,
-						Text:        *p.Text,
+						Type:             ir.EventTextDelta,
+						ChoiceIndex:      choiceIdx,
+						Text:             *p.Text,
+						ThoughtSignature: p.ThoughtSignature,
+						OriginFormat:     ir.FormatGoogleGenAI,
 					})
 
 				case p.ThoughtSignature != "":
@@ -202,7 +213,7 @@ func (c *Codec) DecodeStreamEvent(_ string, rawData []byte, ctx *ir.StreamContex
 	}
 
 	for ci, cand := range gResp.Candidates {
-		if cand.FinishReason == "" {
+		if cand.FinishReason == "" || strings.EqualFold(cand.FinishReason, "FINISH_REASON_UNSPECIFIED") {
 			continue
 		}
 		choiceIdx := cand.Index
@@ -236,6 +247,9 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 	if ctx == nil {
 		ctx = ir.NewStreamContext(ir.FormatGoogleGenAI, ir.FormatGoogleGenAI)
 	}
+	if ctx.Ended || ctx.FinishEmitted {
+		return nil, nil
+	}
 	if ev.ResponseID != "" {
 		ctx.ResponseID = ev.ResponseID
 	}
@@ -264,10 +278,44 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 		if err != nil {
 			return nil, err
 		}
-		if ev.Text == "" {
+		if ev.Text == "" && ev.ThoughtSignature == "" {
 			return frames, nil
 		}
-		frame, err := buildStreamChunkFrame(ctx, ev.ChoiceIndex, []googlePart{{Text: strPtr(ev.Text)}}, "", nil)
+		part := googlePart{Text: strPtr(ev.Text)}
+		if ev.ThoughtSignature != "" && shouldEmitGoogleSignature(ev.OriginFormat, ctx) {
+			part.ThoughtSignature = ev.ThoughtSignature
+		}
+		frame, err := buildStreamChunkFrame(ctx, ev.ChoiceIndex, []googlePart{part}, "", nil)
+		if err != nil {
+			return frames, err
+		}
+		return append(frames, frame), nil
+
+	case ir.EventImage:
+		ctx.Started = true
+		frames, err := flushAllPendingToolCalls(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if ev.Image == nil {
+			return frames, nil
+		}
+		var part googlePart
+		if ev.Image.Data != "" {
+			mime := ev.Image.MediaType
+			if mime == "" {
+				mime = "image/png"
+			}
+			part.InlineData = &googleInlineData{MimeType: mime, Data: ev.Image.Data}
+		} else if ev.Image.URL != "" {
+			part.FileData = &googleFileData{MimeType: ev.Image.MediaType, FileURI: ev.Image.URL}
+		} else {
+			return frames, nil
+		}
+		if ev.ThoughtSignature != "" && shouldEmitGoogleSignature(ev.OriginFormat, ctx) {
+			part.ThoughtSignature = ev.ThoughtSignature
+		}
+		frame, err := buildStreamChunkFrame(ctx, ev.ChoiceIndex, []googlePart{part}, "", nil)
 		if err != nil {
 			return frames, err
 		}
@@ -332,14 +380,31 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 			sig = ev.ThoughtSignature
 		}
 		idx := ev.ToolCallIndex
-		if ev.ToolCallID != "" {
-			if existing := ctx.ToolCallsByID[ev.ToolCallID]; existing != nil {
-				idx = existing.Index
-			} else if existingAtIdx := ctx.ToolCallsByIndex[idx]; existingAtIdx != nil && existingAtIdx.ID != ev.ToolCallID {
+		callID := ev.ToolCallID
+		if callID != "" {
+			if existing := ctx.ToolCallsByID[callID]; existing != nil {
+				if existing.Closed {
+					// Reused ID after prior call closed: allocate fresh slot rather than dropping silently.
+					callID = ir.SynthesizeToolCallID("call")
+					idx = -1
+				} else {
+					idx = existing.Index
+				}
+			} else if idx >= 0 {
+				if existingAtIdx := ctx.ToolCallsByIndex[idx]; existingAtIdx != nil && (existingAtIdx.ID != callID || existingAtIdx.Closed) {
+					idx = -1
+				}
+			}
+		} else if idx >= 0 {
+			if existingAtIdx := ctx.ToolCallsByIndex[idx]; existingAtIdx != nil &&
+				(existingAtIdx.Closed || (ev.ToolName != "" && existingAtIdx.Name != "" && existingAtIdx.Name != ev.ToolName)) {
 				idx = -1
 			}
 		}
-		tc, _ := ctx.RegisterToolCall(idx, ev.ToolCallID, ev.ToolCallItemID, ev.ToolName, ev.ToolKind, sig)
+		tc, _ := ctx.RegisterToolCall(idx, callID, ev.ToolCallItemID, ev.ToolName, ev.ToolKind, sig)
+		if ev.ToolCallIndex >= 0 {
+			recordGoogleUpstreamToolIndex(ctx, ev.ToolCallIndex, tc)
+		}
 		if tc.BlockIndex < 0 || ev.BlockIndex > 0 {
 			tc.BlockIndex = ev.BlockIndex
 		}
@@ -358,12 +423,18 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 	case ir.EventToolCallDelta:
 		ctx.Started = true
 		tc := findTrackedToolCall(ctx, ev)
+		if tc != nil && tc.Closed {
+			return nil, nil
+		}
 		if tc == nil {
 			sig := ""
 			if ev.ThoughtSignature != "" && shouldEmitGoogleSignature(ev.OriginFormat, ctx) {
 				sig = ev.ThoughtSignature
 			}
 			tc, _ = ctx.RegisterToolCall(ev.ToolCallIndex, ev.ToolCallID, ev.ToolCallItemID, ev.ToolName, ev.ToolKind, sig)
+			if ev.ToolCallIndex >= 0 {
+				recordGoogleUpstreamToolIndex(ctx, ev.ToolCallIndex, tc)
+			}
 			tc.BlockIndex = ev.BlockIndex
 			tc.Started = true
 		} else {
@@ -404,8 +475,14 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 			return nil, err
 		}
 		fr := ev.FinishReason
-		ctx.PendingFinish = &fr
-		ctx.PendingRawFinish = ev.RawFinishReason
+		if ctx.ChoicePendingFinish == nil {
+			ctx.ChoicePendingFinish = make(map[int]ir.FinishReason)
+		}
+		ctx.ChoicePendingFinish[ev.ChoiceIndex] = fr
+		if ev.ChoiceIndex == 0 || ctx.PendingFinish == nil {
+			ctx.PendingFinish = &fr
+			ctx.PendingRawFinish = ev.RawFinishReason
+		}
 		if ev.Usage != nil {
 			ctx.MergeUsage(ev.Usage)
 		}
@@ -438,6 +515,7 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 			return frames, err
 		}
 		ctx.FinishEmitted = true
+		ctx.Ended = true
 		return append(frames, ir.SSEFrame{Data: b}), nil
 
 	case ir.EventPassthrough:
@@ -454,7 +532,7 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 // FlushStream flushes any buffered tool calls and emits the final Google GenAI SSE chunk
 // with finishReason and usageMetadata (without an SSE event header or [DONE] sentinel).
 func (c *Codec) FlushStream(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
-	if ctx == nil {
+	if ctx == nil || ctx.Ended {
 		return nil, nil
 	}
 
@@ -463,24 +541,55 @@ func (c *Codec) FlushStream(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
 		return nil, err
 	}
 
-	if !ctx.FinishEmitted && (ctx.PendingFinish != nil || ctx.LastUsage != nil || ctx.Started || len(frames) > 0) {
-		finishReason := "STOP"
-		if ctx.PendingFinish != nil {
-			if mapped := encodeGoogleFinishReason(*ctx.PendingFinish, ctx.PendingRawFinish); mapped != "" {
-				finishReason = mapped
+	if !ctx.FinishEmitted && (ctx.PendingFinish != nil || len(ctx.ChoicePendingFinish) > 0 || ctx.LastUsage != nil || ctx.Started || len(frames) > 0) {
+		if len(ctx.ChoicePendingFinish) > 1 {
+			choiceIdxs := make([]int, 0, len(ctx.ChoicePendingFinish))
+			for ci := range ctx.ChoicePendingFinish {
+				choiceIdxs = append(choiceIdxs, ci)
 			}
+			sort.Ints(choiceIdxs)
+			for i, ci := range choiceIdxs {
+				fr := encodeGoogleFinishReason(ctx.ChoicePendingFinish[ci], ctx.PendingRawFinish)
+				if fr == "" {
+					fr = "STOP"
+				}
+				var usageMeta *googleUsageMetadata
+				if i == len(choiceIdxs)-1 {
+					usageMeta = encodeUsageMetadata(ctx.LastUsage)
+				}
+				f, err := buildStreamChunkFrame(ctx, ci, []googlePart{}, fr, usageMeta)
+				if err != nil {
+					return frames, err
+				}
+				frames = append(frames, f)
+			}
+		} else {
+			choiceIdx := 0
+			finishReason := "STOP"
+			if len(ctx.ChoicePendingFinish) == 1 {
+				for ci, fr := range ctx.ChoicePendingFinish {
+					choiceIdx = ci
+					if mapped := encodeGoogleFinishReason(fr, ctx.PendingRawFinish); mapped != "" {
+						finishReason = mapped
+					}
+				}
+			} else if ctx.PendingFinish != nil {
+				if mapped := encodeGoogleFinishReason(*ctx.PendingFinish, ctx.PendingRawFinish); mapped != "" {
+					finishReason = mapped
+				}
+			}
+			finalFrame, err := buildStreamChunkFrame(
+				ctx,
+				choiceIdx,
+				[]googlePart{},
+				finishReason,
+				encodeUsageMetadata(ctx.LastUsage),
+			)
+			if err != nil {
+				return frames, err
+			}
+			frames = append(frames, finalFrame)
 		}
-		finalFrame, err := buildStreamChunkFrame(
-			ctx,
-			0,
-			[]googlePart{},
-			finishReason,
-			encodeUsageMetadata(ctx.LastUsage),
-		)
-		if err != nil {
-			return frames, err
-		}
-		frames = append(frames, finalFrame)
 		ctx.FinishEmitted = true
 		if ctx.LastUsage != nil {
 			ctx.UsageEmitted = true
@@ -488,8 +597,38 @@ func (c *Codec) FlushStream(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
 		ctx.PendingFinish = nil
 		ctx.PendingUsage = nil
 	}
+	ctx.Ended = true
 
 	return frames, nil
+}
+
+func recordGoogleUpstreamToolIndex(ctx *ir.StreamContext, upstreamIdx int, tc *ir.TrackedToolCall) {
+	if ctx == nil || tc == nil || upstreamIdx < 0 {
+		return
+	}
+	if ctx.Metadata == nil {
+		ctx.Metadata = make(map[string]any)
+	}
+	m, _ := ctx.Metadata[metaKeyGoogleUpstreamToolIdx].(map[int]*ir.TrackedToolCall)
+	if m == nil {
+		m = make(map[int]*ir.TrackedToolCall)
+		ctx.Metadata[metaKeyGoogleUpstreamToolIdx] = m
+	}
+	m[upstreamIdx] = tc
+}
+
+func lookupGoogleUpstreamToolIndex(ctx *ir.StreamContext, upstreamIdx int) *ir.TrackedToolCall {
+	if ctx == nil || ctx.Metadata == nil || upstreamIdx < 0 {
+		return nil
+	}
+	m, _ := ctx.Metadata[metaKeyGoogleUpstreamToolIdx].(map[int]*ir.TrackedToolCall)
+	if m == nil {
+		return nil
+	}
+	if tc := m[upstreamIdx]; tc != nil && !tc.Closed {
+		return tc
+	}
+	return nil
 }
 
 func shouldEmitGoogleSignature(origin ir.Format, ctx *ir.StreamContext) bool {
@@ -504,7 +643,10 @@ func shouldEmitGoogleSignature(origin ir.Format, ctx *ir.StreamContext) bool {
 
 func findTrackedToolCall(ctx *ir.StreamContext, ev ir.StreamEvent) *ir.TrackedToolCall {
 	if ev.ToolCallID != "" {
-		if tc := ctx.ToolCallsByID[ev.ToolCallID]; tc != nil {
+		return ctx.ToolCallsByID[ev.ToolCallID]
+	}
+	if ev.ToolCallIndex >= 0 {
+		if tc := lookupGoogleUpstreamToolIndex(ctx, ev.ToolCallIndex); tc != nil {
 			return tc
 		}
 	}
@@ -545,8 +687,13 @@ func matchToolCallForBlockEnd(ctx *ir.StreamContext, ev ir.StreamEvent) *ir.Trac
 		if tc := ctx.ToolCallsByID[ev.ToolCallID]; tc != nil && !tc.Closed {
 			return tc
 		}
+		return nil
 	}
 	if ev.BlockType != "" && ev.BlockType != ir.PartToolCall {
+		return nil
+	}
+	if ev.BlockType == "" && ev.BlockIndex == 0 && ev.ToolCallIndex == 0 {
+		// Guard against untyped/default EventContentBlockEnd{BlockIndex:0} prematurely flushing Tool 0.
 		return nil
 	}
 	if ev.BlockIndex >= 0 {
@@ -558,6 +705,9 @@ func matchToolCallForBlockEnd(ctx *ir.StreamContext, ev ir.StreamEvent) *ir.Trac
 	}
 	if ev.BlockType == ir.PartToolCall {
 		if ev.ToolCallIndex >= 0 {
+			if tc := lookupGoogleUpstreamToolIndex(ctx, ev.ToolCallIndex); tc != nil {
+				return tc
+			}
 			if tc := ctx.ToolCallsByIndex[ev.ToolCallIndex]; tc != nil && !tc.Closed {
 				return tc
 			}

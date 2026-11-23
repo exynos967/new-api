@@ -3,6 +3,7 @@ package openairesponses
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"time"
 
@@ -53,16 +54,50 @@ func sanitizeID(raw string) string {
 	return b.String()
 }
 
-// synthesizeFunctionCallItemID ensures an OpenAI Responses function_call item id begins with "fc_".
-func synthesizeFunctionCallItemID(callID string, fallbackIdx int) string {
-	clean := sanitizeID(callID)
+const maxResponsesItemIDLen = 64
+
+func clampResponsesItemID(prefix, raw string) string {
+	clean := sanitizeID(raw)
 	if clean == "" {
-		return fmt.Sprintf("fc_%d", fallbackIdx)
+		return ""
 	}
-	if strings.HasPrefix(clean, "fc_") {
+	if !strings.HasPrefix(clean, prefix) {
+		clean = prefix + clean
+	}
+	if len(clean) <= maxResponsesItemIDLen {
 		return clean
 	}
-	return "fc_" + clean
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(raw))
+	suffix := fmt.Sprintf("_%08x", h.Sum32())
+	keep := maxResponsesItemIDLen - len(suffix)
+	if keep < len(prefix) {
+		keep = len(prefix)
+	}
+	return clean[:keep] + suffix
+}
+
+// synthesizeFunctionCallItemID ensures an OpenAI Responses function_call item id begins with "fc_"
+// and respects the 64-character OpenAI Responses API maximum length.
+func synthesizeFunctionCallItemID(callID string, fallbackIdx int) string {
+	return normalizeResponsesToolItemID("", callID, "function", fallbackIdx)
+}
+
+// normalizeResponsesToolItemID ensures a function_call ("fc_") or custom_tool_call ("ctc_") item ID
+// has a valid prefix, valid characters, and fits within OpenAI Responses' 64-char limit.
+func normalizeResponsesToolItemID(itemID, callID, kind string, fallbackIdx int) string {
+	prefix := "fc_"
+	if kind == "custom" {
+		prefix = "ctc_"
+	}
+	source := itemID
+	if source == "" {
+		source = callID
+	}
+	if clamped := clampResponsesItemID(prefix, source); clamped != "" {
+		return clamped
+	}
+	return fmt.Sprintf("%s%d", prefix, fallbackIdx)
 }
 
 // ensureResponseID ensures an OpenAI Responses envelope id begins with "resp_".

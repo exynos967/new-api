@@ -1,10 +1,35 @@
 package ir
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+var (
+	toolCallIDSalt    = initToolCallIDSalt()
+	toolCallIDCounter atomic.Uint64
+)
+
+func initToolCallIDSalt() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return hex.EncodeToString(b[:])
+	}
+	return fmt.Sprintf("%x", time.Now().UnixNano()&0xffffffff)
+}
+
+// SynthesizeToolCallID generates a short, collision-resistant tool call ID (<= 24 chars)
+// so multi-turn and multi-tenant requests never collide on deterministic IDs like "call_0".
+func SynthesizeToolCallID(prefix string) string {
+	if prefix == "" {
+		prefix = "call"
+	}
+	return fmt.Sprintf("%s_%s_%x", prefix, toolCallIDSalt, toolCallIDCounter.Add(1))
+}
 
 // MetadataMode controls whether provider-specific opaque fields survive round-trips.
 type MetadataMode string
@@ -155,10 +180,12 @@ type StreamContext struct {
 	ReasoningRedacted    string
 	ReasoningOrigin      Format
 
-	// Google GenAI streaming delta/diff tracking
-	GooglePrevText          string
-	GooglePrevThought       string
+	// Google GenAI streaming delta tracking
 	GoogleSeenToolCallCount int
+
+	// Multi-choice streaming tracking (OpenAI Chat n > 1 / Google multi-candidate)
+	ChoiceFinishEmitted map[int]bool
+	ChoicePendingFinish map[int]FinishReason
 
 	// Deferred completion & usage accounting
 	PendingFinish       *FinishReason
@@ -172,6 +199,8 @@ type StreamContext struct {
 	WebSearchCalls      int
 	FileSearchCalls     int
 	HasImageGenCall     bool
+	ImageGenQuality     string
+	ImageGenSize        string
 	SeenToolItemIDs     map[string]struct{}
 	OutputTextEstimate  strings.Builder
 }
@@ -186,6 +215,8 @@ func NewStreamContext(source, target Format) *StreamContext {
 		ReasoningOutputIndex: -1,
 		ToolCallsByID:        make(map[string]*TrackedToolCall),
 		ToolCallsByIndex:     make(map[int]*TrackedToolCall),
+		ChoiceFinishEmitted:  make(map[int]bool),
+		ChoicePendingFinish:  make(map[int]FinishReason),
 		SeenToolItemIDs:      make(map[string]struct{}),
 	}
 }
@@ -237,18 +268,30 @@ func (s *StreamContext) RegisterToolCall(index int, id, itemID, name, kind, thou
 		tc = s.ToolCallsByID[id]
 	}
 	if tc == nil && index >= 0 {
-		tc = s.ToolCallsByIndex[index]
+		if existing := s.ToolCallsByIndex[index]; existing != nil {
+			// Guard against index collisions when two distinct tool calls reuse the same index (e.g. 0)
+			// or when an already-closed slot is reused for a new tool call.
+			idConflict := id != "" && existing.ID != "" && existing.ID != id
+			if !idConflict && !existing.Closed {
+				tc = existing
+			} else {
+				index = s.NextToolIndex
+			}
+		}
 	}
 	created := false
 	if tc == nil {
 		if index < 0 {
 			index = s.NextToolIndex
 		}
+		for s.ToolCallsByIndex[index] != nil {
+			index++
+		}
 		if index >= s.NextToolIndex {
 			s.NextToolIndex = index + 1
 		}
 		if id == "" {
-			id = fmt.Sprintf("call_%d", index)
+			id = SynthesizeToolCallID("call")
 		}
 		tc = &TrackedToolCall{
 			Index:       index,
@@ -286,26 +329,42 @@ func (s *StreamContext) RegisterToolCall(index int, id, itemID, name, kind, thou
 			ResponsesItemID:  tc.ItemID,
 			ToolName:         tc.Name,
 			ThoughtSignature: tc.ThoughtSignature,
-			OriginFormat:     s.TargetFormat,
+			OriginFormat:     s.SourceFormat,
 		})
 	}
 	return tc, created
 }
 
-// LookupToolCall finds a tracked tool call by ID or index.
+// LookupToolCall finds a tracked tool call by ID or index without cross-contaminating distinct tool IDs.
 func (s *StreamContext) LookupToolCall(index int, id string) *TrackedToolCall {
 	if id != "" {
-		if tc := s.ToolCallsByID[id]; tc != nil {
-			return tc
-		}
+		// Exact ID match only: never fall back to a different tool call when caller supplied a specific ID.
+		return s.ToolCallsByID[id]
 	}
 	if index >= 0 {
 		if tc := s.ToolCallsByIndex[index]; tc != nil {
 			return tc
 		}
+		return nil
 	}
-	if len(s.ToolCallOrder) > 0 {
-		return s.ToolCallOrder[len(s.ToolCallOrder)-1]
+	// Wildcard lookup (id == "" && index < 0): return the most recent open tool call.
+	for i := len(s.ToolCallOrder) - 1; i >= 0; i-- {
+		if !s.ToolCallOrder[i].Closed {
+			return s.ToolCallOrder[i]
+		}
+	}
+	return nil
+}
+
+// LookupToolCallByBlockIndex finds a tracked tool call associated with an Anthropic/stream content block index.
+func (s *StreamContext) LookupToolCallByBlockIndex(blockIndex int) *TrackedToolCall {
+	if blockIndex < 0 {
+		return nil
+	}
+	for i := len(s.ToolCallOrder) - 1; i >= 0; i-- {
+		if s.ToolCallOrder[i].BlockIndex == blockIndex {
+			return s.ToolCallOrder[i]
+		}
 	}
 	return nil
 }
@@ -317,6 +376,12 @@ func (s *StreamContext) MergeUsage(u *Usage) {
 	}
 	if s.LastUsage == nil {
 		copied := *u
+		if copied.ReasoningTokens > copied.OutputTokens {
+			copied.OutputTokens = copied.ReasoningTokens
+		}
+		if computed := copied.InclusiveInputTokens() + copied.OutputTokens; computed > copied.TotalTokens {
+			copied.TotalTokens = computed
+		}
 		s.LastUsage = &copied
 		return
 	}
@@ -324,46 +389,51 @@ func (s *StreamContext) MergeUsage(u *Usage) {
 	if u.InputExclusive {
 		dst.InputExclusive = true
 	}
-	if u.InputTokens > 0 {
+	if u.InputTokens > dst.InputTokens {
 		dst.InputTokens = u.InputTokens
 	}
 	if u.OutputTokens > 0 {
-		dst.OutputTokens = u.OutputTokens
+		if u.OutputTokens > dst.OutputTokens {
+			dst.OutputTokens = u.OutputTokens
+		} else if u.ReasoningTokens == 0 && dst.ReasoningTokens > 0 && u.OutputTokens+dst.ReasoningTokens > dst.OutputTokens {
+			// Guard against providers (e.g. Gemini) omitting earlier thoughtsTokenCount on a later chunk.
+			dst.OutputTokens = u.OutputTokens + dst.ReasoningTokens
+		}
 	}
-	if u.TotalTokens > 0 {
+	if u.TotalTokens > dst.TotalTokens {
 		dst.TotalTokens = u.TotalTokens
 	}
-	if u.CachedReadTokens > 0 {
+	if u.CachedReadTokens > dst.CachedReadTokens {
 		dst.CachedReadTokens = u.CachedReadTokens
 	}
-	if u.CacheCreationTokens > 0 {
+	if u.CacheCreationTokens > dst.CacheCreationTokens {
 		dst.CacheCreationTokens = u.CacheCreationTokens
 	}
-	if u.CacheCreation5mTokens > 0 {
+	if u.CacheCreation5mTokens > dst.CacheCreation5mTokens {
 		dst.CacheCreation5mTokens = u.CacheCreation5mTokens
 	}
-	if u.CacheCreation1hTokens > 0 {
+	if u.CacheCreation1hTokens > dst.CacheCreation1hTokens {
 		dst.CacheCreation1hTokens = u.CacheCreation1hTokens
 	}
-	if u.ReasoningTokens > 0 {
+	if u.ReasoningTokens > dst.ReasoningTokens {
 		dst.ReasoningTokens = u.ReasoningTokens
 	}
-	if u.AudioInputTokens > 0 {
+	if u.AudioInputTokens > dst.AudioInputTokens {
 		dst.AudioInputTokens = u.AudioInputTokens
 	}
-	if u.AudioOutputTokens > 0 {
+	if u.AudioOutputTokens > dst.AudioOutputTokens {
 		dst.AudioOutputTokens = u.AudioOutputTokens
 	}
-	if u.ImageInputTokens > 0 {
+	if u.ImageInputTokens > dst.ImageInputTokens {
 		dst.ImageInputTokens = u.ImageInputTokens
 	}
-	if u.ImageOutputTokens > 0 {
+	if u.ImageOutputTokens > dst.ImageOutputTokens {
 		dst.ImageOutputTokens = u.ImageOutputTokens
 	}
-	if u.TextInputTokens > 0 {
+	if u.TextInputTokens > dst.TextInputTokens {
 		dst.TextInputTokens = u.TextInputTokens
 	}
-	if u.TextOutputTokens > 0 {
+	if u.TextOutputTokens > dst.TextOutputTokens {
 		dst.TextOutputTokens = u.TextOutputTokens
 	}
 	if u.WebSearchRequests > dst.WebSearchRequests {
@@ -375,7 +445,16 @@ func (s *StreamContext) MergeUsage(u *Usage) {
 	if u.HasImageGenCall {
 		dst.HasImageGenCall = true
 	}
-	if dst.TotalTokens == 0 && (dst.InputTokens > 0 || dst.OutputTokens > 0) {
-		dst.TotalTokens = dst.InclusiveInputTokens() + dst.OutputTokens
+	if u.ImageGenQuality != "" {
+		dst.ImageGenQuality = u.ImageGenQuality
+	}
+	if u.ImageGenSize != "" {
+		dst.ImageGenSize = u.ImageGenSize
+	}
+	if dst.ReasoningTokens > dst.OutputTokens {
+		dst.OutputTokens = dst.ReasoningTokens
+	}
+	if computed := dst.InclusiveInputTokens() + dst.OutputTokens; computed > dst.TotalTokens {
+		dst.TotalTokens = computed
 	}
 }

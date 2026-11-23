@@ -140,7 +140,7 @@ func TestDecodeRequestComprehensive(t *testing.T) {
 	if req.Messages[0].Parts[1].Image.Data != "iVBORw==" || req.Messages[0].Parts[2].Image.URL != "https://example.com/a.jpg" {
 		t.Fatalf("image decoding mismatch: %+v %+v", req.Messages[0].Parts[1].Image, req.Messages[0].Parts[2].Image)
 	}
-	if req.Messages[0].Parts[3].File.Filename != "notes.txt" || req.Messages[0].Parts[3].File.Data != "hello doc" {
+	if req.Messages[0].Parts[3].File.Filename != "notes.txt" || req.Messages[0].Parts[3].File.Text != "hello doc" {
 		t.Fatalf("text document decoding mismatch: %+v", req.Messages[0].Parts[3].File)
 	}
 
@@ -790,6 +790,7 @@ func TestAdaptiveThinkingToolChoiceDataURLAndPipelineStreamRoundTrip(t *testing.
 		"system": "Be helpful.",
 		"thinking": {"type": "adaptive", "display": "summarized"},
 		"output_config": {"effort": "max"},
+		"tools": [{"name": "search", "input_schema": {"type": "object", "properties": {}}}],
 		"tool_choice": {"type": "tool", "name": "search", "disable_parallel_tool_use": true},
 		"messages": [{"role": "user", "content": "Hi"}]
 	}`

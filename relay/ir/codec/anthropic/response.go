@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/QuantumNous/new-api/relay/ir"
 )
@@ -109,6 +110,10 @@ func (*Codec) DecodeResponse(raw []byte, ctx *ir.ConversionContext) (*ir.Respons
 	if wire.StopReason != nil {
 		rawStopReason = *wire.StopReason
 	}
+	stopSeq := ""
+	if wire.StopSequence != nil {
+		stopSeq = *wire.StopSequence
+	}
 
 	serviceTier := wire.ServiceTier
 	if serviceTier == "" && wire.Usage != nil {
@@ -126,6 +131,7 @@ func (*Codec) DecodeResponse(raw []byte, ctx *ir.ConversionContext) (*ir.Respons
 			},
 			FinishReason:    decodeFinishReason(rawStopReason),
 			RawFinishReason: rawStopReason,
+			StopSequence:    stopSeq,
 		}},
 		Usage:            decodeUsage(wire.Usage, true),
 		ServiceTier:      serviceTier,
@@ -179,6 +185,7 @@ func (*Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]by
 	content := make([]any, 0)
 	var finishReason ir.FinishReason
 	rawFinishReason := ""
+	var stopSequence *string
 	hasToolCall := false
 	toolFallbackIdx := 0
 
@@ -186,6 +193,10 @@ func (*Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]by
 		ch := resp.Choices[0]
 		finishReason = ch.FinishReason
 		rawFinishReason = ch.RawFinishReason
+		if ch.StopSequence != "" {
+			s := ch.StopSequence
+			stopSequence = &s
+		}
 
 		for _, p := range ch.Message.Parts {
 			switch p.Type {
@@ -218,10 +229,23 @@ func (*Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]by
 				}
 
 			case ir.PartText:
+				if p.Text == "" {
+					continue
+				}
 				content = append(content, wireTextBlockEnc{
 					Type: "text",
 					Text: p.Text,
 				})
+
+			case ir.PartImage:
+				if p.Image != nil {
+					if md := formatAnthropicImageMarkdown(p.Image); md != "" {
+						content = append(content, wireTextBlockEnc{
+							Type: "text",
+							Text: md,
+						})
+					}
+				}
 
 			case ir.PartCitation:
 				if p.Citation == nil || len(content) == 0 {
@@ -260,12 +284,27 @@ func (*Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]by
 		}
 	}
 
-	// Preserve same-dialect passthrough blocks (e.g., server_tool_use / web_search_tool_result).
-	if ctx != nil {
+	// Preserve same-dialect passthrough blocks in their original Position order.
+	if ctx != nil && len(resp.PassthroughItems) > 0 {
+		var nativePT []ir.PassthroughItem
 		for _, item := range resp.PassthroughItems {
 			if item.OriginFormat == ir.FormatAnthropic && ctx.ShouldPreserveMetadata(item.OriginFormat) && len(item.Payload) > 0 {
-				content = append(content, json.RawMessage(bytes.Clone(item.Payload)))
+				nativePT = append(nativePT, item)
 			}
+		}
+		sort.SliceStable(nativePT, func(i, j int) bool {
+			return nativePT[i].Position < nativePT[j].Position
+		})
+		for _, item := range nativePT {
+			rawBlk := json.RawMessage(bytes.Clone(item.Payload))
+			pos := item.Position
+			if pos < 0 || pos >= len(content) {
+				content = append(content, rawBlk)
+				continue
+			}
+			content = append(content, nil)
+			copy(content[pos+1:], content[pos:])
+			content[pos] = rawBlk
 		}
 	}
 
@@ -285,7 +324,7 @@ func (*Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]by
 		Model:        resp.Model,
 		Content:      content,
 		StopReason:   stopReason,
-		StopSequence: nil,
+		StopSequence: stopSequence,
 		Usage:        encodeUsage(resp.Usage),
 	}
 
@@ -294,4 +333,21 @@ func (*Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]by
 		return nil, fmt.Errorf("anthropic: marshal response: %w", err)
 	}
 	return encoded, nil
+}
+
+func formatAnthropicImageMarkdown(img *ir.ImageSource) string {
+	if img == nil {
+		return ""
+	}
+	if img.URL != "" {
+		return fmt.Sprintf("![image](%s)", img.URL)
+	}
+	if img.Data != "" {
+		mt := img.MediaType
+		if mt == "" {
+			mt = "image/png"
+		}
+		return fmt.Sprintf("![image](data:%s;base64,%s)", mt, img.Data)
+	}
+	return ""
 }

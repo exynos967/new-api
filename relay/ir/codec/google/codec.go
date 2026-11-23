@@ -452,14 +452,15 @@ func encodeGoogleFinishReason(fr ir.FinishReason, raw string) string {
 	case ir.FinishContentFilter:
 		upper := strings.ToUpper(strings.TrimSpace(raw))
 		switch upper {
-		case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII":
+		case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII",
+			"IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "LANGUAGE":
 			return upper
 		default:
 			return "SAFETY"
 		}
 	case ir.FinishError:
 		upper := strings.ToUpper(strings.TrimSpace(raw))
-		if upper == "MALFORMED_FUNCTION_CALL" || upper == "UNEXPECTED_TOOL_CALL" {
+		if upper == "MALFORMED_FUNCTION_CALL" || upper == "UNEXPECTED_TOOL_CALL" || upper == "TOO_MANY_TOOL_CALLS" {
 			return upper
 		}
 		return "OTHER"
@@ -519,7 +520,7 @@ func encodeUsageMetadata(u *ir.Usage) *googleUsageMetadata {
 		candidatesTokens = 0
 	}
 	totalTokens := u.TotalTokens
-	if totalTokens == 0 && (promptTokens > 0 || u.OutputTokens > 0) {
+	if totalTokens < promptTokens+u.OutputTokens {
 		totalTokens = promptTokens + u.OutputTokens
 	}
 	meta := &googleUsageMetadata{

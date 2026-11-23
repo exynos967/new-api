@@ -828,7 +828,8 @@ func TestStreamDecodeAndBridgeState(t *testing.T) {
 			if ev.Text == "Calling tool now." {
 				sawText = true
 			}
-			if ev.Text == "![image](data:image/png;base64,YWJj)" {
+		case ir.EventImage:
+			if ev.Image != nil && ev.Image.MediaType == "image/png" && ev.Image.Data == "YWJj" {
 				sawImg = true
 			}
 		case ir.EventToolCallStart:

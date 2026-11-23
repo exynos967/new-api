@@ -128,20 +128,26 @@ type bridgeCacheRecord struct {
 	expiresAt time.Time
 }
 
-// TurnBridge is a concurrency-safe TTL+LRU cache that bridges opaque cross-turn metadata
-// across independent HTTP turns in the gateway.
-type TurnBridge struct {
+type turnBridgeShard struct {
 	mu      sync.Mutex
+	maxSize int
+	lru     *list.List
+	items   map[string]*list.Element
+}
+
+// TurnBridge is a concurrency-safe sharded TTL+LRU cache that bridges opaque cross-turn metadata
+// across independent HTTP turns in the gateway with strict scope isolation.
+type TurnBridge struct {
 	ttl     time.Duration
 	maxSize int
 	now     func() time.Time
-	lru     *list.List
-	items   map[string]*list.Element
+	shards  []turnBridgeShard
 }
 
 const (
 	defaultTurnBridgeTTL     = 30 * time.Minute
 	defaultTurnBridgeMaxSize = 10000
+	defaultTurnBridgeShards  = 16
 )
 
 // NewTurnBridge creates a TurnBridge with the given TTL and maximum entries.
@@ -152,12 +158,32 @@ func NewTurnBridge(ttl time.Duration, maxSize int) *TurnBridge {
 	if maxSize <= 0 {
 		maxSize = defaultTurnBridgeMaxSize
 	}
+	numShards := 1
+	if maxSize >= 64 {
+		numShards = defaultTurnBridgeShards
+	}
+	shards := make([]turnBridgeShard, numShards)
+	baseCap := maxSize / numShards
+	rem := maxSize % numShards
+	for i := range shards {
+		shardCap := baseCap
+		if i < rem {
+			shardCap++
+		}
+		if shardCap < 1 {
+			shardCap = 1
+		}
+		shards[i] = turnBridgeShard{
+			maxSize: shardCap,
+			lru:     list.New(),
+			items:   make(map[string]*list.Element, 32),
+		}
+	}
 	return &TurnBridge{
 		ttl:     ttl,
 		maxSize: maxSize,
 		now:     time.Now,
-		lru:     list.New(),
-		items:   make(map[string]*list.Element, 256),
+		shards:  shards,
 	}
 }
 
@@ -166,6 +192,19 @@ var defaultTurnBridge = NewTurnBridge(defaultTurnBridgeTTL, defaultTurnBridgeMax
 // DefaultTurnBridge returns the process-wide TurnBridge instance used by the relay pipeline.
 func DefaultTurnBridge() *TurnBridge {
 	return defaultTurnBridge
+}
+
+func (tb *TurnBridge) shardFor(scope string) *turnBridgeShard {
+	if len(tb.shards) == 1 {
+		return &tb.shards[0]
+	}
+	// FNV-1a 32-bit hash on scope so all entries for a tenant/channel scope stay in one shard.
+	var h uint32 = 2166136261
+	for i := 0; i < len(scope); i++ {
+		h ^= uint32(scope[i])
+		h *= 16777619
+	}
+	return &tb.shards[h%uint32(len(tb.shards))]
 }
 
 func makeBridgeKey(scope, toolCallID string) string {
@@ -180,8 +219,9 @@ func (tb *TurnBridge) Save(scope string, state *BridgeState) {
 	if tb == nil || state == nil || len(state.ToolCalls) == 0 {
 		return
 	}
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
+	shard := tb.shardFor(scope)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
 	now := tb.now()
 	exp := now.Add(tb.ttl)
@@ -193,11 +233,11 @@ func (tb *TurnBridge) Save(scope string, state *BridgeState) {
 			continue
 		}
 		k := makeBridgeKey(scope, id)
-		if elem, ok := tb.items[k]; ok {
+		if elem, ok := shard.items[k]; ok {
 			rec := elem.Value.(*bridgeCacheRecord)
 			rec.entry = mergeBridgeEntry(rec.entry, entry)
 			rec.expiresAt = exp
-			tb.lru.MoveToFront(elem)
+			shard.lru.MoveToFront(elem)
 			continue
 		}
 		rec := &bridgeCacheRecord{
@@ -205,14 +245,14 @@ func (tb *TurnBridge) Save(scope string, state *BridgeState) {
 			entry:     entry,
 			expiresAt: exp,
 		}
-		elem := tb.lru.PushFront(rec)
-		tb.items[k] = elem
+		elem := shard.lru.PushFront(rec)
+		shard.items[k] = elem
 	}
-	tb.evictLocked(now)
+	shard.evictLocked(now)
 }
 
-// LoadForRequest looks up cached entries for every tool call / tool result ID referenced in req.
-// Entries are read with non-destructive Get semantics so multi-turn history replays remain intact.
+// LoadForRequest looks up cached entries for every tool call / tool result ID referenced in req
+// strictly within the caller's scope (never falling back across scopes).
 func (tb *TurnBridge) LoadForRequest(scope string, req *Request) *BridgeState {
 	state := NewBridgeState()
 	if tb == nil || req == nil {
@@ -223,27 +263,27 @@ func (tb *TurnBridge) LoadForRequest(scope string, req *Request) *BridgeState {
 		return state
 	}
 
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
+	shard := tb.shardFor(scope)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
 	now := tb.now()
+	exp := now.Add(tb.ttl)
 	for _, id := range ids {
 		k := makeBridgeKey(scope, id)
-		elem, ok := tb.items[k]
-		if !ok && scope != "" {
-			// Fallback to unscoped lookup when scope changed (e.g. retry across channels).
-			elem, ok = tb.items[id]
-		}
+		elem, ok := shard.items[k]
 		if !ok {
 			continue
 		}
 		rec := elem.Value.(*bridgeCacheRecord)
 		if now.After(rec.expiresAt) {
-			tb.lru.Remove(elem)
-			delete(tb.items, rec.key)
+			shard.lru.Remove(elem)
+			delete(shard.items, rec.key)
 			continue
 		}
-		tb.lru.MoveToFront(elem)
+		// Refresh sliding TTL alongside MoveToFront so the LRU list stays monotonic in expiresAt.
+		rec.expiresAt = exp
+		shard.lru.MoveToFront(elem)
 		state.ToolCalls[id] = rec.entry
 	}
 	return state
@@ -254,10 +294,13 @@ func (tb *TurnBridge) Clear() {
 	if tb == nil {
 		return
 	}
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-	tb.lru.Init()
-	tb.items = make(map[string]*list.Element, 64)
+	for i := range tb.shards {
+		s := &tb.shards[i]
+		s.mu.Lock()
+		s.lru.Init()
+		s.items = make(map[string]*list.Element, 32)
+		s.mu.Unlock()
+	}
 }
 
 // Len returns the current number of cached entries (for observability/testing).
@@ -265,19 +308,24 @@ func (tb *TurnBridge) Len() int {
 	if tb == nil {
 		return 0
 	}
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-	return len(tb.items)
+	total := 0
+	for i := range tb.shards {
+		s := &tb.shards[i]
+		s.mu.Lock()
+		total += len(s.items)
+		s.mu.Unlock()
+	}
+	return total
 }
 
-func (tb *TurnBridge) evictLocked(now time.Time) {
-	// Evict expired items from tail first, then enforce maxSize.
-	for elem := tb.lru.Back(); elem != nil; {
+func (s *turnBridgeShard) evictLocked(now time.Time) {
+	// Because every MoveToFront refreshes expiresAt, the LRU list is monotonic from tail (oldest) to head (newest).
+	for elem := s.lru.Back(); elem != nil; {
 		prev := elem.Prev()
 		rec := elem.Value.(*bridgeCacheRecord)
-		if now.After(rec.expiresAt) || len(tb.items) > tb.maxSize {
-			tb.lru.Remove(elem)
-			delete(tb.items, rec.key)
+		if now.After(rec.expiresAt) || len(s.items) > s.maxSize {
+			s.lru.Remove(elem)
+			delete(s.items, rec.key)
 		} else {
 			break
 		}
@@ -286,6 +334,13 @@ func (tb *TurnBridge) evictLocked(now time.Time) {
 }
 
 func mergeBridgeEntry(base, next ToolCallBridgeEntry) ToolCallBridgeEntry {
+	// If the colliding entry comes from a different origin protocol or distinct tool identity,
+	// replace instead of stitching incompatible metadata together.
+	if (base.OriginFormat != FormatUnknown && next.OriginFormat != FormatUnknown && base.OriginFormat != next.OriginFormat) ||
+		(base.ToolName != "" && next.ToolName != "" && base.ToolName != next.ToolName) ||
+		(base.ResponsesItemID != "" && next.ResponsesItemID != "" && base.ResponsesItemID != next.ResponsesItemID) {
+		return next
+	}
 	if next.ToolCallID != "" {
 		base.ToolCallID = next.ToolCallID
 	}

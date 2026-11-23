@@ -3,7 +3,6 @@ package codex
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -14,9 +13,6 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
-	"github.com/QuantumNous/new-api/relay/ir"
-	_ "github.com/QuantumNous/new-api/relay/ir/codec/all"
-	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -25,40 +21,12 @@ import (
 type Adaptor struct {
 }
 
-func (a *Adaptor) convertCrossProtocolViaIR(info *relaycommon.RelayInfo, sourceFormat ir.Format, req any) (any, error) {
-	scope := ""
-	if info != nil && info.ChannelMeta != nil && info.ChannelId > 0 {
-		scope = fmt.Sprintf("channel:%d", info.ChannelId)
-	}
-	raw, err := ir.ConvertPayload(sourceFormat, ir.FormatOpenAIResponses, req, ir.CodexResponsesShim, scope, nil)
-	if err != nil {
-		return nil, err
-	}
-	if info != nil {
-		out, err := ir.ApplyJSONTransforms(raw, []ir.JSONTransform{
-			ir.SetDefaultField("model", info.UpstreamModelName),
-			ir.SetDefaultField("stream", info.IsStream),
-		}, nil)
-		if err != nil {
-			return nil, err
-		}
-		return json.RawMessage(out), nil
-	}
-	return raw, nil
+func (a *Adaptor) ConvertGeminiRequest(_ *gin.Context, _ *relaycommon.RelayInfo, _ *dto.GeminiChatRequest) (any, error) {
+	return nil, errors.New("codex channel: endpoint not supported")
 }
 
-func (a *Adaptor) ConvertGeminiRequest(_ *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error) {
-	if !model_setting.IsIRConversionEnabled() {
-		return nil, errors.New("codex channel: endpoint not supported")
-	}
-	return a.convertCrossProtocolViaIR(info, ir.FormatGoogleGenAI, request)
-}
-
-func (a *Adaptor) ConvertClaudeRequest(_ *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
-	if !model_setting.IsIRConversionEnabled() {
-		return nil, errors.New("codex channel: /v1/messages endpoint not supported")
-	}
-	return a.convertCrossProtocolViaIR(info, ir.FormatAnthropic, request)
+func (a *Adaptor) ConvertClaudeRequest(_ *gin.Context, _ *relaycommon.RelayInfo, _ *dto.ClaudeRequest) (any, error) {
+	return nil, errors.New("codex channel: /v1/messages endpoint not supported")
 }
 
 func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
@@ -72,11 +40,8 @@ func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInf
 func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 }
 
-func (a *Adaptor) ConvertOpenAIRequest(_ *gin.Context, info *relaycommon.RelayInfo, request *dto.GeneralOpenAIRequest) (any, error) {
-	if !model_setting.IsIRConversionEnabled() {
-		return nil, errors.New("codex channel: /v1/chat/completions endpoint not supported")
-	}
-	return a.convertCrossProtocolViaIR(info, ir.FormatOpenAIChat, request)
+func (a *Adaptor) ConvertOpenAIRequest(_ *gin.Context, _ *relaycommon.RelayInfo, _ *dto.GeneralOpenAIRequest) (any, error) {
+	return nil, errors.New("codex channel: /v1/chat/completions endpoint not supported")
 }
 
 func (a *Adaptor) ConvertRerankRequest(c *gin.Context, relayMode int, request dto.RerankRequest) (any, error) {

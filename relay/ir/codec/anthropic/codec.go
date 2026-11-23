@@ -96,16 +96,14 @@ type wireDocumentBlockEnc struct {
 }
 
 type wireThinkingBlockEnc struct {
-	Type         string            `json:"type"`
-	Thinking     string            `json:"thinking"`
-	Signature    string            `json:"signature,omitempty"`
-	CacheControl *wireCacheControl `json:"cache_control,omitempty"`
+	Type      string `json:"type"`
+	Thinking  string `json:"thinking"`
+	Signature string `json:"signature,omitempty"`
 }
 
 type wireRedactedThinkingBlockEnc struct {
-	Type         string            `json:"type"`
-	Data         string            `json:"data"`
-	CacheControl *wireCacheControl `json:"cache_control,omitempty"`
+	Type string `json:"type"`
+	Data string `json:"data"`
 }
 
 type wireToolUseBlockEnc struct {
@@ -241,8 +239,8 @@ func decodeFinishReason(stopReason string) ir.FinishReason {
 func encodeFinishReason(fr ir.FinishReason, raw string) string {
 	switch fr {
 	case ir.FinishStop:
-		if raw == "stop_sequence" {
-			return "stop_sequence"
+		if raw == "stop_sequence" || raw == "pause_turn" {
+			return raw
 		}
 		return "end_turn"
 	case ir.FinishLength:

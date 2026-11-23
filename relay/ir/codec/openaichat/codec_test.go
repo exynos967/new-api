@@ -811,22 +811,25 @@ func TestStreamBufferedUsageFlushAndError(t *testing.T) {
 		t.Fatalf("expected pre-finish usage to remain buffered, got %d frames", len(frames))
 	}
 
-	// FlushStream should emit: finish(tool_calls) -> merged usage(prompt=110, completion=25) -> [DONE].
+	// FlushStream should emit: empty "{}" args for the 2 zero-arg tools -> finish(tool_calls) -> merged usage(prompt=110, completion=25) -> [DONE].
 	flushed, err := c.FlushStream(ctx)
 	if err != nil {
 		t.Fatalf("FlushStream error: %v", err)
 	}
-	if len(flushed) != 3 {
-		t.Fatalf("expected 3 flush frames (finish, usage, [DONE]), got %d", len(flushed))
+	if len(flushed) != 5 {
+		t.Fatalf("expected 5 flush frames (2x '{}' args, finish, usage, [DONE]), got %d", len(flushed))
 	}
-	if !strings.Contains(string(flushed[0].Data), `"finish_reason":"tool_calls"`) {
-		t.Fatalf("expected tool_calls finish chunk, got %s", string(flushed[0].Data))
+	if !strings.Contains(string(flushed[0].Data), `"arguments":"{}"`) || !strings.Contains(string(flushed[1].Data), `"arguments":"{}"`) {
+		t.Fatalf("expected zero-arg tools to emit '{}' before finish, got %s | %s", string(flushed[0].Data), string(flushed[1].Data))
 	}
-	if !strings.Contains(string(flushed[1].Data), `"prompt_tokens":110`) || !strings.Contains(string(flushed[1].Data), `"completion_tokens":25`) {
-		t.Fatalf("expected merged inclusive usage chunk, got %s", string(flushed[1].Data))
+	if !strings.Contains(string(flushed[2].Data), `"finish_reason":"tool_calls"`) {
+		t.Fatalf("expected tool_calls finish chunk, got %s", string(flushed[2].Data))
 	}
-	if string(flushed[2].Data) != "[DONE]" {
-		t.Fatalf("expected [DONE], got %q", string(flushed[2].Data))
+	if !strings.Contains(string(flushed[3].Data), `"prompt_tokens":110`) || !strings.Contains(string(flushed[3].Data), `"completion_tokens":25`) {
+		t.Fatalf("expected merged inclusive usage chunk, got %s", string(flushed[3].Data))
+	}
+	if string(flushed[4].Data) != "[DONE]" {
+		t.Fatalf("expected [DONE], got %q", string(flushed[4].Data))
 	}
 
 	// Second FlushStream must be idempotent.

@@ -76,6 +76,7 @@ type wireRequestDec struct {
 	StopSequences []string          `json:"stop_sequences,omitempty"`
 	Metadata      map[string]any    `json:"metadata,omitempty"`
 	ServiceTier   string            `json:"service_tier,omitempty"`
+	CacheControl  *wireCacheControl `json:"cache_control,omitempty"`
 }
 
 type wireRequestEnc struct {
@@ -94,6 +95,7 @@ type wireRequestEnc struct {
 	StopSequences []string          `json:"stop_sequences,omitempty"`
 	Metadata      map[string]any    `json:"metadata,omitempty"`
 	ServiceTier   string            `json:"service_tier,omitempty"`
+	CacheControl  *wireCacheControl `json:"cache_control,omitempty"`
 }
 
 // DecodeRequest translates an Anthropic /v1/messages JSON request into the provider-neutral IR.
@@ -117,7 +119,8 @@ func (*Codec) DecodeRequest(raw []byte, ctx *ir.ConversionContext) (*ir.Request,
 			StopSequences: wire.StopSequences,
 			ServiceTier:   wire.ServiceTier,
 		},
-		Metadata: wire.Metadata,
+		Metadata:     wire.Metadata,
+		CacheControl: decodeCacheControl(wire.CacheControl),
 	}
 	if wire.Stream != nil {
 		req.Stream = *wire.Stream
@@ -316,10 +319,13 @@ func decodeRequestBlock(b wireContentBlock, ctx *ir.ConversionContext) (ir.Conte
 			img.MediaType = b.Source.MediaType
 		case "url":
 			img.URL = b.Source.URL
+		case "file":
+			img.FileID = b.Source.FileID
 		default:
 			img.Data = b.Source.Data
 			img.MediaType = b.Source.MediaType
 			img.URL = b.Source.URL
+			img.FileID = b.Source.FileID
 		}
 		return ir.ContentPart{
 			Type:         ir.PartImage,
@@ -342,7 +348,7 @@ func decodeRequestBlock(b wireContentBlock, ctx *ir.ConversionContext) (ir.Conte
 		case "url":
 			fs.URL = b.Source.URL
 		case "text":
-			fs.Data = b.Source.Data
+			fs.Text = b.Source.Data
 			if fs.MediaType == "" {
 				fs.MediaType = "text/plain"
 			}
@@ -529,7 +535,17 @@ func (*Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byte,
 		return nil, errors.New("anthropic: nil request")
 	}
 
-	thinking, outputCfg := encodeReasoningConfig(req.Reasoning)
+	thinking, outputCfg := encodeReasoningConfig(req.Reasoning, req.Model)
+
+	// Tools & tool choice must be resolved before thinking/tool_choice compatibility checks.
+	wireTools := encodeTools(req.Tools, ctx)
+	wireTC := encodeToolChoice(req.ToolChoice, req.ParallelToolCalls, len(wireTools) > 0)
+
+	// Anthropic rejects manual thinking ("enabled") when tool_choice forces tool use ("any" or "tool").
+	if thinking != nil && thinking.Type == "enabled" && wireTC != nil && (wireTC.Type == "any" || wireTC.Type == "tool") {
+		ctx.AddWarning("dropped_thinking_forced_tool", "thinking", "disabled thinking.type=enabled because forced tool_choice (any/tool) is incompatible with manual thinking on Anthropic")
+		thinking = nil
+	}
 
 	// Anthropic REQUIRES max_tokens > 0 and max_tokens > thinking.budget_tokens.
 	maxTokens := 0
@@ -562,19 +578,35 @@ func (*Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byte,
 	}
 	topP := req.Generation.TopP
 	topK := req.Generation.TopK
-	if thinking != nil && thinking.Type == "enabled" {
-		if temp != nil && *temp != 1.0 {
-			one := 1.0
-			temp = &one
-			ctx.AddWarning("adjusted_temperature", "temperature", "set temperature to 1.0 as required when thinking.type is enabled")
+	isAdaptiveOnlyModel := isAnthropicAdaptiveOnlyModel(req.Model)
+	thinkingActive := thinking != nil && (thinking.Type == "enabled" || thinking.Type == "adaptive")
+	if isAdaptiveOnlyModel {
+		// Claude Opus 4.7+ rejects non-default temperature/top_p/top_k unconditionally.
+		if temp != nil {
+			temp = nil
+			ctx.AddWarning("dropped_temperature", "temperature", "dropped temperature for Claude Opus 4.7+ compatibility")
 		}
 		if topP != nil {
 			topP = nil
-			ctx.AddWarning("dropped_top_p", "top_p", "dropped top_p as required when thinking.type is enabled")
+			ctx.AddWarning("dropped_top_p", "top_p", "dropped top_p for Claude Opus 4.7+ compatibility")
 		}
 		if topK != nil {
 			topK = nil
-			ctx.AddWarning("dropped_top_k", "top_k", "dropped top_k as required when thinking.type is enabled")
+			ctx.AddWarning("dropped_top_k", "top_k", "dropped top_k for Claude Opus 4.7+ compatibility")
+		}
+	} else if thinkingActive {
+		if temp != nil && *temp != 1.0 {
+			one := 1.0
+			temp = &one
+			ctx.AddWarning("adjusted_temperature", "temperature", "set temperature to 1.0 as required when thinking is active")
+		}
+		if topP != nil {
+			topP = nil
+			ctx.AddWarning("dropped_top_p", "top_p", "dropped top_p as required when thinking is active")
+		}
+		if topK != nil {
+			topK = nil
+			ctx.AddWarning("dropped_top_k", "top_k", "dropped top_k as required when thinking is active")
 		}
 	}
 
@@ -583,12 +615,6 @@ func (*Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byte,
 
 	// Messages with strict Anthropic invariants.
 	wireMessages := encodeMessages(req.Messages, ctx)
-
-	// Tools.
-	wireTools := encodeTools(req.Tools, ctx)
-
-	// Tool choice.
-	wireTC := encodeToolChoice(req.ToolChoice, req.ParallelToolCalls, len(wireTools) > 0)
 
 	// Metadata (preserve metadata map and inject user_id from Generation.User without mutating caller state).
 	var meta map[string]any
@@ -604,6 +630,8 @@ func (*Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byte,
 		}
 	}
 
+	isStream := req.Stream || (ctx != nil && ctx.GetBoolOption("stream", false))
+
 	out := wireRequestEnc{
 		Model:         req.Model,
 		MaxTokens:     maxTokens,
@@ -613,13 +641,14 @@ func (*Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byte,
 		ToolChoice:    wireTC,
 		Thinking:      thinking,
 		OutputConfig:  outputCfg,
-		Stream:        req.Stream,
+		Stream:        isStream,
 		Temperature:   temp,
 		TopP:          topP,
 		TopK:          topK,
 		StopSequences: req.Generation.StopSequences,
 		Metadata:      meta,
 		ServiceTier:   req.Generation.ServiceTier,
+		CacheControl:  encodeCacheControl(req.CacheControl),
 	}
 
 	encoded, err := json.Marshal(out)
@@ -634,15 +663,12 @@ func encodeSystem(sysParts []ir.ContentPart, messages []ir.Message) any {
 	hasCacheControl := false
 
 	appendPart := func(p ir.ContentPart, fallbackCC *ir.CacheControl) {
-		if p.Type != ir.PartText {
+		if p.Type != ir.PartText || p.Text == "" {
 			return
 		}
 		cc := p.CacheControl
 		if cc == nil {
 			cc = fallbackCC
-		}
-		if p.Text == "" && cc == nil {
-			return
 		}
 		wcc := encodeCacheControl(cc)
 		if wcc != nil {
@@ -708,9 +734,15 @@ func encodeMessages(messages []ir.Message, ctx *ir.ConversionContext) []wireMess
 			}
 		}
 
-		// Propagate message-level cache_control onto the last encoded block if unset.
+		// Propagate message-level cache_control onto the last cacheable (non-thinking) block if unset.
 		if msg.CacheControl != nil && len(blocks) > 0 {
-			blocks[len(blocks)-1] = attachBlockCacheControl(blocks[len(blocks)-1], encodeCacheControl(msg.CacheControl))
+			wcc := encodeCacheControl(msg.CacheControl)
+			for bi := len(blocks) - 1; bi >= 0; bi-- {
+				if isCacheableBlock(blocks[bi]) {
+					blocks[bi] = attachBlockCacheControl(blocks[bi], wcc)
+					break
+				}
+			}
 		}
 
 		// Invariant 2: merge adjacent messages with the same wire role.
@@ -721,6 +753,20 @@ func encodeMessages(messages []ir.Message, ctx *ir.ConversionContext) []wireMess
 				Role:    wireRole,
 				Content: blocks,
 			})
+		}
+	}
+
+	// Enforce strict Anthropic block ordering inside merged messages:
+	// - user messages: tool_result blocks must precede regular text/image/document blocks.
+	// - assistant messages: thinking/redacted_thinking blocks must precede text/tool_use blocks.
+	for i := range merged {
+		if merged[i].Role == "user" {
+			merged[i].Content = hoistBlocks(merged[i].Content, func(b any) bool {
+				_, ok := b.(wireToolResultBlockEnc)
+				return ok
+			})
+		} else if merged[i].Role == "assistant" {
+			merged[i].Content = hoistBlocks(merged[i].Content, isThinkingBlock)
 		}
 	}
 
@@ -789,20 +835,19 @@ func encodeRequestPart(p ir.ContentPart, toolFallbackIdx *int, ctx *ir.Conversio
 			return nil, false
 		}
 		// Invariant 5 (opaque thinking/signature safety):
-		// Anthropic rejects thinking blocks without valid Anthropic signatures or foreign encrypted blobs.
+		// Anthropic rejects thinking blocks without valid Anthropic signatures, foreign encrypted blobs,
+		// or cache_control on thinking/redacted_thinking blocks.
 		if p.Reasoning.OriginFormat == ir.FormatAnthropic && p.Reasoning.Signature != "" {
 			return wireThinkingBlockEnc{
-				Type:         "thinking",
-				Thinking:     p.Reasoning.Text,
-				Signature:    p.Reasoning.Signature,
-				CacheControl: cc,
+				Type:      "thinking",
+				Thinking:  p.Reasoning.Text,
+				Signature: p.Reasoning.Signature,
 			}, true
 		}
 		if p.Reasoning.OriginFormat == ir.FormatAnthropic && p.Reasoning.RedactedData != "" {
 			return wireRedactedThinkingBlockEnc{
-				Type:         "redacted_thinking",
-				Data:         p.Reasoning.RedactedData,
-				CacheControl: cc,
+				Type: "redacted_thinking",
+				Data: p.Reasoning.RedactedData,
 			}, true
 		}
 		ctx.AddWarning("dropped_foreign_reasoning", "messages.content",
@@ -872,6 +917,9 @@ func encodeToolResultSubPart(p ir.ContentPart, ctx *ir.ConversionContext) (any, 
 	cc := encodeCacheControl(p.CacheControl)
 	switch p.Type {
 	case ir.PartText:
+		if p.Text == "" {
+			return nil, false
+		}
 		return wireTextBlockEnc{
 			Type:         "text",
 			Text:         p.Text,
@@ -924,6 +972,16 @@ func encodeImageBlock(img *ir.ImageSource, cc *wireCacheControl) (any, bool) {
 			CacheControl: cc,
 		}, true
 	}
+	if img.FileID != "" {
+		return wireImageBlockEnc{
+			Type: "image",
+			Source: wireSource{
+				Type:   "file",
+				FileID: img.FileID,
+			},
+			CacheControl: cc,
+		}, true
+	}
 	return nil, false
 }
 
@@ -935,11 +993,15 @@ func encodeDocumentBlock(f *ir.FileSource, meta map[string]any, cc *wireCacheCon
 	var src wireSource
 
 	switch {
-	case sourceType == "text":
+	case sourceType == "text" || (f.Text != "" && f.Data == "" && f.URL == "" && f.FileID == ""):
+		textVal := f.Text
+		if textVal == "" {
+			textVal = f.Data
+		}
 		src = wireSource{
 			Type:      "text",
 			MediaType: nonEmpty(f.MediaType, "text/plain"),
-			Data:      f.Data,
+			Data:      textVal,
 		}
 	case f.Data != "":
 		if mediaType, payload, ok := ir.ParseDataURL(f.Data); ok {
@@ -985,6 +1047,38 @@ func encodeDocumentBlock(f *ir.FileSource, meta map[string]any, cc *wireCacheCon
 	}, true
 }
 
+func isThinkingBlock(b any) bool {
+	switch b.(type) {
+	case wireThinkingBlockEnc, wireRedactedThinkingBlockEnc:
+		return true
+	default:
+		return false
+	}
+}
+
+func isCacheableBlock(b any) bool {
+	return !isThinkingBlock(b)
+}
+
+func hoistBlocks(blocks []any, predicate func(any) bool) []any {
+	if len(blocks) <= 1 {
+		return blocks
+	}
+	var front []any
+	var rest []any
+	for _, b := range blocks {
+		if predicate(b) {
+			front = append(front, b)
+		} else {
+			rest = append(rest, b)
+		}
+	}
+	if len(front) == 0 || len(rest) == 0 {
+		return blocks
+	}
+	return append(front, rest...)
+}
+
 func attachBlockCacheControl(blk any, cc *wireCacheControl) any {
 	if cc == nil {
 		return blk
@@ -1001,16 +1095,6 @@ func attachBlockCacheControl(blk any, cc *wireCacheControl) any {
 		}
 		return v
 	case wireDocumentBlockEnc:
-		if v.CacheControl == nil {
-			v.CacheControl = cc
-		}
-		return v
-	case wireThinkingBlockEnc:
-		if v.CacheControl == nil {
-			v.CacheControl = cc
-		}
-		return v
-	case wireRedactedThinkingBlockEnc:
 		if v.CacheControl == nil {
 			v.CacheControl = cc
 		}
@@ -1064,8 +1148,8 @@ func encodeTools(tools []ir.ToolDefinition, ctx *ir.ConversionContext) []any {
 	return out
 }
 
-// ensureInputSchemaObject guarantees input_schema is a JSON object with "type": "object",
-// preventing Anthropic HTTP 400 validation failures.
+// ensureInputSchemaObject guarantees input_schema is a JSON object with "type": "object"
+// and recursively normalizes uppercase Gemini OpenAPI types (e.g. "STRING" -> "string").
 func ensureInputSchemaObject(raw json.RawMessage) json.RawMessage {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -1075,12 +1159,7 @@ func ensureInputSchemaObject(raw json.RawMessage) json.RawMessage {
 	if err := json.Unmarshal(trimmed, &schema); err != nil || schema == nil {
 		return json.RawMessage(`{"type":"object","properties":{}}`)
 	}
-	if t, ok := schema["type"].(string); ok && t == "object" {
-		var buf bytes.Buffer
-		if err := json.Compact(&buf, trimmed); err == nil {
-			return json.RawMessage(buf.Bytes())
-		}
-	}
+	normalizeSchemaTypesLower(schema)
 	schema["type"] = "object"
 	b, err := json.Marshal(schema)
 	if err != nil {
@@ -1089,7 +1168,48 @@ func ensureInputSchemaObject(raw json.RawMessage) json.RawMessage {
 	return json.RawMessage(b)
 }
 
+func normalizeSchemaTypesLower(node any) {
+	switch v := node.(type) {
+	case map[string]any:
+		if t, ok := v["type"].(string); ok && t != "" {
+			v["type"] = strings.ToLower(t)
+		}
+		if props, ok := v["properties"].(map[string]any); ok {
+			for _, child := range props {
+				normalizeSchemaTypesLower(child)
+			}
+		}
+		if items, ok := v["items"]; ok {
+			normalizeSchemaTypesLower(items)
+		}
+		for _, k := range []string{"anyOf", "oneOf", "allOf"} {
+			if list, ok := v[k].([]any); ok {
+				for _, child := range list {
+					normalizeSchemaTypesLower(child)
+				}
+			}
+		}
+		for _, k := range []string{"$defs", "definitions"} {
+			if defs, ok := v[k].(map[string]any); ok {
+				for _, child := range defs {
+					normalizeSchemaTypesLower(child)
+				}
+			}
+		}
+		if addProps, ok := v["additionalProperties"].(map[string]any); ok {
+			normalizeSchemaTypesLower(addProps)
+		}
+	case []any:
+		for _, child := range v {
+			normalizeSchemaTypesLower(child)
+		}
+	}
+}
+
 func encodeToolChoice(tc *ir.ToolChoice, parallelToolCalls *bool, hasTools bool) *wireToolChoice {
+	if !hasTools {
+		return nil
+	}
 	var disableParallel *bool
 	if tc != nil && tc.DisableParallel != nil {
 		v := *tc.DisableParallel
@@ -1100,7 +1220,7 @@ func encodeToolChoice(tc *ir.ToolChoice, parallelToolCalls *bool, hasTools bool)
 	}
 
 	if tc == nil {
-		if hasTools && disableParallel != nil && *disableParallel {
+		if disableParallel != nil && *disableParallel {
 			v := true
 			return &wireToolChoice{
 				Type:                   "auto",
@@ -1134,7 +1254,24 @@ func encodeToolChoice(tc *ir.ToolChoice, parallelToolCalls *bool, hasTools bool)
 	return out
 }
 
-func encodeReasoningConfig(rc *ir.ReasoningConfig) (*wireThinking, *wireOutputConfig) {
+func isAnthropicAdaptiveOnlyModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(m, "opus-4-7") || strings.Contains(m, "opus-4.7") ||
+		strings.Contains(m, "opus-4-8") || strings.Contains(m, "opus-4.8")
+}
+
+func supportsAnthropicOutputConfigEffort(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return true
+	}
+	return strings.Contains(m, "4-6") || strings.Contains(m, "4.6") ||
+		strings.Contains(m, "4-7") || strings.Contains(m, "4.7") ||
+		strings.Contains(m, "4-8") || strings.Contains(m, "4.8") ||
+		strings.Contains(m, "opus-4-5") || strings.Contains(m, "opus-4.5")
+}
+
+func encodeReasoningConfig(rc *ir.ReasoningConfig, model string) (*wireThinking, *wireOutputConfig) {
 	if rc == nil {
 		return nil, nil
 	}
@@ -1145,6 +1282,7 @@ func encodeReasoningConfig(rc *ir.ReasoningConfig) (*wireThinking, *wireOutputCo
 		outputCfg = &wireOutputConfig{Effort: effort}
 	}
 
+	adaptiveOnly := isAnthropicAdaptiveOnlyModel(model)
 	mode := strings.ToLower(strings.TrimSpace(rc.Mode))
 	switch {
 	case mode == "disabled" || (rc.Enabled != nil && !*rc.Enabled) ||
@@ -1158,6 +1296,12 @@ func encodeReasoningConfig(rc *ir.ReasoningConfig) (*wireThinking, *wireOutputCo
 		}, outputCfg
 
 	case mode == "enabled" || (rc.Enabled != nil && *rc.Enabled) || (rc.BudgetTokens != nil && *rc.BudgetTokens > 0):
+		if adaptiveOnly {
+			return &wireThinking{
+				Type:    "adaptive",
+				Display: rc.Display,
+			}, outputCfg
+		}
 		budget := 0
 		if rc.BudgetTokens != nil && *rc.BudgetTokens > 0 {
 			budget = *rc.BudgetTokens
@@ -1167,11 +1311,33 @@ func encodeReasoningConfig(rc *ir.ReasoningConfig) (*wireThinking, *wireOutputCo
 		if budget < minAnthropicThinkingBudget {
 			budget = minAnthropicThinkingBudget
 		}
+		var oc *wireOutputConfig
+		if supportsAnthropicOutputConfigEffort(model) {
+			oc = outputCfg
+		}
 		return &wireThinking{
 			Type:         "enabled",
 			BudgetTokens: &budget,
 			Display:      rc.Display,
-		}, outputCfg
+		}, oc
+
+	case effort != "":
+		// Bare reasoning_effort (e.g. from OpenAI Chat) without explicit Mode/Enabled/BudgetTokens.
+		if adaptiveOnly || supportsAnthropicOutputConfigEffort(model) {
+			return &wireThinking{
+				Type:    "adaptive",
+				Display: rc.Display,
+			}, outputCfg
+		}
+		budget := effortToBudgetTokens(rc.Effort)
+		if budget < minAnthropicThinkingBudget {
+			budget = minAnthropicThinkingBudget
+		}
+		return &wireThinking{
+			Type:         "enabled",
+			BudgetTokens: &budget,
+			Display:      rc.Display,
+		}, nil
 
 	default:
 		return nil, outputCfg

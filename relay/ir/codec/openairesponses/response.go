@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/QuantumNous/new-api/relay/ir"
@@ -87,6 +88,8 @@ type responsesOutputItemWire struct {
 	Name             string                     `json:"name,omitempty"`
 	Arguments        string                     `json:"arguments,omitempty"`
 	Input            string                     `json:"input,omitempty"`
+	Quality          string                     `json:"quality,omitempty"`
+	Size             string                     `json:"size,omitempty"`
 }
 
 // DecodeResponse parses a non-streaming OpenAI Responses API JSON body into the provider-neutral IR.
@@ -99,11 +102,33 @@ func (c *Codec) DecodeResponse(raw []byte, ctx *ir.ConversionContext) (*ir.Respo
 		return nil, fmt.Errorf("openairesponses: decode response: %w", err)
 	}
 
+	var decodedErr *ir.ResponseError
+	if !isNullOrEmptyJSON(wire.Error) {
+		decodedErr = decodeResponseError(wire.Error)
+		// Pure gateway error envelope (no response id/status/output): fail fast rather than returning FinishStop.
+		if wire.ID == "" && wire.Status == "" && len(wire.Output) == 0 {
+			errType := "error"
+			errMsg := "upstream response error"
+			if decodedErr != nil {
+				if decodedErr.Type != "" {
+					errType = decodedErr.Type
+				} else if decodedErr.Code != "" {
+					errType = decodedErr.Code
+				}
+				if decodedErr.Message != "" {
+					errMsg = decodedErr.Message
+				}
+			}
+			return nil, fmt.Errorf("openairesponses: upstream error (%s): %s", errType, errMsg)
+		}
+	}
+
 	resp := &ir.Response{
 		ID:          wire.ID,
 		Model:       wire.Model,
 		Created:     wire.CreatedAt,
 		ServiceTier: wire.ServiceTier,
+		Error:       decodedErr,
 	}
 
 	var parts []ir.ContentPart
@@ -111,6 +136,8 @@ func (c *Codec) DecodeResponse(raw []byte, ctx *ir.ConversionContext) (*ir.Respo
 	webSearchRequests := 0
 	fileSearchCalls := 0
 	hasImageGenCall := false
+	imageGenQuality := ""
+	imageGenSize := ""
 
 	for idx, rawItem := range wire.Output {
 		trimmed := bytes.TrimSpace(rawItem)
@@ -199,6 +226,14 @@ func (c *Codec) DecodeResponse(raw []byte, ctx *ir.ConversionContext) (*ir.Respo
 
 		case "image_generation_call":
 			hasImageGenCall = true
+			if q, s := extractImageGenParams(trimmed); q != "" || s != "" {
+				if q != "" {
+					imageGenQuality = q
+				}
+				if s != "" {
+					imageGenSize = s
+				}
+			}
 			resp.PassthroughItems = append(resp.PassthroughItems, ir.PassthroughItem{
 				OriginFormat: ir.FormatOpenAIResponses,
 				Position:     idx,
@@ -237,10 +272,52 @@ func (c *Codec) DecodeResponse(raw []byte, ctx *ir.ConversionContext) (*ir.Respo
 		usage.WebSearchRequests = webSearchRequests
 		usage.FileSearchCalls = fileSearchCalls
 		usage.HasImageGenCall = hasImageGenCall
+		if imageGenQuality != "" {
+			usage.ImageGenQuality = imageGenQuality
+		}
+		if imageGenSize != "" {
+			usage.ImageGenSize = imageGenSize
+		}
 		resp.Usage = usage
 	}
 
 	return resp, nil
+}
+
+func decodeResponseError(raw json.RawMessage) *ir.ResponseError {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var obj struct {
+		Type    string `json:"type"`
+		Code    any    `json:"code"`
+		Message string `json:"message"`
+		Param   string `json:"param"`
+	}
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
+		return &ir.ResponseError{Message: string(trimmed)}
+	}
+	re := &ir.ResponseError{
+		Type:    obj.Type,
+		Message: obj.Message,
+		Param:   obj.Param,
+	}
+	if obj.Code != nil {
+		re.Code = fmt.Sprintf("%v", obj.Code)
+	}
+	return re
+}
+
+func extractImageGenParams(raw json.RawMessage) (quality, size string) {
+	var obj struct {
+		Quality string `json:"quality"`
+		Size    string `json:"size"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return obj.Quality, obj.Size
+	}
+	return "", ""
 }
 
 func recordToolBridge(ctx *ir.ConversionContext, tc *ir.ToolCall) {
@@ -259,6 +336,8 @@ func deriveFinishReason(status string, incomplete *responsesIncompleteDetailsWir
 	switch status {
 	case "failed":
 		return ir.FinishError, "failed"
+	case "cancelled":
+		return ir.FinishError, "cancelled"
 	case "incomplete":
 		reason := incomplete.EffectiveReason()
 		switch reason {
@@ -319,7 +398,7 @@ func encodeResponsesUsage(u *ir.Usage) *responsesUsageWire {
 	inputTokens := u.InclusiveInputTokens()
 	outputTokens := u.OutputTokens
 	totalTokens := u.TotalTokens
-	if totalTokens == 0 || u.InputExclusive {
+	if totalTokens < inputTokens+outputTokens || u.InputExclusive {
 		totalTokens = inputTokens + outputTokens
 	}
 
@@ -415,6 +494,20 @@ func (c *Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]
 					"annotations": []any{},
 				})
 
+			case ir.PartImage:
+				if part.Image != nil {
+					if md := formatResponsesImageMarkdown(part.Image); md != "" {
+						pendingContent = append(pendingContent, map[string]any{
+							"type":        "output_text",
+							"text":        md,
+							"annotations": []any{},
+						})
+					}
+				}
+
+			case ir.PartAudio, ir.PartFile:
+				ctx.AddWarning("unsupported_response_part", "output", fmt.Sprintf("OpenAI Responses assistant output cannot carry %q part natively", part.Type))
+
 			case ir.PartCitation:
 				if part.Citation == nil {
 					continue
@@ -449,7 +542,7 @@ func (c *Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]
 					continue
 				}
 				flushMessage()
-				output = append(output, encodeResponseReasoningItem(part.Reasoning, suffix, rsIdx, ctx))
+				output = append(output, encodeResponseReasoningItem(part.Reasoning, suffix, rsIdx, itemStatus, ctx))
 				rsIdx++
 
 			case ir.PartToolCall:
@@ -457,19 +550,35 @@ func (c *Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]
 					continue
 				}
 				flushMessage()
-				output = append(output, encodeResponseToolCallItem(part.ToolCall, fcIdx))
+				output = append(output, encodeResponseToolCallItem(part.ToolCall, fcIdx, itemStatus))
 				fcIdx++
 			}
 		}
 		flushMessage()
 	}
 
+	var nativePassthrough []ir.PassthroughItem
 	for _, pt := range resp.PassthroughItems {
 		if len(pt.Payload) == 0 {
 			continue
 		}
 		if shouldPreserveResponsesNative(pt.OriginFormat, ctx) {
-			output = append(output, pt.Payload)
+			nativePassthrough = append(nativePassthrough, pt)
+		}
+	}
+	if len(nativePassthrough) > 0 {
+		sort.SliceStable(nativePassthrough, func(i, j int) bool {
+			return nativePassthrough[i].Position < nativePassthrough[j].Position
+		})
+		for _, pt := range nativePassthrough {
+			pos := pt.Position
+			if pos < 0 || pos >= len(output) {
+				output = append(output, pt.Payload)
+				continue
+			}
+			output = append(output, nil)
+			copy(output[pos+1:], output[pos:])
+			output[pos] = pt.Payload
 		}
 	}
 
@@ -484,6 +593,21 @@ func (c *Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]
 	if incompleteDetails != nil {
 		out["incomplete_details"] = incompleteDetails
 	}
+	if resp.Error != nil {
+		errObj := map[string]any{
+			"code":    resp.Error.Code,
+			"message": resp.Error.Message,
+		}
+		if resp.Error.Type != "" {
+			errObj["type"] = resp.Error.Type
+		}
+		out["error"] = errObj
+	} else if status == "failed" {
+		out["error"] = map[string]any{
+			"code":    "server_error",
+			"message": "upstream generation failed",
+		}
+	}
 	if resp.ServiceTier != "" {
 		out["service_tier"] = resp.ServiceTier
 	}
@@ -494,7 +618,23 @@ func (c *Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]
 	return json.Marshal(out)
 }
 
-func encodeResponseReasoningItem(r *ir.Reasoning, suffix string, idx int, ctx *ir.ConversionContext) map[string]any {
+func formatResponsesImageMarkdown(img *ir.ImageSource) string {
+	if img == nil {
+		return ""
+	}
+	if img.URL != "" {
+		return fmt.Sprintf("![image](%s)", img.URL)
+	}
+	if img.Data != "" {
+		return fmt.Sprintf("![image](%s)", buildDataURL(img.MediaType, img.Data))
+	}
+	return ""
+}
+
+func encodeResponseReasoningItem(r *ir.Reasoning, suffix string, idx int, itemStatus string, ctx *ir.ConversionContext) map[string]any {
+	if itemStatus == "" {
+		itemStatus = "completed"
+	}
 	rsID := r.ItemID
 	if rsID == "" {
 		rsID = fmt.Sprintf("rs_%s_%d", suffix, idx)
@@ -513,8 +653,14 @@ func encodeResponseReasoningItem(r *ir.Reasoning, suffix string, idx int, ctx *i
 	item := map[string]any{
 		"id":      rsID,
 		"type":    "reasoning",
-		"status":  "completed",
+		"status":  itemStatus,
 		"summary": summary,
+	}
+	if r.Summary != "" && r.Text != "" && r.Text != r.Summary {
+		item["content"] = []map[string]any{{
+			"type": "reasoning_text",
+			"text": r.Text,
+		}}
 	}
 	if r.OriginFormat == ir.FormatOpenAIResponses && r.RedactedData != "" && shouldPreserveResponsesNative(r.OriginFormat, ctx) {
 		item["encrypted_content"] = r.RedactedData
@@ -524,8 +670,11 @@ func encodeResponseReasoningItem(r *ir.Reasoning, suffix string, idx int, ctx *i
 	return item
 }
 
-func encodeResponseToolCallItem(tc *ir.ToolCall, idx int) map[string]any {
+func encodeResponseToolCallItem(tc *ir.ToolCall, idx int, itemStatus string) map[string]any {
+	if itemStatus == "" {
+		itemStatus = "completed"
+	}
 	item := encodeRequestToolCallItem(tc, idx)
-	item["status"] = "completed"
+	item["status"] = itemStatus
 	return item
 }

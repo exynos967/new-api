@@ -1,6 +1,8 @@
 package aws
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -20,7 +22,7 @@ import (
 // IsBedrockClaudeModel reports whether the upstream model uses Bedrock's Anthropic Messages API
 // (as opposed to Amazon Nova's schema).
 func (a *Adaptor) IsBedrockClaudeModel(info *relaycommon.RelayInfo) bool {
-	if info == nil {
+	if info == nil || info.ChannelMeta == nil {
 		return false
 	}
 	return !isNovaModel(getAwsModelID(info.UpstreamModelName))
@@ -80,11 +82,20 @@ func (a *Adaptor) PrepareRawClaudePayload(c *gin.Context, info *relaycommon.Rela
 		}
 	}
 
-	payload["anthropic_version"] = "bedrock-2023-05-31"
+	if existingVersion, ok := payload["anthropic_version"].(string); !ok || strings.TrimSpace(existingVersion) == "" {
+		payload["anthropic_version"] = "bedrock-2023-05-31"
+	}
 	delete(payload, "model")
 	delete(payload, "stream")
 
 	return json.Marshal(payload)
+}
+
+func awsRequestParentContext(c *gin.Context) context.Context {
+	if c != nil && c.Request != nil && c.Request.Context() != nil {
+		return c.Request.Context()
+	}
+	return context.Background()
 }
 
 func (a *Adaptor) resolveClientAndModel(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.Client, string, *types.NewAPIError) {
@@ -110,7 +121,7 @@ func (a *Adaptor) InvokeRawClaudeNonStream(c *gin.Context, info *relaycommon.Rel
 		return nil, apiErr
 	}
 
-	ctx, cancel := newAwsInvokeContext()
+	ctx, cancel := newAwsInvokeContextFrom(awsRequestParentContext(c))
 	defer cancel()
 
 	awsResp, err := awsCli.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{
@@ -121,7 +132,13 @@ func (a *Adaptor) InvokeRawClaudeNonStream(c *gin.Context, info *relaycommon.Rel
 	})
 	if err != nil {
 		statusCode := getAwsErrorStatusCode(err)
+		if errors.Is(err, context.Canceled) {
+			return nil, types.NewOpenAIError(errors.Wrap(err, "InvokeModel"), types.ErrorCodeAwsInvokeError, statusCode, types.ErrOptionWithSkipRetry())
+		}
 		return nil, types.NewOpenAIError(errors.Wrap(err, "InvokeModel"), types.ErrorCodeAwsInvokeError, statusCode)
+	}
+	if awsResp == nil {
+		return nil, types.NewOpenAIError(errors.New("InvokeModel returned nil response"), types.ErrorCodeAwsInvokeError, http.StatusBadGateway)
 	}
 	return awsResp.Body, nil
 }
@@ -134,7 +151,7 @@ func (a *Adaptor) InvokeRawClaudeStream(c *gin.Context, info *relaycommon.RelayI
 		return apiErr
 	}
 
-	ctx, cancel := newAwsInvokeContext()
+	ctx, cancel := newAwsInvokeContextFrom(awsRequestParentContext(c))
 	defer cancel()
 
 	awsResp, err := awsCli.InvokeModelWithResponseStream(ctx, &bedrockruntime.InvokeModelWithResponseStreamInput{
@@ -145,26 +162,43 @@ func (a *Adaptor) InvokeRawClaudeStream(c *gin.Context, info *relaycommon.RelayI
 	})
 	if err != nil {
 		statusCode := getAwsErrorStatusCode(err)
+		if errors.Is(err, context.Canceled) {
+			return types.NewOpenAIError(errors.Wrap(err, "InvokeModelWithResponseStream"), types.ErrorCodeAwsInvokeError, statusCode, types.ErrOptionWithSkipRetry())
+		}
 		return types.NewOpenAIError(errors.Wrap(err, "InvokeModelWithResponseStream"), types.ErrorCodeAwsInvokeError, statusCode)
+	}
+	if awsResp == nil || awsResp.GetStream() == nil {
+		return types.NewOpenAIError(errors.New("InvokeModelWithResponseStream returned nil stream"), types.ErrorCodeAwsInvokeError, http.StatusBadGateway)
 	}
 	stream := awsResp.GetStream()
 	defer stream.Close()
 
+	deliveredAny := false
 	for event := range stream.Events() {
 		switch v := event.(type) {
 		case *bedrockruntimeTypes.ResponseStreamMemberChunk:
 			info.SetFirstResponseTime()
+			deliveredAny = true
 			if err := onChunk(v.Value.Bytes); err != nil {
 				return err
 			}
 		case *bedrockruntimeTypes.UnknownUnionMember:
+			if deliveredAny {
+				return types.NewError(fmt.Errorf("unknown bedrock stream event tag: %s", v.Tag), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+			}
 			return types.NewError(fmt.Errorf("unknown bedrock stream event tag: %s", v.Tag), types.ErrorCodeInvalidRequest)
 		default:
+			if deliveredAny {
+				return types.NewError(errors.New("nil or unknown bedrock stream event type"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+			}
 			return types.NewError(errors.New("nil or unknown bedrock stream event type"), types.ErrorCodeInvalidRequest)
 		}
 	}
 	if err := stream.Err(); err != nil {
 		statusCode := getAwsErrorStatusCode(err)
+		if deliveredAny || errors.Is(err, context.Canceled) {
+			return types.NewOpenAIError(errors.Wrap(err, "InvokeModelWithResponseStream"), types.ErrorCodeAwsInvokeError, statusCode, types.ErrOptionWithSkipRetry())
+		}
 		return types.NewOpenAIError(errors.Wrap(err, "InvokeModelWithResponseStream"), types.ErrorCodeAwsInvokeError, statusCode)
 	}
 	return nil
@@ -223,6 +257,16 @@ func inlineSourceBlock(c *gin.Context, block map[string]any) error {
 	base64Data, mimeType, err := service.GetBase64Data(c, fileSource, "formatting image for Bedrock Claude")
 	if err != nil {
 		return fmt.Errorf("get file base64 from url failed: %s", err.Error())
+	}
+	blockType, _ := block["type"].(string)
+	if blockType == "document" && strings.HasPrefix(strings.ToLower(strings.TrimSpace(mimeType)), "text/") {
+		if rawText, decErr := base64.StdEncoding.DecodeString(base64Data); decErr == nil {
+			src["type"] = "text"
+			src["media_type"] = mimeType
+			src["data"] = string(rawText)
+			delete(src, "url")
+			return nil
+		}
 	}
 	src["type"] = "base64"
 	src["media_type"] = mimeType

@@ -2,10 +2,16 @@ package relay
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -22,20 +28,23 @@ import (
 	_ "github.com/QuantumNous/new-api/relay/ir/codec/all"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
 type irTargetSpec struct {
-	Format             ir.Format
-	Shim               *ir.Shim
-	RelayMode          int
-	URLPath            string
-	RelayFormat        types.RelayFormat
-	ModelRewrite       string
-	ClearStreamOptions bool
-	IsBedrockClaude    bool
+	Format              ir.Format
+	Shim                *ir.Shim
+	RelayMode           int
+	URLPath             string
+	RelayFormat         types.RelayFormat
+	ModelRewrite        string
+	ClearStreamOptions  bool
+	IsBedrockClaude     bool
+	ForceUpstreamStream bool
 }
 
 func isIRSupportedRelayMode(sourceFormat ir.Format, mode int) bool {
@@ -91,11 +100,12 @@ func resolveTargetIRSpec(c *gin.Context, info *relaycommon.RelayInfo, adaptor ch
 	switch info.ApiType {
 	case constant.APITypeCodex:
 		return irTargetSpec{
-			Format:      ir.FormatOpenAIResponses,
-			Shim:        ir.CodexResponsesShim,
-			RelayMode:   relayconstant.RelayModeResponses,
-			URLPath:     "/v1/responses",
-			RelayFormat: types.RelayFormatOpenAIResponses,
+			Format:              ir.FormatOpenAIResponses,
+			Shim:                ir.CodexResponsesShim,
+			RelayMode:           relayconstant.RelayModeResponses,
+			URLPath:             "/v1/responses",
+			RelayFormat:         types.RelayFormatOpenAIResponses,
+			ForceUpstreamStream: true,
 		}, true
 
 	case constant.APITypeOpenRouter:
@@ -339,12 +349,38 @@ func tryIRCrossProtocolRelay(
 		return false, nil, nil
 	}
 
+	// Snapshot per-attempt RelayInfo fields so any pre-commit error cleanly restores state before retries.
+	origFinalFmt := info.FinalRequestRelayFormat
+	origChain := append([]types.RelayFormat(nil), info.RequestConversionChain...)
+	origRespUsage := info.ResponsesUsageInfo
+	origIsStream := info.IsStream
+	origDisablePing := info.DisablePing
+	origUpstreamModel := info.UpstreamModelName
+	committed := false
+	defer func() {
+		if !committed && apiErr != nil {
+			info.FinalRequestRelayFormat = origFinalFmt
+			info.RequestConversionChain = origChain
+			info.ResponsesUsageInfo = origRespUsage
+			info.IsStream = origIsStream
+			info.DisablePing = origDisablePing
+			info.UpstreamModelName = origUpstreamModel
+		}
+	}()
+
+	// Inject channel SystemPrompt on /v1/responses cross-protocol requests (matching codex/openai adaptors).
+	if sourceFormat == ir.FormatOpenAIResponses && info.ChannelSetting.SystemPrompt != "" {
+		if respReq, ok := sourceReq.(*dto.OpenAIResponsesRequest); ok && respReq != nil {
+			mergeChannelSystemPromptIntoResponses(respReq, info)
+		}
+	}
+
 	srcBytes, err := common.Marshal(sourceReq)
 	if err != nil {
 		return true, nil, types.NewError(fmt.Errorf("ir: marshal source request failed: %w", err), types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
 
-	// Ensure Gemini source JSON has model/stream populated from RelayInfo before IR decoding.
+	// Ensure Gemini source JSON has model populated from RelayInfo before IR decoding.
 	if sourceFormat == ir.FormatGoogleGenAI {
 		srcBytes, err = ir.ApplyJSONTransforms(srcBytes, []ir.JSONTransform{
 			ir.SetDefaultField("model", info.UpstreamModelName),
@@ -354,22 +390,26 @@ func tryIRCrossProtocolRelay(
 		}
 	}
 
-	scope := ""
-	if info.ChannelId > 0 {
-		scope = fmt.Sprintf("channel:%d", info.ChannelId)
+	scope := relaycommon.IRBridgeScope(info)
+	var bridge *ir.TurnBridge
+	if scope != "" {
+		bridge = ir.DefaultTurnBridge()
 	}
 
+	upstreamStream := info.IsStream || spec.ForceUpstreamStream
 	opts := map[string]any{
 		"attach_thought_signature": model_setting.GetGeminiSettings().FunctionCallThoughtSignatureEnabled,
 		"include_usage":            info.ShouldIncludeUsage,
 		"disable_stream_options":   !info.SupportStreamOptions || spec.ClearStreamOptions,
+		"stream":                   upstreamStream,
+		"preserve_cache_control":   info.ChannelType == constant.ChannelTypeOpenRouter,
 	}
 	if dm := model_setting.GetClaudeSettings().GetDefaultMaxTokens(info.UpstreamModelName); dm > 0 {
 		opts["default_max_tokens"] = dm
 	}
 
 	pipeline, err := ir.NewPipeline(ir.PipelineConfig{
-		Bridge:       ir.DefaultTurnBridge(),
+		Bridge:       bridge,
 		BridgeScope:  scope,
 		SourceFormat: sourceFormat,
 		TargetFormat: spec.Format,
@@ -388,22 +428,21 @@ func tryIRCrossProtocolRelay(
 		logger.LogDebug(c, fmt.Sprintf("ir request warnings (%s->%s): %+v", sourceFormat, spec.Format, convCtx.Warnings))
 	}
 
-	// Align model and stream fields when translating from URL-driven dialects (e.g. Google GenAI)
-	// or applying Vertex OpenSource model rewrites.
-	targetJSON, err = finalizeIRTargetRequestJSON(targetJSON, info, spec)
+	// Align model and stream fields when translating from URL-driven dialects (e.g. Google GenAI),
+	// stream-only upstreams (Codex), or applying Vertex OpenSource model rewrites.
+	targetJSON, err = finalizeIRTargetRequestJSON(targetJSON, info, spec, upstreamStream)
+	if err != nil {
+		return true, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+
+	// Apply Claude -thinking/effort and Gemini ThinkingAdaptor model-suffix adaptations.
+	targetJSON, err = applyIRModelSuffixAdaptation(targetJSON, info, spec)
 	if err != nil {
 		return true, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
 
 	info.AppendRequestConversion(spec.RelayFormat)
 	info.FinalRequestRelayFormat = spec.RelayFormat
-
-	if spec.Format == ir.FormatOpenAIResponses {
-		var respReq dto.OpenAIResponsesRequest
-		if uErr := common.Unmarshal(targetJSON, &respReq); uErr == nil {
-			info.InitResponsesUsageInfo(&respReq)
-		}
-	}
 
 	if spec.Format != ir.FormatGoogleGenAI {
 		targetJSON, err = relaycommon.RemoveDisabledFields(targetJSON, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
@@ -416,6 +455,13 @@ func tryIRCrossProtocolRelay(
 		targetJSON, err = relaycommon.ApplyParamOverrideWithRelayInfo(targetJSON, info)
 		if err != nil {
 			return true, nil, newAPIErrorFromParamOverride(err)
+		}
+		// Vertex rawPredict rejects "model" in body; ensure ParamOverride cannot break Vertex Claude.
+		if spec.Shim == ir.VertexClaudeShim {
+			targetJSON, err = ir.ApplyJSONTransforms(targetJSON, []ir.JSONTransform{ir.StripFields("model")}, nil)
+			if err != nil {
+				return true, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+			}
 		}
 	}
 
@@ -439,7 +485,7 @@ func tryIRCrossProtocolRelay(
 				info.AppendRequestConversion(spec.RelayFormat)
 				info.FinalRequestRelayFormat = spec.RelayFormat
 				upgradePipe, pErr := ir.NewPipeline(ir.PipelineConfig{
-					Bridge:       ir.DefaultTurnBridge(),
+					Bridge:       bridge,
 					BridgeScope:  scope,
 					SourceFormat: ir.FormatOpenAIChat,
 					TargetFormat: ir.FormatOpenAIResponses,
@@ -452,12 +498,16 @@ func tryIRCrossProtocolRelay(
 				if err != nil {
 					return true, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 				}
+				targetJSON, err = relaycommon.RemoveDisabledFields(targetJSON, info.ChannelOtherSettings, info.ChannelSetting.PassThroughBodyEnabled)
+				if err != nil {
+					return true, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+				}
 				targetJSON, err = normalizeOfficialResponsesRequest(info, targetJSON)
 				if err != nil {
 					return true, nil, invalidOpenAIModelRequest(err)
 				}
 				pipeline, err = ir.NewPipeline(ir.PipelineConfig{
-					Bridge:       ir.DefaultTurnBridge(),
+					Bridge:       bridge,
 					BridgeScope:  scope,
 					SourceFormat: sourceFormat,
 					TargetFormat: ir.FormatOpenAIResponses,
@@ -467,6 +517,15 @@ func tryIRCrossProtocolRelay(
 					return true, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 				}
 			}
+		}
+	}
+
+	// Initialize ResponsesUsageInfo AFTER ParamOverride and dynamic Chat->Responses upgrades so all
+	// built-in tools (including search_context_size) are accounted for accurately.
+	if spec.Format == ir.FormatOpenAIResponses {
+		var respReq dto.OpenAIResponsesRequest
+		if uErr := common.Unmarshal(targetJSON, &respReq); uErr == nil {
+			info.InitResponsesUsageInfo(&respReq)
 		}
 	}
 
@@ -480,14 +539,49 @@ func tryIRCrossProtocolRelay(
 
 	if spec.IsBedrockClaude {
 		u, bErr := executeIRBedrockClaude(c, info, adaptor.(*awsChannel.Adaptor), pipeline, targetJSON, clientModel)
+		committed = c.GetBool("ir_response_committed") || bErr == nil
 		return true, u, bErr
 	}
 
-	u, hErr := executeIRHTTPRelay(c, info, adaptor, pipeline, spec, targetJSON, clientModel)
+	u, hErr := executeIRHTTPRelay(c, info, adaptor, pipeline, spec, targetJSON, clientModel, upstreamStream)
+	committed = c.GetBool("ir_response_committed") || hErr == nil
 	return true, u, hErr
 }
 
-func finalizeIRTargetRequestJSON(raw []byte, info *relaycommon.RelayInfo, spec irTargetSpec) ([]byte, error) {
+func mergeChannelSystemPromptIntoResponses(req *dto.OpenAIResponsesRequest, info *relaycommon.RelayInfo) {
+	if req == nil || info == nil || info.ChannelSetting.SystemPrompt == "" {
+		return
+	}
+	systemPrompt := info.ChannelSetting.SystemPrompt
+	if len(req.Instructions) == 0 {
+		if b, err := common.Marshal(systemPrompt); err == nil {
+			req.Instructions = b
+		}
+		return
+	}
+	if !info.ChannelSetting.SystemPromptOverride {
+		return
+	}
+	var existing string
+	if err := common.Unmarshal(req.Instructions, &existing); err == nil {
+		existing = strings.TrimSpace(existing)
+		if existing == "" {
+			if b, err := common.Marshal(systemPrompt); err == nil {
+				req.Instructions = b
+			}
+		} else {
+			if b, err := common.Marshal(systemPrompt + "\n" + existing); err == nil {
+				req.Instructions = b
+			}
+		}
+	} else {
+		if b, err := common.Marshal(systemPrompt); err == nil {
+			req.Instructions = b
+		}
+	}
+}
+
+func finalizeIRTargetRequestJSON(raw []byte, info *relaycommon.RelayInfo, spec irTargetSpec, upstreamStream bool) ([]byte, error) {
 	if spec.Format == ir.FormatGoogleGenAI {
 		return raw, nil
 	}
@@ -498,16 +592,248 @@ func finalizeIRTargetRequestJSON(raw []byte, info *relaycommon.RelayInfo, spec i
 		transforms = append(transforms, ir.SetDefaultField("model", info.UpstreamModelName))
 	}
 	if spec.Shim != ir.BedrockClaudeShim {
-		if info.IsStream {
+		if upstreamStream {
 			transforms = append(transforms, ir.SetField("stream", true))
 		} else {
 			transforms = append(transforms, ir.SetDefaultField("stream", false))
 		}
 	}
+	if spec.Format == ir.FormatOpenAIChat && upstreamStream && info.SupportStreamOptions && !spec.ClearStreamOptions {
+		transforms = append(transforms, func(payload map[string]any, _ *ir.ConversionContext) error {
+			if _, exists := payload["stream_options"]; !exists {
+				payload["stream_options"] = map[string]any{"include_usage": true}
+			}
+			return nil
+		})
+	}
 	if len(transforms) == 0 {
 		return raw, nil
 	}
 	return ir.ApplyJSONTransforms(raw, transforms, nil)
+}
+
+func applyIRModelSuffixAdaptation(raw []byte, info *relaycommon.RelayInfo, spec irTargetSpec) ([]byte, error) {
+	if info == nil || info.ChannelMeta == nil {
+		return raw, nil
+	}
+	modelName := info.UpstreamModelName
+	if modelName == "" {
+		return raw, nil
+	}
+
+	switch spec.Format {
+	case ir.FormatAnthropic:
+		// 1. Claude Opus 4.6 / 4.7 effort suffix (e.g. claude-opus-4-6-high)
+		if baseModel, effortLevel, ok := reasoning.TrimEffortSuffix(modelName); ok && effortLevel != "" &&
+			(strings.HasPrefix(modelName, "claude-opus-4-6") || strings.HasPrefix(modelName, "claude-opus-4-7")) {
+			info.UpstreamModelName = baseModel
+			return ir.ApplyJSONTransforms(raw, []ir.JSONTransform{
+				func(payload map[string]any, _ *ir.ConversionContext) error {
+					if spec.Shim != ir.VertexClaudeShim && spec.Shim != ir.BedrockClaudeShim {
+						payload["model"] = baseModel
+					}
+					th := map[string]any{"type": "adaptive"}
+					if strings.HasPrefix(baseModel, "claude-opus-4-7") {
+						th["display"] = "summarized"
+						delete(payload, "temperature")
+						delete(payload, "top_p")
+						delete(payload, "top_k")
+					} else {
+						delete(payload, "top_p")
+						payload["temperature"] = 1.0
+					}
+					payload["thinking"] = th
+					payload["output_config"] = map[string]any{"effort": effortLevel}
+					return nil
+				},
+			}, nil)
+		}
+		// 2. Claude -thinking suffix when ThinkingAdapterEnabled
+		if model_setting.GetClaudeSettings().ThinkingAdapterEnabled && strings.HasSuffix(modelName, "-thinking") {
+			trimmedModel := strings.TrimSuffix(modelName, "-thinking")
+			preserveSuffix := model_setting.ShouldPreserveThinkingSuffix(modelName)
+			if !preserveSuffix {
+				info.UpstreamModelName = trimmedModel
+			}
+			return ir.ApplyJSONTransforms(raw, []ir.JSONTransform{
+				func(payload map[string]any, _ *ir.ConversionContext) error {
+					if !preserveSuffix && spec.Shim != ir.VertexClaudeShim && spec.Shim != ir.BedrockClaudeShim {
+						payload["model"] = trimmedModel
+					}
+					if strings.HasPrefix(trimmedModel, "claude-opus-4-7") {
+						payload["thinking"] = map[string]any{"type": "adaptive", "display": "summarized"}
+						payload["output_config"] = map[string]any{"effort": "high"}
+						delete(payload, "temperature")
+						delete(payload, "top_p")
+						delete(payload, "top_k")
+						return nil
+					}
+					if _, exists := payload["thinking"]; !exists {
+						maxTok := 8192
+						if mt, ok := payload["max_tokens"]; ok {
+							switch v := mt.(type) {
+							case json.Number:
+								if n, err := v.Int64(); err == nil && n > 0 {
+									maxTok = int(n)
+								}
+							case float64:
+								if v > 0 {
+									maxTok = int(v)
+								}
+							}
+						}
+						if maxTok < 1280 {
+							maxTok = 1280
+							payload["max_tokens"] = maxTok
+						}
+						budget := int(float64(maxTok) * model_setting.GetClaudeSettings().ThinkingAdapterBudgetTokensPercentage)
+						if budget < 1024 {
+							budget = 1024
+						}
+						if budget >= maxTok {
+							maxTok = budget + 4096
+							payload["max_tokens"] = maxTok
+						}
+						payload["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+						delete(payload, "top_p")
+						delete(payload, "top_k")
+						payload["temperature"] = 1.0
+					}
+					return nil
+				},
+			}, nil)
+		}
+
+	case ir.FormatGoogleGenAI:
+		if !model_setting.GetGeminiSettings().ThinkingAdapterEnabled {
+			return raw, nil
+		}
+		isNew25Pro := strings.HasPrefix(modelName, "gemini-2.5-pro") &&
+			!strings.HasPrefix(modelName, "gemini-2.5-pro-preview-05-06") &&
+			!strings.HasPrefix(modelName, "gemini-2.5-pro-preview-03-25")
+
+		var tcPatch map[string]any
+		if strings.Contains(modelName, "-thinking-") {
+			parts := strings.SplitN(modelName, "-thinking-", 2)
+			if len(parts) == 2 && parts[1] != "" {
+				if budgetTokens, err := strconv.Atoi(parts[1]); err == nil && budgetTokens >= 0 {
+					tcPatch = map[string]any{
+						"thinkingBudget":  budgetTokens,
+						"includeThoughts": true,
+					}
+				}
+			}
+		} else if strings.HasSuffix(modelName, "-thinking") {
+			tcPatch = map[string]any{
+				"includeThoughts": true,
+			}
+		} else if strings.HasSuffix(modelName, "-nothinking") {
+			if !isNew25Pro {
+				tcPatch = map[string]any{
+					"thinkingBudget":  0,
+					"includeThoughts": false,
+				}
+			}
+		} else if _, level, ok := reasoning.TrimEffortSuffix(modelName); ok && level != "" {
+			tcPatch = map[string]any{
+				"includeThoughts": true,
+				"thinkingLevel":   strings.ToUpper(level),
+			}
+			info.ReasoningEffort = level
+		}
+		if len(tcPatch) > 0 {
+			return ir.ApplyJSONTransforms(raw, []ir.JSONTransform{
+				func(payload map[string]any, _ *ir.ConversionContext) error {
+					genCfg, _ := payload["generationConfig"].(map[string]any)
+					if genCfg == nil {
+						genCfg = make(map[string]any)
+						payload["generationConfig"] = genCfg
+					}
+					if _, exists := genCfg["thinkingConfig"]; !exists {
+						genCfg["thinkingConfig"] = tcPatch
+					}
+					return nil
+				},
+			}, nil)
+		}
+	}
+
+	return raw, nil
+}
+
+type irStreamWriter struct {
+	c         *gin.Context
+	info      *relaycommon.RelayInfo
+	mu        sync.Mutex
+	committed bool
+}
+
+func newIRStreamWriter(c *gin.Context, info *relaycommon.RelayInfo) *irStreamWriter {
+	return &irStreamWriter{c: c, info: info}
+}
+
+func (w *irStreamWriter) isCommitted() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.committed
+}
+
+func (w *irStreamWriter) writeFrame(frame ir.SSEFrame) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.committed {
+		helper.SetEventStreamHeaders(w.c)
+		w.c.Set("ir_response_committed", true)
+		w.committed = true
+	}
+	w.info.SetFirstResponseTime()
+	raw := ir.FormatSSEFrame(frame)
+	relaycommon.AppendConversationClientResponse(w.c, raw)
+	if _, err := w.c.Writer.Write(raw); err != nil {
+		return err
+	}
+	if err := helper.FlushWriter(w.c); err != nil {
+		return err
+	}
+	w.info.SendResponseCount++
+	return nil
+}
+
+func (w *irStreamWriter) writePing() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.committed {
+		return nil
+	}
+	if _, err := w.c.Writer.Write([]byte(": ping\n\n")); err != nil {
+		return err
+	}
+	return helper.FlushWriter(w.c)
+}
+
+func buildIRStreamAPIError(ev *ir.StreamEvent, skipRetry bool) *types.NewAPIError {
+	msg := "upstream stream error"
+	statusCode := http.StatusBadGateway
+	if ev != nil {
+		if ev.ErrorMessage != "" {
+			msg = ev.ErrorMessage
+		}
+		if ev.ErrorCode != "" {
+			if code, err := strconv.Atoi(strings.TrimSpace(ev.ErrorCode)); err == nil && code >= 400 && code <= 599 {
+				statusCode = code
+			}
+		}
+		if strings.Contains(strings.ToLower(ev.ErrorType), "rate_limit") {
+			statusCode = http.StatusTooManyRequests
+		} else if strings.Contains(strings.ToLower(ev.ErrorType), "overloaded") {
+			statusCode = http.StatusServiceUnavailable
+		}
+	}
+	var opts []types.NewAPIErrorOptions
+	if skipRetry {
+		opts = append(opts, types.ErrOptionWithSkipRetry())
+	}
+	return types.NewErrorWithStatusCode(errors.New(msg), types.ErrorCodeBadResponseBody, statusCode, opts...)
 }
 
 func executeIRBedrockClaude(
@@ -529,35 +855,111 @@ func executeIRBedrockClaude(
 	}
 
 	if info.IsStream {
-		helper.SetEventStreamHeaders(c)
+		if info.StreamStatus == nil {
+			info.StreamStatus = relaycommon.NewStreamStatus()
+		}
+		sw := newIRStreamWriter(c, info)
 		st := pipeline.NewStreamTranslator(clientModel)
+
+		stopPing := make(chan struct{})
+		var pingWg sync.WaitGroup
+		generalSettings := operation_setting.GetGeneralSetting()
+		if generalSettings.PingIntervalEnabled && !info.DisablePing {
+			interval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
+			if interval <= 0 {
+				interval = helper.DefaultPingInterval
+			}
+			pingWg.Add(1)
+			go func() {
+				defer pingWg.Done()
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-stopPing:
+						return
+					case <-c.Request.Context().Done():
+						return
+					case <-ticker.C:
+						_ = sw.writePing()
+					}
+				}
+			}()
+		}
+
+		var clientWriteFailed atomic.Bool
 		emitErr := awsAdaptor.InvokeRawClaudeStream(c, info, preparedBody, func(chunk []byte) *types.NewAPIError {
+			if info.ConversationCapture != nil && len(chunk) > 0 {
+				info.ConversationCapture.AppendUpstreamResponseBody(chunk)
+				info.ConversationCapture.AppendUpstreamResponseBody([]byte("\n"))
+			}
 			info.ReceivedResponseCount++
 			frames, procErr := st.ProcessChunk("", chunk)
 			if procErr != nil {
 				return types.NewError(procErr, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
 			}
+			// If first chunk is an upstream EventError before headers are sent, abort with retryable API error.
+			if st.StreamError() != nil && !sw.isCommitted() {
+				return buildIRStreamAPIError(st.StreamError(), false)
+			}
 			for _, f := range frames {
-				if wErr := writeIRSSEFrame(c, info, f); wErr != nil {
+				if wErr := sw.writeFrame(f); wErr != nil {
+					clientWriteFailed.Store(true)
 					return types.NewError(wErr, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
 				}
 			}
 			return nil
 		})
+		close(stopPing)
+		pingWg.Wait()
+
 		if emitErr != nil {
 			if emitErr.StatusCode == http.StatusTooManyRequests {
 				service.RecordChannelRPM429(c.Request.Context(), info.ChannelId, info.ChannelSetting.RPMProtection)
 			}
+			st.PersistBridgeNow()
+			if sw.isCommitted() {
+				if clientWriteFailed.Load() || c.Request.Context().Err() != nil {
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, emitErr)
+				} else {
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, emitErr)
+					info.StreamStatus.RecordError(emitErr.Error())
+				}
+				return finalizeIRUsage(c, info, st.Usage(), st.EstimatedOutputText(), st.ReceivedChunks(), ir.FormatAnthropic), nil
+			}
+			if c.Request.Context().Err() != nil {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, emitErr)
+				return nil, types.NewError(emitErr, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+			}
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, emitErr)
+			info.StreamStatus.RecordError(emitErr.Error())
 			return nil, emitErr
 		}
+
 		tail, flushErr := st.Flush()
-		if flushErr != nil {
+		if flushErr != nil && !sw.isCommitted() {
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, flushErr)
 			return nil, types.NewError(flushErr, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
 		}
+		if st.StreamError() != nil && !sw.isCommitted() {
+			errObj := buildIRStreamAPIError(st.StreamError(), false)
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, errObj)
+			return nil, errObj
+		}
 		for _, f := range tail {
-			if wErr := writeIRSSEFrame(c, info, f); wErr != nil {
-				return nil, types.NewError(wErr, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+			if wErr := sw.writeFrame(f); wErr != nil {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, wErr)
+				return finalizeIRUsage(c, info, st.Usage(), st.EstimatedOutputText(), st.ReceivedChunks(), ir.FormatAnthropic), nil
 			}
+		}
+		if st.StreamError() != nil {
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, errors.New(st.StreamError().ErrorMessage))
+			info.StreamStatus.RecordError(st.StreamError().ErrorMessage)
+			if !st.HasNonErrorOutput() && st.Usage() == nil {
+				return &dto.Usage{UsageSemantic: "anthropic"}, nil
+			}
+		} else {
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 		}
 		return finalizeIRUsage(c, info, st.Usage(), st.EstimatedOutputText(), st.ReceivedChunks(), ir.FormatAnthropic), nil
 	}
@@ -568,6 +970,9 @@ func executeIRBedrockClaude(
 			service.RecordChannelRPM429(c.Request.Context(), info.ChannelId, info.ChannelSetting.RPMProtection)
 		}
 		return nil, apiErr
+	}
+	if info.ConversationCapture != nil && len(respBody) > 0 {
+		info.ConversationCapture.AppendUpstreamResponseBody(respBody)
 	}
 	return handleIRNonStreamResponse(c, info, pipeline, respBody, clientModel, ir.FormatAnthropic)
 }
@@ -580,16 +985,26 @@ func executeIRHTTPRelay(
 	spec irTargetSpec,
 	targetJSON []byte,
 	clientModel string,
+	upstreamStream bool,
 ) (*dto.Usage, *types.NewAPIError) {
 	origRelayMode := info.RelayMode
 	origURLPath := info.RequestURLPath
+	origDisablePing := info.DisablePing
+	origIsStream := info.IsStream
 	info.RelayMode = spec.RelayMode
 	if spec.URLPath != "" {
 		info.RequestURLPath = spec.URLPath
 	}
+	// When a non-streaming client targets a stream-only upstream (e.g. Codex), temporarily signal
+	// upstream streaming to adaptor.SetupRequestHeader (Accept: text/event-stream) without flipping client mode.
+	if upstreamStream && !origIsStream {
+		info.IsStream = true
+	}
 	defer func() {
 		info.RelayMode = origRelayMode
 		info.RequestURLPath = origURLPath
+		info.DisablePing = origDisablePing
+		info.IsStream = origIsStream
 	}()
 
 	resp, err := doChannelRPMGuardedRequest(c, info, func() (any, error) {
@@ -606,30 +1021,37 @@ func executeIRHTTPRelay(
 	if !ok || httpResp == nil {
 		return nil, types.NewError(fmt.Errorf("ir: unexpected response type %T", resp), types.ErrorCodeDoRequestFailed)
 	}
-
-	info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
+	if httpResp.Body != nil {
+		defer httpResp.Body.Close()
+	}
 
 	if httpResp.StatusCode != http.StatusOK {
 		newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
-		service.ResetStatusCode(newApiErr, c.GetString("status_code_mapping"))
 		return nil, newApiErr
+	}
+	if httpResp.Body == nil {
+		return nil, types.NewError(errors.New("ir: upstream returned nil response body"), types.ErrorCodeReadResponseBodyFailed)
 	}
 
 	relaycommon.WrapConversationUpstreamResponse(info, httpResp)
-	defer httpResp.Body.Close()
+	respIsSSE := strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
 
-	if info.IsStream {
-		helper.SetEventStreamHeaders(c)
-		st := pipeline.NewStreamTranslator(clientModel)
-		streamErr := st.TranslateReader(httpResp.Body, func(frame ir.SSEFrame) error {
-			info.SetFirstResponseTime()
-			return writeIRSSEFrame(c, info, frame)
-		})
-		info.ReceivedResponseCount += st.ReceivedChunks()
-		if streamErr != nil {
-			return nil, types.NewError(streamErr, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+	// Non-streaming client against a stream-only upstream (e.g. Codex): aggregate upstream SSE into JSON response.
+	if !origIsStream && spec.ForceUpstreamStream && respIsSSE {
+		outBytes, irResp, streamErrEv, receivedChunks, aggErr := pipeline.TranslateStreamToResponse(httpResp.Body, clientModel)
+		info.ReceivedResponseCount += receivedChunks
+		if aggErr != nil {
+			return nil, types.NewError(aggErr, types.ErrorCodeBadResponseBody)
 		}
-		return finalizeIRUsage(c, info, st.Usage(), st.EstimatedOutputText(), st.ReceivedChunks(), spec.Format), nil
+		if streamErrEv != nil && irResp == nil {
+			return nil, buildIRStreamAPIError(streamErrEv, false)
+		}
+		return writeIRNonStreamResponse(c, info, outBytes, irResp, spec.Format), nil
+	}
+
+	clientIsStream := origIsStream || respIsSSE
+	if clientIsStream {
+		return runIRHTTPStream(c, info, httpResp, pipeline, spec, clientModel)
 	}
 
 	respBody, err := io.ReadAll(httpResp.Body)
@@ -637,6 +1059,206 @@ func executeIRHTTPRelay(
 		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}
 	return handleIRNonStreamResponse(c, info, pipeline, respBody, clientModel, spec.Format)
+}
+
+func runIRHTTPStream(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	httpResp *http.Response,
+	pipeline *ir.Pipeline,
+	spec irTargetSpec,
+	clientModel string,
+) (*dto.Usage, *types.NewAPIError) {
+	if info.StreamStatus == nil {
+		info.StreamStatus = relaycommon.NewStreamStatus()
+	}
+	sw := newIRStreamWriter(c, info)
+	st := pipeline.NewStreamTranslator(clientModel)
+
+	doneCh := make(chan struct{})
+	resetIdleCh := make(chan struct{}, 1)
+	var clientGone atomic.Bool
+	var timedOut atomic.Bool
+	var wg sync.WaitGroup
+
+	// Monitor client cancellation and idle StreamingTimeout to unblock reader.Next() promptly.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var idleTimer *time.Timer
+		var idleC <-chan time.Time
+		idleDur := time.Duration(constant.StreamingTimeout) * time.Second
+		if idleDur > 0 {
+			idleTimer = time.NewTimer(idleDur)
+			idleC = idleTimer.C
+			defer idleTimer.Stop()
+		}
+		for {
+			select {
+			case <-doneCh:
+				return
+			case <-c.Request.Context().Done():
+				clientGone.Store(true)
+				_ = httpResp.Body.Close()
+				return
+			case <-idleC:
+				timedOut.Store(true)
+				_ = httpResp.Body.Close()
+				return
+			case <-resetIdleCh:
+				if idleTimer != nil {
+					if !idleTimer.Stop() {
+						select {
+						case <-idleTimer.C:
+						default:
+						}
+					}
+					idleTimer.Reset(idleDur)
+				}
+			}
+		}
+	}()
+
+	// Optional SSE keepalive ping goroutine matching helper.StreamScannerHandler semantics.
+	generalSettings := operation_setting.GetGeneralSetting()
+	if generalSettings.PingIntervalEnabled && !info.DisablePing {
+		pingInterval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
+		if pingInterval <= 0 {
+			pingInterval = helper.DefaultPingInterval
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(pingInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-doneCh:
+					return
+				case <-c.Request.Context().Done():
+					return
+				case <-ticker.C:
+					_ = sw.writePing()
+				}
+			}
+		}()
+	}
+
+	cleanupWatchers := func() {
+		select {
+		case <-doneCh:
+		default:
+			close(doneCh)
+		}
+		wg.Wait()
+	}
+	defer cleanupWatchers()
+
+	reader := ir.NewSSEReader(httpResp.Body)
+	for {
+		evName, data, readErr := reader.Next()
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			info.ReceivedResponseCount += st.ReceivedChunks()
+			st.PersistBridgeNow()
+			if sw.isCommitted() {
+				switch {
+				case clientGone.Load() || c.Request.Context().Err() != nil:
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, readErr)
+				case timedOut.Load():
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, readErr)
+				default:
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, readErr)
+					info.StreamStatus.RecordError(readErr.Error())
+				}
+				return finalizeIRUsage(c, info, st.Usage(), st.EstimatedOutputText(), st.ReceivedChunks(), spec.Format), nil
+			}
+			if clientGone.Load() || c.Request.Context().Err() != nil {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, readErr)
+				return nil, types.NewError(readErr, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry())
+			}
+			if timedOut.Load() {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, readErr)
+				return nil, types.NewErrorWithStatusCode(errors.New("upstream stream idle timeout"), types.ErrorCodeBadResponseBody, http.StatusGatewayTimeout)
+			}
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, readErr)
+			info.StreamStatus.RecordError(readErr.Error())
+			return nil, types.NewError(readErr, types.ErrorCodeBadResponseBody)
+		}
+
+		select {
+		case resetIdleCh <- struct{}{}:
+		default:
+		}
+
+		frames, procErr := st.ProcessChunk(evName, data)
+		if procErr != nil {
+			info.ReceivedResponseCount += st.ReceivedChunks()
+			st.PersistBridgeNow()
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, procErr)
+			info.StreamStatus.RecordError(procErr.Error())
+			if sw.isCommitted() {
+				return finalizeIRUsage(c, info, st.Usage(), st.EstimatedOutputText(), st.ReceivedChunks(), spec.Format), nil
+			}
+			return nil, types.NewError(procErr, types.ErrorCodeBadResponseBody)
+		}
+
+		// If the very first semantic event is an upstream EventError before any frames were sent,
+		// surface it as a real retryable *types.NewAPIError with zero billing instead of HTTP 200.
+		if st.StreamError() != nil && !sw.isCommitted() {
+			info.ReceivedResponseCount += st.ReceivedChunks()
+			errObj := buildIRStreamAPIError(st.StreamError(), false)
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, errObj)
+			info.StreamStatus.RecordError(errObj.Error())
+			return nil, errObj
+		}
+
+		for _, f := range frames {
+			if wErr := sw.writeFrame(f); wErr != nil {
+				info.ReceivedResponseCount += st.ReceivedChunks()
+				st.PersistBridgeNow()
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, wErr)
+				// Client disconnected mid-stream: bill all tokens consumed so far rather than refunding 100%.
+				return finalizeIRUsage(c, info, st.Usage(), st.EstimatedOutputText(), st.ReceivedChunks(), spec.Format), nil
+			}
+		}
+	}
+
+	tail, flushErr := st.Flush()
+	info.ReceivedResponseCount += st.ReceivedChunks()
+	if flushErr != nil && !sw.isCommitted() {
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, flushErr)
+		return nil, types.NewError(flushErr, types.ErrorCodeBadResponseBody)
+	}
+	if st.StreamError() != nil && !sw.isCommitted() {
+		errObj := buildIRStreamAPIError(st.StreamError(), false)
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, errObj)
+		return nil, errObj
+	}
+	for _, f := range tail {
+		if wErr := sw.writeFrame(f); wErr != nil {
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, wErr)
+			return finalizeIRUsage(c, info, st.Usage(), st.EstimatedOutputText(), st.ReceivedChunks(), spec.Format), nil
+		}
+	}
+
+	if st.StreamError() != nil {
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, errors.New(st.StreamError().ErrorMessage))
+		info.StreamStatus.RecordError(st.StreamError().ErrorMessage)
+		if !st.HasNonErrorOutput() && st.Usage() == nil {
+			sem := "openai"
+			if spec.Format == ir.FormatAnthropic {
+				sem = "anthropic"
+			}
+			return &dto.Usage{UsageSemantic: sem}, nil
+		}
+	} else {
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+	}
+
+	return finalizeIRUsage(c, info, st.Usage(), st.EstimatedOutputText(), st.ReceivedChunks(), spec.Format), nil
 }
 
 func handleIRNonStreamResponse(
@@ -651,9 +1273,20 @@ func handleIRNonStreamResponse(
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
+	info.ReceivedResponseCount++
+	return writeIRNonStreamResponse(c, info, outBytes, irResp, targetFormat), nil
+}
 
+func writeIRNonStreamResponse(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	outBytes []byte,
+	irResp *ir.Response,
+	targetFormat ir.Format,
+) *dto.Usage {
+	info.SetFirstResponseTime()
+	c.Set("ir_response_committed", true)
 	c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-	c.Writer.WriteHeader(http.StatusOK)
 	service.IOCopyBytesGracefully(c, nil, outBytes)
 	info.SendResponseCount++
 
@@ -678,18 +1311,7 @@ func handleIRNonStreamResponse(
 	if irResp != nil {
 		irUsage = irResp.Usage
 	}
-	return finalizeIRUsage(c, info, irUsage, estimatedText, 1, targetFormat), nil
-}
-
-func writeIRSSEFrame(c *gin.Context, info *relaycommon.RelayInfo, frame ir.SSEFrame) error {
-	raw := ir.FormatSSEFrame(frame)
-	relaycommon.AppendConversationClientResponse(c, raw)
-	if _, err := c.Writer.Write(raw); err != nil {
-		return err
-	}
-	c.Writer.Flush()
-	info.SendResponseCount++
-	return nil
+	return finalizeIRUsage(c, info, irUsage, estimatedText, 1, targetFormat)
 }
 
 func finalizeIRUsage(
@@ -706,28 +1328,44 @@ func finalizeIRUsage(
 		if targetFormat == ir.FormatAnthropic && irUsage.WebSearchRequests > 0 {
 			c.Set("claude_web_search_requests", irUsage.WebSearchRequests)
 		}
-		if targetFormat == ir.FormatOpenAIResponses && info.ResponsesUsageInfo != nil {
-			if irUsage.WebSearchRequests > 0 {
-				if info.ResponsesUsageInfo.BuiltInTools == nil {
-					info.ResponsesUsageInfo.BuiltInTools = make(map[string]*relaycommon.BuildInToolInfo)
+		if targetFormat == ir.FormatOpenAIResponses && (irUsage.WebSearchRequests > 0 || irUsage.FileSearchCalls > 0) {
+			if info.ResponsesUsageInfo == nil {
+				info.ResponsesUsageInfo = &relaycommon.ResponsesUsageInfo{
+					BuiltInTools: make(map[string]*relaycommon.BuildInToolInfo),
 				}
-				info.ResponsesUsageInfo.BuiltInTools["web_search_preview"] = &relaycommon.BuildInToolInfo{
-					ToolName:  "web_search_preview",
-					CallCount: irUsage.WebSearchRequests,
+			}
+			if info.ResponsesUsageInfo.BuiltInTools == nil {
+				info.ResponsesUsageInfo.BuiltInTools = make(map[string]*relaycommon.BuildInToolInfo)
+			}
+			if irUsage.WebSearchRequests > 0 {
+				if existing := info.ResponsesUsageInfo.BuiltInTools["web_search_preview"]; existing != nil {
+					existing.CallCount = irUsage.WebSearchRequests
+				} else {
+					info.ResponsesUsageInfo.BuiltInTools["web_search_preview"] = &relaycommon.BuildInToolInfo{
+						ToolName:  "web_search_preview",
+						CallCount: irUsage.WebSearchRequests,
+					}
 				}
 			}
 			if irUsage.FileSearchCalls > 0 {
-				if info.ResponsesUsageInfo.BuiltInTools == nil {
-					info.ResponsesUsageInfo.BuiltInTools = make(map[string]*relaycommon.BuildInToolInfo)
-				}
-				info.ResponsesUsageInfo.BuiltInTools["file_search"] = &relaycommon.BuildInToolInfo{
-					ToolName:  "file_search",
-					CallCount: irUsage.FileSearchCalls,
+				if existing := info.ResponsesUsageInfo.BuiltInTools["file_search"]; existing != nil {
+					existing.CallCount = irUsage.FileSearchCalls
+				} else {
+					info.ResponsesUsageInfo.BuiltInTools["file_search"] = &relaycommon.BuildInToolInfo{
+						ToolName:  "file_search",
+						CallCount: irUsage.FileSearchCalls,
+					}
 				}
 			}
 		}
 		if irUsage.HasImageGenCall {
 			c.Set("image_generation_call", true)
+			if irUsage.ImageGenQuality != "" {
+				c.Set("image_generation_call_quality", irUsage.ImageGenQuality)
+			}
+			if irUsage.ImageGenSize != "" {
+				c.Set("image_generation_call_size", irUsage.ImageGenSize)
+			}
 		}
 	} else {
 		dtoUsage = &dto.Usage{}
@@ -743,13 +1381,19 @@ func finalizeIRUsage(
 		est := service.ResponseText2Usage(c, estimatedText, info.UpstreamModelName, info.GetEstimatePromptTokens())
 		if dtoUsage.PromptTokens == 0 && dtoUsage.PromptTokensDetails.CachedTokens == 0 && dtoUsage.PromptTokensDetails.GetCacheCreationTokens() == 0 {
 			dtoUsage.PromptTokens = est.PromptTokens
+			dtoUsage.InputTokens = est.PromptTokens
 		}
 		if dtoUsage.CompletionTokens == 0 {
 			dtoUsage.CompletionTokens = est.CompletionTokens
+			dtoUsage.OutputTokens = est.CompletionTokens
 		}
-		if dtoUsage.TotalTokens == 0 {
-			dtoUsage.TotalTokens = dtoUsage.PromptTokens + dtoUsage.CompletionTokens
-		}
+	}
+	inclusivePrompt := dtoUsage.PromptTokens
+	if dtoUsage.UsageSemantic == "anthropic" {
+		inclusivePrompt += dtoUsage.PromptTokensDetails.CachedTokens + dtoUsage.PromptTokensDetails.GetCacheCreationTokens()
+	}
+	if dtoUsage.TotalTokens < inclusivePrompt+dtoUsage.CompletionTokens {
+		dtoUsage.TotalTokens = inclusivePrompt + dtoUsage.CompletionTokens
 	}
 	return dtoUsage
 }
@@ -760,7 +1404,15 @@ func billIRUsage(c *gin.Context, info *relaycommon.RelayInfo, usage *dto.Usage) 
 	}
 	containAudioTokens := usage.CompletionTokenDetails.AudioTokens > 0 || usage.PromptTokensDetails.AudioTokens > 0
 	containsAudioRatios := ratio_setting.ContainsAudioRatio(info.OriginModelName) || ratio_setting.ContainsAudioCompletionRatio(info.OriginModelName)
-	if containAudioTokens && containsAudioRatios {
+	hasNonAudioExtras := usage.PromptTokensDetails.CachedTokens > 0 ||
+		usage.PromptTokensDetails.GetCacheCreationTokens() > 0 ||
+		usage.PromptTokensDetails.ImageTokens > 0 ||
+		(info != nil && info.ResponsesUsageInfo != nil && len(info.ResponsesUsageInfo.BuiltInTools) > 0) ||
+		c.GetBool("image_generation_call") ||
+		c.GetInt("claude_web_search_requests") > 0
+	// PostAudioConsumeQuota only accounts for PromptTokensDetails.TextTokens + AudioTokens and skips
+	// cache/image/tool surcharges; fall back to PostTextConsumeQuota whenever extras exist or TextTokens is absent.
+	if containAudioTokens && containsAudioRatios && !hasNonAudioExtras && usage.PromptTokensDetails.TextTokens > 0 {
 		service.PostAudioConsumeQuota(c, info, usage, "")
 		return
 	}

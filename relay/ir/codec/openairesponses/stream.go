@@ -20,6 +20,12 @@ const (
 	metaKeyCurrentMsgRefuseIdx    = "_openai_responses_cur_msg_refusal_idx"
 	metaKeyCurrentReasoning       = "_openai_responses_cur_reasoning_text"
 	metaKeyCurrentReasoningHasSum = "_openai_responses_cur_reasoning_has_summary"
+	metaKeyDecodeItemHasText      = "_openai_responses_dec_item_has_text"
+	metaKeyDecodeItemHasRefusal   = "_openai_responses_dec_item_has_refusal"
+	metaKeyDecodeItemHasReasoning = "_openai_responses_dec_item_has_reasoning"
+	metaKeyDecodeItemHasSummary   = "_openai_responses_dec_item_has_summary"
+	metaKeyDecodeLastSummaryIdx   = "_openai_responses_dec_last_summary_idx"
+	metaKeyPreferredReasoningID   = "_openai_responses_preferred_rs_id"
 )
 
 type responsesCompletedOutput struct {
@@ -98,6 +104,7 @@ func (c *Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.Strea
 			return nil, nil
 		}
 		ctx.AccumulatedText.WriteString(wire.Delta)
+		setMetaBool(ctx, metaKeyDecodeItemHasText, true)
 		return []ir.StreamEvent{{
 			Type:       ir.EventTextDelta,
 			BlockIndex: derefInt(wire.OutputIndex, ctx.MessageOutputIndex),
@@ -108,11 +115,27 @@ func (c *Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.Strea
 		if wire.Delta == "" {
 			return nil, nil
 		}
-		ctx.AccumulatedReasoning.WriteString(wire.Delta)
+		if eventType == "response.reasoning_text.delta" && getMetaBool(ctx, metaKeyDecodeItemHasSummary) {
+			// Avoid duplicating reasoning when an upstream emits both summary_text and reasoning_text deltas.
+			return nil, nil
+		}
+		delta := wire.Delta
+		if eventType == "response.reasoning_summary_text.delta" {
+			setMetaBool(ctx, metaKeyDecodeItemHasSummary, true)
+			if wire.SummaryIndex != nil {
+				lastIdx := getMetaInt(ctx, metaKeyDecodeLastSummaryIdx)
+				if getMetaBool(ctx, metaKeyDecodeItemHasReasoning) && lastIdx >= 0 && *wire.SummaryIndex != lastIdx {
+					delta = "\n\n" + delta
+				}
+				setMetaInt(ctx, metaKeyDecodeLastSummaryIdx, *wire.SummaryIndex)
+			}
+		}
+		ctx.AccumulatedReasoning.WriteString(delta)
+		setMetaBool(ctx, metaKeyDecodeItemHasReasoning, true)
 		return []ir.StreamEvent{{
 			Type:         ir.EventReasoningDelta,
 			BlockIndex:   derefInt(wire.OutputIndex, ctx.ReasoningOutputIndex),
-			Reasoning:    wire.Delta,
+			Reasoning:    delta,
 			OriginFormat: ir.FormatOpenAIResponses,
 		}}, nil
 
@@ -121,6 +144,7 @@ func (c *Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.Strea
 			return nil, nil
 		}
 		ctx.AccumulatedRefusal.WriteString(wire.Delta)
+		setMetaBool(ctx, metaKeyDecodeItemHasRefusal, true)
 		return []ir.StreamEvent{{
 			Type:       ir.EventRefusalDelta,
 			BlockIndex: derefInt(wire.OutputIndex, ctx.MessageOutputIndex),
@@ -135,6 +159,7 @@ func (c *Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.Strea
 		if eventType == "response.custom_tool_call_input.delta" {
 			kind = "custom"
 		}
+		var events []ir.StreamEvent
 		tc := lookupResponsesToolCall(ctx, wire.ItemID, wire.OutputIndex)
 		if tc == nil {
 			outIdx := derefInt(wire.OutputIndex, ctx.NextOutputIndex)
@@ -145,9 +170,20 @@ func (c *Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.Strea
 				ctx.ToolCallsByID[wire.ItemID] = tc
 			}
 			recordStreamToolBridge(ctx, tc)
+			events = append(events, ir.StreamEvent{
+				Type:           ir.EventToolCallStart,
+				BlockIndex:     outIdx,
+				BlockType:      ir.PartToolCall,
+				ToolCallID:     tc.ID,
+				ToolCallItemID: tc.ItemID,
+				ToolName:       tc.Name,
+				ToolCallIndex:  tc.Index,
+				ToolKind:       tc.Kind,
+				OriginFormat:   ir.FormatOpenAIResponses,
+			})
 		}
 		tc.Args.WriteString(wire.Delta)
-		return []ir.StreamEvent{{
+		events = append(events, ir.StreamEvent{
 			Type:           ir.EventToolCallDelta,
 			BlockIndex:     derefInt(wire.OutputIndex, tc.OutputIndex),
 			ToolCallID:     tc.ID,
@@ -157,7 +193,8 @@ func (c *Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.Strea
 			ToolArguments:  wire.Delta,
 			ToolKind:       tc.Kind,
 			OriginFormat:   ir.FormatOpenAIResponses,
-		}}, nil
+		})
+		return events, nil
 
 	case "response.output_item.done":
 		return decodeOutputItemDone(&wire, ctx), nil
@@ -243,17 +280,26 @@ func decodeOutputItemAdded(wire *responsesStreamEventWire, ctx *ir.StreamContext
 		ctx.ReasoningOutputIndex = outIdx
 		ctx.ReasoningItemStarted = true
 		ctx.ReasoningOrigin = ir.FormatOpenAIResponses
-		return []ir.StreamEvent{{
+		setMetaBool(ctx, metaKeyDecodeItemHasReasoning, false)
+		setMetaBool(ctx, metaKeyDecodeItemHasSummary, false)
+		setMetaInt(ctx, metaKeyDecodeLastSummaryIdx, -1)
+		ev := ir.StreamEvent{
 			Type:         ir.EventContentBlockStart,
 			BlockIndex:   outIdx,
 			BlockType:    ir.PartReasoning,
 			OriginFormat: ir.FormatOpenAIResponses,
-		}}
+		}
+		if item.ID != "" {
+			ev.ProviderMetadata = map[string]any{"item_id": item.ID}
+		}
+		return []ir.StreamEvent{ev}
 
 	case "message":
 		ctx.MessageItemID = item.ID
 		ctx.MessageOutputIndex = outIdx
 		ctx.MessageItemStarted = true
+		setMetaBool(ctx, metaKeyDecodeItemHasText, false)
+		setMetaBool(ctx, metaKeyDecodeItemHasRefusal, false)
 		return []ir.StreamEvent{{
 			Type:         ir.EventContentBlockStart,
 			BlockIndex:   outIdx,
@@ -262,7 +308,7 @@ func decodeOutputItemAdded(wire *responsesStreamEventWire, ctx *ir.StreamContext
 		}}
 
 	case "web_search_call", "file_search_call", "image_generation_call":
-		countBuiltinStreamToolOnce(ctx, item.Type, item.ID, outIdx)
+		countBuiltinStreamToolOnce(ctx, item.Type, item.ID, outIdx, item.Quality, item.Size)
 		return nil
 
 	default:
@@ -354,10 +400,11 @@ func decodeOutputItemDone(wire *responsesStreamEventWire, ctx *ir.StreamContext)
 
 	case "reasoning":
 		var events []ir.StreamEvent
-		if ctx.AccumulatedReasoning.Len() == 0 {
+		if !getMetaBool(ctx, metaKeyDecodeItemHasReasoning) {
 			decoded := decodeReasoningItem(item.ID, item.Summary, item.Content, item.EncryptedContent)
 			if decoded.Text != "" {
 				ctx.AccumulatedReasoning.WriteString(decoded.Text)
+				setMetaBool(ctx, metaKeyDecodeItemHasReasoning, true)
 				events = append(events, ir.StreamEvent{
 					Type:         ir.EventReasoningDelta,
 					BlockIndex:   outIdx,
@@ -389,17 +436,17 @@ func decodeOutputItemDone(wire *responsesStreamEventWire, ctx *ir.StreamContext)
 
 	case "message":
 		var events []ir.StreamEvent
-		if ctx.AccumulatedText.Len() == 0 && ctx.AccumulatedRefusal.Len() == 0 && len(item.Content) > 0 {
+		if (!getMetaBool(ctx, metaKeyDecodeItemHasText) || !getMetaBool(ctx, metaKeyDecodeItemHasRefusal)) && len(item.Content) > 0 {
 			if parts, err := decodeMessageContent(item.Content); err == nil {
 				for _, p := range parts {
-					if p.Type == ir.PartText && p.Text != "" {
+					if p.Type == ir.PartText && p.Text != "" && !getMetaBool(ctx, metaKeyDecodeItemHasText) {
 						ctx.AccumulatedText.WriteString(p.Text)
 						events = append(events, ir.StreamEvent{
 							Type:       ir.EventTextDelta,
 							BlockIndex: outIdx,
 							Text:       p.Text,
 						})
-					} else if p.Type == ir.PartRefusal && p.Refusal != "" {
+					} else if p.Type == ir.PartRefusal && p.Refusal != "" && !getMetaBool(ctx, metaKeyDecodeItemHasRefusal) {
 						ctx.AccumulatedRefusal.WriteString(p.Refusal)
 						events = append(events, ir.StreamEvent{
 							Type:       ir.EventRefusalDelta,
@@ -419,7 +466,7 @@ func decodeOutputItemDone(wire *responsesStreamEventWire, ctx *ir.StreamContext)
 		return events
 
 	case "web_search_call", "file_search_call", "image_generation_call":
-		countBuiltinStreamToolOnce(ctx, item.Type, item.ID, outIdx)
+		countBuiltinStreamToolOnce(ctx, item.Type, item.ID, outIdx, item.Quality, item.Size)
 		return nil
 
 	default:
@@ -454,19 +501,32 @@ func decodeStreamTerminal(eventType string, wire *responsesStreamEventWire, ctx 
 		incomplete = wire.Response.IncompleteDetails
 		usage = decodeResponsesUsage(wire.Response.Usage)
 
+		noPriorItems := !ctx.MessageItemStarted && !ctx.ReasoningItemStarted && len(ctx.ToolCallOrder) == 0 && ctx.AccumulatedText.Len() == 0 && ctx.AccumulatedReasoning.Len() == 0
 		for idx, rawItem := range wire.Response.Output {
-			var probe struct {
-				Type string `json:"type"`
-				ID   string `json:"id"`
-			}
-			if err := json.Unmarshal(rawItem, &probe); err != nil {
+			var item responsesOutputItemWire
+			if err := json.Unmarshal(rawItem, &item); err != nil {
 				continue
 			}
-			switch probe.Type {
+			switch item.Type {
 			case "function_call", "custom_tool_call":
 				hasToolCalls = true
+				if noPriorItems {
+					outIdx := idx
+					events = append(events, decodeOutputItemDone(&responsesStreamEventWire{
+						OutputIndex: &outIdx,
+						Item:        &item,
+					}, ctx)...)
+				}
+			case "message", "reasoning":
+				if noPriorItems {
+					outIdx := idx
+					events = append(events, decodeOutputItemDone(&responsesStreamEventWire{
+						OutputIndex: &outIdx,
+						Item:        &item,
+					}, ctx)...)
+				}
 			case "web_search_call", "file_search_call", "image_generation_call":
-				countBuiltinStreamToolOnce(ctx, probe.Type, probe.ID, idx)
+				countBuiltinStreamToolOnce(ctx, item.Type, item.ID, idx, item.Quality, item.Size)
 			}
 		}
 	}
@@ -483,6 +543,12 @@ func decodeStreamTerminal(eventType string, wire *responsesStreamEventWire, ctx 
 		}
 		if ctx.HasImageGenCall {
 			usage.HasImageGenCall = true
+		}
+		if ctx.ImageGenQuality != "" && usage.ImageGenQuality == "" {
+			usage.ImageGenQuality = ctx.ImageGenQuality
+		}
+		if ctx.ImageGenSize != "" && usage.ImageGenSize == "" {
+			usage.ImageGenSize = ctx.ImageGenSize
 		}
 		ctx.MergeUsage(usage)
 		events = append(events, ir.StreamEvent{
@@ -504,9 +570,17 @@ func decodeStreamTerminal(eventType string, wire *responsesStreamEventWire, ctx 
 	return events
 }
 
-func countBuiltinStreamToolOnce(ctx *ir.StreamContext, itemType, itemID string, outIdx int) {
+func countBuiltinStreamToolOnce(ctx *ir.StreamContext, itemType, itemID string, outIdx int, quality, size string) {
 	if ctx == nil {
 		return
+	}
+	if itemType == "image_generation_call" {
+		if quality != "" {
+			ctx.ImageGenQuality = quality
+		}
+		if size != "" {
+			ctx.ImageGenSize = size
+		}
 	}
 	if ctx.SeenToolItemIDs == nil {
 		ctx.SeenToolItemIDs = make(map[string]struct{})
@@ -636,6 +710,11 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 		return frames, nil
 
 	case ir.EventContentBlockStart:
+		if ev.BlockType == ir.PartReasoning && ev.ProviderMetadata != nil {
+			if id, ok := ev.ProviderMetadata["item_id"].(string); ok && id != "" {
+				setMetaString(ctx, metaKeyPreferredReasoningID, id)
+			}
+		}
 		frames = append(frames, ensureStreamStarted(ctx)...)
 		return frames, nil
 
@@ -716,6 +795,27 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 		}))
 		return frames, nil
 
+	case ir.EventImage:
+		md := formatResponsesImageMarkdown(ev.Image)
+		if md == "" {
+			return nil, nil
+		}
+		frames = append(frames, ensureStreamStarted(ctx)...)
+		frames = append(frames, closeOpenReasoningItem(ctx)...)
+		frames = append(frames, closeOpenToolCalls(ctx)...)
+		frames = append(frames, ensureMessageTextPartOpen(ctx)...)
+
+		ctx.AccumulatedText.WriteString(md)
+		appendMetaString(ctx, metaKeyCurrentMsgText, md)
+
+		frames = append(frames, makeSSEFrame(ctx, "response.output_text.delta", map[string]any{
+			"item_id":       ctx.MessageItemID,
+			"output_index":  ctx.MessageOutputIndex,
+			"content_index": getMetaInt(ctx, metaKeyCurrentMsgTextIdx),
+			"delta":         md,
+		}))
+		return frames, nil
+
 	case ir.EventToolCallStart:
 		frames = append(frames, ensureStreamStarted(ctx)...)
 		frames = append(frames, closeOpenReasoningItem(ctx)...)
@@ -724,7 +824,7 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 		tc, startFrames := openOrGetToolCall(ctx, ev)
 		frames = append(frames, startFrames...)
 
-		if ev.ToolArguments != "" && tc != nil {
+		if ev.ToolArguments != "" && tc != nil && !tc.Closed {
 			tc.Args.WriteString(ev.ToolArguments)
 			frames = append(frames, makeToolCallDeltaFrame(ctx, tc, ev.ToolArguments))
 		}
@@ -739,10 +839,20 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 		frames = append(frames, closeOpenMessageItem(ctx)...)
 
 		tc := ctx.LookupToolCall(ev.ToolCallIndex, ev.ToolCallID)
+		if tc != nil && tc.Closed {
+			return nil, nil
+		}
+		if tc == nil && ev.ToolName == "" && ev.ToolCallID != "" {
+			// Ignore stray delta referencing an unregistered/unknown tool ID without a tool name.
+			return nil, nil
+		}
 		if tc == nil || !tc.Started {
 			var startFrames []ir.SSEFrame
 			tc, startFrames = openOrGetToolCall(ctx, ev)
 			frames = append(frames, startFrames...)
+		}
+		if tc == nil || tc.Closed {
+			return frames, nil
 		}
 		tc.Args.WriteString(ev.ToolArguments)
 		frames = append(frames, makeToolCallDeltaFrame(ctx, tc, ev.ToolArguments))
@@ -755,11 +865,26 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 		case ir.PartText, ir.PartRefusal:
 			return closeOpenMessageItem(ctx), nil
 		case ir.PartToolCall:
-			if tc := ctx.LookupToolCall(ev.ToolCallIndex, ev.ToolCallID); tc != nil {
-				return closeSingleToolCall(ctx, tc), nil
+			var tc *ir.TrackedToolCall
+			if ev.ToolCallID != "" {
+				tc = ctx.LookupToolCall(-1, ev.ToolCallID)
+			}
+			if tc == nil && ev.BlockIndex >= 0 {
+				tc = ctx.LookupToolCallByBlockIndex(ev.BlockIndex)
+			}
+			if tc == nil && ev.ToolCallIndex >= 0 {
+				tc = ctx.LookupToolCall(ev.ToolCallIndex, "")
+			}
+			if tc != nil {
+				return closeSingleToolCall(ctx, tc, "completed"), nil
 			}
 			return nil, nil
 		default:
+			if ev.BlockType == "" && ev.BlockIndex >= 0 {
+				if tc := ctx.LookupToolCallByBlockIndex(ev.BlockIndex); tc != nil {
+					return closeSingleToolCall(ctx, tc, "completed"), nil
+				}
+			}
 			return nil, nil
 		}
 
@@ -776,8 +901,9 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 		ctx.PendingRawFinish = ev.RawFinishReason
 
 		// For OpenAI Chat upstreams using stream_options.include_usage, finish_reason arrives one
-		// chunk before the final usage-only chunk; defer terminal frame until FlushStream/StreamEnd.
-		if ctx.SourceFormat == ir.FormatOpenAIChat && ctx.LastUsage == nil {
+		// chunk before the final usage-only chunk; defer terminal frame until FlushStream/StreamEnd
+		// if no non-zero usage has been observed yet.
+		if ctx.SourceFormat == ir.FormatOpenAIChat && (ctx.LastUsage == nil || (ctx.LastUsage.InputTokens == 0 && ctx.LastUsage.OutputTokens == 0)) {
 			return nil, nil
 		}
 		return emitTerminalCompletion(ctx), nil
@@ -786,19 +912,30 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 		return c.FlushStream(ctx)
 
 	case ir.EventError:
+		errCode := ev.ErrorCode
+		if errCode == "" {
+			errCode = ev.ErrorType
+		}
+		errMsg := ev.ErrorMessage
+		if errMsg == "" {
+			errMsg = "stream error"
+		}
 		frames = append(frames, makeSSEFrame(ctx, "error", map[string]any{
-			"code":    ev.ErrorCode,
-			"message": ev.ErrorMessage,
-			"type":    ev.ErrorType,
+			"code":    errCode,
+			"message": errMsg,
 			"param":   nil,
 		}))
+		// Terminate stream so FlushStream never fabricates response.completed after an error.
+		ctx.FinishEmitted = true
+		ctx.Ended = true
 		return frames, nil
 
 	case ir.EventPassthrough:
 		if len(ev.PassthroughData) > 0 && shouldPreserveResponsesNative(ev.OriginFormat, ctx.ConversionContext) {
+			data := rewritePassthroughSeq(ctx, ev.PassthroughData)
 			return []ir.SSEFrame{{
 				Event: ev.PassthroughEvent,
-				Data:  ev.PassthroughData,
+				Data:  data,
 			}}, nil
 		}
 		return nil, nil
@@ -824,14 +961,9 @@ func emitTerminalCompletion(ctx *ir.StreamContext) []ir.SSEFrame {
 	if ctx.FinishEmitted {
 		return nil
 	}
-	var frames []ir.SSEFrame
-	frames = append(frames, ensureStreamStarted(ctx)...)
-	frames = append(frames, closeOpenReasoningItem(ctx)...)
-	frames = append(frames, closeOpenMessageItem(ctx)...)
-	frames = append(frames, closeOpenToolCalls(ctx)...)
-
 	eventType := "response.completed"
 	status := "completed"
+	itemStatus := "completed"
 	var incomplete *responsesIncompleteDetailsWire
 
 	if ctx.PendingFinish != nil {
@@ -839,18 +971,37 @@ func emitTerminalCompletion(ctx *ir.StreamContext) []ir.SSEFrame {
 		case ir.FinishLength:
 			eventType = "response.incomplete"
 			status = "incomplete"
+			itemStatus = "incomplete"
 			incomplete = &responsesIncompleteDetailsWire{Reason: "max_output_tokens"}
 		case ir.FinishContentFilter:
 			eventType = "response.incomplete"
 			status = "incomplete"
+			itemStatus = "incomplete"
 			incomplete = &responsesIncompleteDetailsWire{Reason: "content_filter"}
 		case ir.FinishError:
 			eventType = "response.failed"
 			status = "failed"
+			itemStatus = "incomplete"
 		}
 	}
 
+	var frames []ir.SSEFrame
+	frames = append(frames, ensureStreamStarted(ctx)...)
+	frames = append(frames, closeOpenReasoningItemWithStatus(ctx, itemStatus)...)
+	frames = append(frames, closeOpenMessageItemWithStatus(ctx, itemStatus)...)
+	frames = append(frames, closeOpenToolCallsWithStatus(ctx, itemStatus)...)
+
 	respObj := buildStreamResponseObject(ctx, status, collectCompletedOutputs(ctx), encodeResponsesUsage(ctx.LastUsage), incomplete)
+	if status == "failed" {
+		msg := "upstream generation failed"
+		if ctx.PendingRawFinish != "" {
+			msg = fmt.Sprintf("upstream generation failed (%s)", ctx.PendingRawFinish)
+		}
+		respObj["error"] = map[string]any{
+			"code":    "server_error",
+			"message": msg,
+		}
+	}
 	frames = append(frames, makeSSEFrame(ctx, eventType, map[string]any{
 		"response": respObj,
 	}))
@@ -901,7 +1052,11 @@ func ensureReasoningItemOpen(ctx *ir.StreamContext, origin ir.Format) []ir.SSEFr
 	}
 	outIdx := ctx.NextOutputIndex
 	ctx.NextOutputIndex++
-	rsID := fmt.Sprintf("rs_%s_%d", shortIDSuffix(ctx.ResponseID), outIdx)
+	rsID := getMetaString(ctx, metaKeyPreferredReasoningID)
+	setMetaString(ctx, metaKeyPreferredReasoningID, "")
+	if rsID == "" {
+		rsID = fmt.Sprintf("rs_%s_%d", shortIDSuffix(ctx.ResponseID), outIdx)
+	}
 
 	ctx.ReasoningItemID = rsID
 	ctx.ReasoningOutputIndex = outIdx
@@ -945,8 +1100,15 @@ func ensureReasoningSummaryOpen(ctx *ir.StreamContext, origin ir.Format) []ir.SS
 }
 
 func closeOpenReasoningItem(ctx *ir.StreamContext) []ir.SSEFrame {
+	return closeOpenReasoningItemWithStatus(ctx, "completed")
+}
+
+func closeOpenReasoningItemWithStatus(ctx *ir.StreamContext, itemStatus string) []ir.SSEFrame {
 	if !ctx.ReasoningItemStarted || ctx.ReasoningItemDone {
 		return nil
+	}
+	if itemStatus == "" {
+		itemStatus = "completed"
 	}
 	var frames []ir.SSEFrame
 	summary := make([]map[string]any, 0, 1)
@@ -977,7 +1139,7 @@ func closeOpenReasoningItem(ctx *ir.StreamContext) []ir.SSEFrame {
 	completedItem := map[string]any{
 		"id":      ctx.ReasoningItemID,
 		"type":    "reasoning",
-		"status":  "completed",
+		"status":  itemStatus,
 		"summary": summary,
 	}
 	if ctx.ReasoningOrigin == ir.FormatOpenAIResponses && ctx.ReasoningRedacted != "" && shouldPreserveResponsesNative(ctx.ReasoningOrigin, ctx.ConversionContext) {
@@ -1079,8 +1241,15 @@ func ensureMessageRefusalPartOpen(ctx *ir.StreamContext) []ir.SSEFrame {
 }
 
 func closeOpenMessageItem(ctx *ir.StreamContext) []ir.SSEFrame {
+	return closeOpenMessageItemWithStatus(ctx, "completed")
+}
+
+func closeOpenMessageItemWithStatus(ctx *ir.StreamContext, itemStatus string) []ir.SSEFrame {
 	if !ctx.MessageItemStarted || ctx.MessageItemDone {
 		return nil
+	}
+	if itemStatus == "" {
+		itemStatus = "completed"
 	}
 	var frames []ir.SSEFrame
 	type indexedContent struct {
@@ -1147,7 +1316,7 @@ func closeOpenMessageItem(ctx *ir.StreamContext) []ir.SSEFrame {
 	completedItem := map[string]any{
 		"id":      ctx.MessageItemID,
 		"type":    "message",
-		"status":  "completed",
+		"status":  itemStatus,
 		"role":    "assistant",
 		"content": content,
 	}
@@ -1164,21 +1333,28 @@ func closeOpenMessageItem(ctx *ir.StreamContext) []ir.SSEFrame {
 func openOrGetToolCall(ctx *ir.StreamContext, ev ir.StreamEvent) (*ir.TrackedToolCall, []ir.SSEFrame) {
 	callID := ev.ToolCallID
 	if callID == "" {
-		callID = fmt.Sprintf("call_%d", ev.ToolCallIndex)
-	}
-	fcID := ev.ToolCallItemID
-	if fcID == "" {
-		fcID = synthesizeFunctionCallItemID(callID, ev.ToolCallIndex)
+		callID = ir.SynthesizeToolCallID("call")
 	}
 	kind := ev.ToolKind
 	if kind == "" {
 		kind = "function"
 	}
+	fcID := normalizeResponsesToolItemID(ev.ToolCallItemID, callID, kind, ev.ToolCallIndex)
 
-	tc, _ := ctx.RegisterToolCall(ev.ToolCallIndex, callID, fcID, ev.ToolName, kind, ev.ThoughtSignature)
-	if tc.ItemID == "" {
-		tc.ItemID = fcID
+	regIdx := ev.ToolCallIndex
+	if regIdx < 0 {
+		regIdx = -1
+	} else if callID != "" {
+		if existing := ctx.ToolCallsByIndex[regIdx]; existing != nil && existing.ID != "" && existing.ID != callID {
+			regIdx = -1
+		}
 	}
+
+	tc, _ := ctx.RegisterToolCall(regIdx, callID, fcID, ev.ToolName, kind, ev.ThoughtSignature)
+	if ev.BlockIndex >= 0 && tc.BlockIndex < 0 {
+		tc.BlockIndex = ev.BlockIndex
+	}
+	tc.ItemID = normalizeResponsesToolItemID(tc.ItemID, tc.ID, tc.Kind, tc.Index)
 	if tc.Started {
 		return tc, nil
 	}
@@ -1231,16 +1407,23 @@ func makeToolCallDeltaFrame(ctx *ir.StreamContext, tc *ir.TrackedToolCall, delta
 }
 
 func closeOpenToolCalls(ctx *ir.StreamContext) []ir.SSEFrame {
+	return closeOpenToolCallsWithStatus(ctx, "completed")
+}
+
+func closeOpenToolCallsWithStatus(ctx *ir.StreamContext, itemStatus string) []ir.SSEFrame {
 	var frames []ir.SSEFrame
 	for _, tc := range ctx.ToolCallOrder {
-		frames = append(frames, closeSingleToolCall(ctx, tc)...)
+		frames = append(frames, closeSingleToolCall(ctx, tc, itemStatus)...)
 	}
 	return frames
 }
 
-func closeSingleToolCall(ctx *ir.StreamContext, tc *ir.TrackedToolCall) []ir.SSEFrame {
+func closeSingleToolCall(ctx *ir.StreamContext, tc *ir.TrackedToolCall, itemStatus string) []ir.SSEFrame {
 	if tc == nil || !tc.Started || tc.Closed {
 		return nil
+	}
+	if itemStatus == "" {
+		itemStatus = "completed"
 	}
 	fullArgs := tc.Args.String()
 	var doneFrame ir.SSEFrame
@@ -1258,10 +1441,10 @@ func closeSingleToolCall(ctx *ir.StreamContext, tc *ir.TrackedToolCall) []ir.SSE
 			"call_id": tc.ID,
 			"name":    tc.Name,
 			"input":   fullArgs,
-			"status":  "completed",
+			"status":  itemStatus,
 		}
 	} else {
-		if fullArgs == "" {
+		if strings.TrimSpace(fullArgs) == "" {
 			fullArgs = "{}"
 		}
 		doneFrame = makeSSEFrame(ctx, "response.function_call_arguments.done", map[string]any{
@@ -1275,7 +1458,7 @@ func closeSingleToolCall(ctx *ir.StreamContext, tc *ir.TrackedToolCall) []ir.SSE
 			"call_id":   tc.ID,
 			"name":      tc.Name,
 			"arguments": fullArgs,
-			"status":    "completed",
+			"status":    itemStatus,
 		}
 	}
 
@@ -1291,16 +1474,32 @@ func closeSingleToolCall(ctx *ir.StreamContext, tc *ir.TrackedToolCall) []ir.SSE
 
 func makeSSEFrame(ctx *ir.StreamContext, eventType string, fields map[string]any) ir.SSEFrame {
 	payload := make(map[string]any, len(fields)+2)
-	payload["type"] = eventType
-	payload["sequence_number"] = ctx.NextSeq()
 	for k, v := range fields {
 		payload[k] = v
 	}
+	// Always stamp canonical SSE event discriminator & monotonic sequence_number last so fields cannot clobber them.
+	payload["type"] = eventType
+	payload["sequence_number"] = ctx.NextSeq()
 	data, _ := json.Marshal(payload)
 	return ir.SSEFrame{
 		Event: eventType,
 		Data:  data,
 	}
+}
+
+func rewritePassthroughSeq(ctx *ir.StreamContext, raw json.RawMessage) []byte {
+	var obj map[string]any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&obj); err != nil || obj == nil {
+		return raw
+	}
+	obj["sequence_number"] = ctx.NextSeq()
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 func recordCompletedOutput(ctx *ir.StreamContext, outIdx int, item any) {
@@ -1339,16 +1538,38 @@ func setMetaString(ctx *ir.StreamContext, key, val string) {
 	if ctx.Metadata == nil {
 		ctx.Metadata = make(map[string]any)
 	}
-	ctx.Metadata[key] = val
+	if b, ok := ctx.Metadata[key].(*strings.Builder); ok && b != nil {
+		b.Reset()
+		b.WriteString(val)
+		return
+	}
+	var b strings.Builder
+	b.WriteString(val)
+	ctx.Metadata[key] = &b
 }
 
 func appendMetaString(ctx *ir.StreamContext, key, delta string) {
-	setMetaString(ctx, key, getMetaString(ctx, key)+delta)
+	if ctx.Metadata == nil {
+		ctx.Metadata = make(map[string]any)
+	}
+	if b, ok := ctx.Metadata[key].(*strings.Builder); ok && b != nil {
+		b.WriteString(delta)
+		return
+	}
+	var b strings.Builder
+	if prev, ok := ctx.Metadata[key].(string); ok {
+		b.WriteString(prev)
+	}
+	b.WriteString(delta)
+	ctx.Metadata[key] = &b
 }
 
 func getMetaString(ctx *ir.StreamContext, key string) string {
 	if ctx.Metadata == nil {
 		return ""
+	}
+	if b, ok := ctx.Metadata[key].(*strings.Builder); ok && b != nil {
+		return b.String()
 	}
 	s, _ := ctx.Metadata[key].(string)
 	return s

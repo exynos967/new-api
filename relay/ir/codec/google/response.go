@@ -44,7 +44,7 @@ func (c *Codec) DecodeResponse(raw []byte, ctx *ir.ConversionContext) (*ir.Respo
 					hasToolCalls = true
 					id := p.FunctionCall.ID
 					if id == "" {
-						id = fmt.Sprintf("call_%d_%d", choiceIdx, pi)
+						id = ir.SynthesizeToolCallID("call")
 					}
 					args := normalizeJSONArgs(p.FunctionCall.Args)
 					tc := &ir.ToolCall{
@@ -119,13 +119,17 @@ func (c *Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]
 				parts = append(parts, encoded)
 			}
 		}
+		fr := encodeGoogleFinishReason(ch.FinishReason, ch.RawFinishReason)
+		if fr == "" {
+			fr = "STOP"
+		}
 		gResp.Candidates = append(gResp.Candidates, googleCandidate{
 			Index: ch.Index,
 			Content: &googleContent{
 				Role:  "model",
 				Parts: parts,
 			},
-			FinishReason: encodeGoogleFinishReason(ch.FinishReason, ch.RawFinishReason),
+			FinishReason: fr,
 		})
 	}
 
@@ -244,6 +248,9 @@ func encodeResponsePart(p ir.ContentPart, ctx *ir.ConversionContext) (googlePart
 	case ir.PartFile:
 		if p.File == nil {
 			return googlePart{}, false
+		}
+		if p.File.Text != "" && p.File.Data == "" && p.File.URL == "" && p.File.FileID == "" {
+			return googlePart{Text: strPtr(p.File.Text)}, true
 		}
 		if p.File.Data != "" {
 			mime := p.File.MediaType

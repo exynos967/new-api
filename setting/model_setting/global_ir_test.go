@@ -1,6 +1,7 @@
 package model_setting
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/QuantumNous/new-api/setting/config"
@@ -8,7 +9,7 @@ import (
 
 func TestIRConversionEnabledDefaultAndDynamicToggle(t *testing.T) {
 	t.Cleanup(func() {
-		GetGlobalSettings().IRConversionEnabled = true
+		SetIRConversionEnabled(true)
 	})
 
 	if !IsIRConversionEnabled() {
@@ -43,4 +44,31 @@ func TestIRConversionEnabledDefaultAndDynamicToggle(t *testing.T) {
 	if got := config.GlobalConfig.ExportAllConfigs()["global.ir_conversion_enabled"]; got != "true" {
 		t.Fatalf("expected exported global.ir_conversion_enabled to be %q after toggling back on, got %q", "true", got)
 	}
+}
+
+func TestIRConversionEnabledConcurrentAccess(t *testing.T) {
+	t.Cleanup(func() {
+		SetIRConversionEnabled(true)
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				if (id+j)%2 == 0 {
+					_ = config.UpdateConfigFromMap(GetGlobalSettings(), map[string]string{
+						"ir_conversion_enabled": "false",
+					})
+				} else {
+					SetIRConversionEnabled(true)
+				}
+				_ = IsIRConversionEnabled()
+				_ = config.GlobalConfig.ExportAllConfigs()
+				_ = ShouldPreserveThinkingSuffix("kimi-k2-thinking")
+			}
+		}(i)
+	}
+	wg.Wait()
 }

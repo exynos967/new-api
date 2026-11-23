@@ -63,8 +63,9 @@ type CacheControl struct {
 	TTL  string `json:"ttl,omitempty"`  // e.g., "5m", "1h"
 }
 
-// ImageSource holds either a URL reference or inline base64 image payload.
+// ImageSource holds either a URL reference, provider file_id, or inline base64 image payload.
 type ImageSource struct {
+	FileID    string `json:"file_id,omitempty"`
 	URL       string `json:"url,omitempty"`
 	Data      string `json:"data,omitempty"` // raw base64 without data: prefix
 	MediaType string `json:"media_type,omitempty"`
@@ -79,12 +80,13 @@ type AudioSource struct {
 	URL       string `json:"url,omitempty"`
 }
 
-// FileSource holds an arbitrary file/document attachment (e.g., PDF).
+// FileSource holds an arbitrary file/document attachment (e.g., PDF or plain text).
 type FileSource struct {
 	FileID    string `json:"file_id,omitempty"`
 	Filename  string `json:"filename,omitempty"`
 	URL       string `json:"url,omitempty"`
 	Data      string `json:"data,omitempty"`
+	Text      string `json:"text,omitempty"`
 	MediaType string `json:"media_type,omitempty"`
 }
 
@@ -168,10 +170,12 @@ type ToolDefinition struct {
 
 // ToolChoice controls how the model selects tools.
 type ToolChoice struct {
-	Mode              string   `json:"mode"` // "auto", "none", "required"/"any", "tool"
-	ToolName          string   `json:"tool_name,omitempty"`
-	AllowedTools      []string `json:"allowed_tools,omitempty"`
-	DisableParallel   *bool    `json:"disable_parallel,omitempty"`
+	Mode             string            `json:"mode"` // "auto", "none", "required"/"any", "tool"
+	ToolName         string            `json:"tool_name,omitempty"`
+	ToolType         string            `json:"tool_type,omitempty"` // "function", "custom", or built-in type (e.g. "web_search_preview")
+	AllowedTools     []string          `json:"allowed_tools,omitempty"`
+	AllowedToolTypes map[string]string `json:"allowed_tool_types,omitempty"` // optional name -> kind ("function" | "custom" | built-in)
+	DisableParallel  *bool             `json:"disable_parallel,omitempty"`
 }
 
 // ReasoningConfig configures chain-of-thought / extended thinking generation.
@@ -241,6 +245,7 @@ type Request struct {
 	StreamIncludeUsage *bool                      `json:"stream_include_usage,omitempty"`
 	Include            []string                   `json:"include,omitempty"`
 	Metadata           map[string]any             `json:"metadata,omitempty"`
+	CacheControl       *CacheControl              `json:"cache_control,omitempty"` // top-level prompt cache control (e.g. Anthropic automatic caching)
 	PassthroughItems   []PassthroughItem          `json:"passthrough_items,omitempty"`
 	ProviderExtensions map[string]json.RawMessage `json:"provider_extensions,omitempty"`
 }
@@ -251,7 +256,16 @@ type Choice struct {
 	Message          Message        `json:"message"`
 	FinishReason     FinishReason   `json:"finish_reason,omitempty"`
 	RawFinishReason  string         `json:"raw_finish_reason,omitempty"`
+	StopSequence     string         `json:"stop_sequence,omitempty"`
 	ProviderMetadata map[string]any `json:"provider_metadata,omitempty"`
+}
+
+// ResponseError captures a provider error carried inside a response envelope (e.g. Responses status="failed").
+type ResponseError struct {
+	Type    string `json:"type,omitempty"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
+	Param   string `json:"param,omitempty"`
 }
 
 // Usage captures normalized token and built-in tool usage metrics.
@@ -274,9 +288,11 @@ type Usage struct {
 	ImageOutputTokens     int  `json:"image_output_tokens,omitempty"`
 	TextInputTokens       int  `json:"text_input_tokens,omitempty"`
 	TextOutputTokens      int  `json:"text_output_tokens,omitempty"`
-	WebSearchRequests     int  `json:"web_search_requests,omitempty"`
-	FileSearchCalls       int  `json:"file_search_calls,omitempty"`
-	HasImageGenCall       bool `json:"has_image_gen_call,omitempty"`
+	WebSearchRequests     int    `json:"web_search_requests,omitempty"`
+	FileSearchCalls       int    `json:"file_search_calls,omitempty"`
+	HasImageGenCall       bool   `json:"has_image_gen_call,omitempty"`
+	ImageGenQuality       string `json:"image_gen_quality,omitempty"`
+	ImageGenSize          string `json:"image_gen_size,omitempty"`
 }
 
 // InclusiveInputTokens returns total input tokens including cached read and creation tokens.
@@ -312,6 +328,7 @@ type Response struct {
 	Created            int64                      `json:"created,omitempty"`
 	Choices            []Choice                   `json:"choices"`
 	Usage              *Usage                     `json:"usage,omitempty"`
+	Error              *ResponseError             `json:"error,omitempty"`
 	SystemFingerprint  string                     `json:"system_fingerprint,omitempty"`
 	ServiceTier        string                     `json:"service_tier,omitempty"`
 	PassthroughItems   []PassthroughItem          `json:"passthrough_items,omitempty"`
@@ -325,6 +342,7 @@ const (
 	EventStreamStart              StreamEventType = "stream_start"
 	EventContentBlockStart        StreamEventType = "content_block_start"
 	EventTextDelta                StreamEventType = "text_delta"
+	EventImage                    StreamEventType = "image"
 	EventReasoningDelta           StreamEventType = "reasoning_delta"
 	EventReasoningSignatureDelta  StreamEventType = "reasoning_signature_delta"
 	EventRefusalDelta             StreamEventType = "refusal_delta"
@@ -348,6 +366,7 @@ type StreamEvent struct {
 	Model             string          `json:"model,omitempty"`
 	Created           int64           `json:"created,omitempty"`
 	Text              string          `json:"text,omitempty"`
+	Image             *ImageSource    `json:"image,omitempty"`
 	Reasoning         string          `json:"reasoning,omitempty"`
 	Signature         string          `json:"signature,omitempty"`
 	RedactedData      string          `json:"redacted_data,omitempty"`

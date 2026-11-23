@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
+
+const maxOutputTextEstimateBytes = 2 * 1024 * 1024
 
 // PipelineConfig configures a Pipeline translation execution.
 type PipelineConfig struct {
@@ -173,9 +176,12 @@ func (p *Pipeline) ConvertResponse(raw []byte, fallbackModel string) ([]byte, *R
 // StreamTranslator translates a single upstream SSE stream (in TargetFormat)
 // into downstream SSE frames (in SourceFormat) with full stateful context tracking.
 type StreamTranslator struct {
-	pipeline  *Pipeline
-	decodeCtx *StreamContext
-	encodeCtx *StreamContext
+	pipeline         *Pipeline
+	decodeCtx        *StreamContext
+	encodeCtx        *StreamContext
+	bridgePersisted  bool
+	streamErr        *StreamEvent
+	hasNonErrorEvent bool
 }
 
 // NewStreamTranslator initializes a stateful translator for one streaming response.
@@ -222,11 +228,30 @@ func (st *StreamTranslator) ProcessChunk(sseEvent string, rawData []byte) ([]SSE
 	var frames []SSEFrame
 	for _, ev := range events {
 		st.recordStreamAccounting(ev)
+		if ev.Type == EventError {
+			copied := ev
+			st.streamErr = &copied
+			out, encErr := st.pipeline.source.EncodeStreamEvent(ev, st.encodeCtx)
+			if encErr != nil {
+				return frames, encErr
+			}
+			frames = append(frames, out...)
+			// Terminate stream immediately so Flush() never fabricates a completion frame after an error.
+			st.encodeCtx.FinishEmitted = true
+			st.encodeCtx.Ended = true
+			continue
+		}
+		if ev.Type != EventStreamStart {
+			st.hasNonErrorEvent = true
+		}
 		out, err := st.pipeline.source.EncodeStreamEvent(ev, st.encodeCtx)
 		if err != nil {
 			return frames, err
 		}
 		frames = append(frames, out...)
+		if ev.Type == EventStreamEnd {
+			st.persistBridge()
+		}
 	}
 	st.encodeCtx.EmittedFrames += len(frames)
 	return frames, nil
@@ -234,14 +259,35 @@ func (st *StreamTranslator) ProcessChunk(sseEvent string, rawData []byte) ([]SSE
 
 // Flush closes open blocks, emits terminal events, and persists captured cross-turn bridge metadata.
 func (st *StreamTranslator) Flush() ([]SSEFrame, error) {
+	// Always persist cross-turn bridge metadata even if EventStreamEnd already marked encodeCtx.Ended = true.
+	st.persistBridge()
 	if st.encodeCtx.Ended {
 		return nil, nil
 	}
 	frames, err := st.pipeline.source.FlushStream(st.encodeCtx)
 	st.encodeCtx.Ended = true
 	st.encodeCtx.EmittedFrames += len(frames)
-	st.persistBridge()
 	return frames, err
+}
+
+// StreamError returns the upstream EventError observed during streaming, if any.
+func (st *StreamTranslator) StreamError() *StreamEvent {
+	return st.streamErr
+}
+
+// HasNonErrorOutput reports whether any meaningful non-error event was observed before a stream error or disconnect.
+func (st *StreamTranslator) HasNonErrorOutput() bool {
+	return st.hasNonErrorEvent
+}
+
+// EmittedFrames returns the count of downstream SSE frames produced so far.
+func (st *StreamTranslator) EmittedFrames() int {
+	return st.encodeCtx.EmittedFrames
+}
+
+// PersistBridgeNow flushes captured TurnBridge metadata idempotently (safe on early disconnect).
+func (st *StreamTranslator) PersistBridgeNow() {
+	st.persistBridge()
 }
 
 // Usage returns the accumulated Usage observed across the stream (nil if upstream reported none).
@@ -280,14 +326,17 @@ func (st *StreamTranslator) TranslateReader(r io.Reader, emit func(frame SSEFram
 			break
 		}
 		if err != nil {
+			st.persistBridge()
 			return err
 		}
 		frames, procErr := st.ProcessChunk(evName, data)
 		if procErr != nil {
+			st.persistBridge()
 			return procErr
 		}
 		for _, f := range frames {
 			if emitErr := emit(f); emitErr != nil {
+				st.persistBridge()
 				return emitErr
 			}
 		}
@@ -304,6 +353,284 @@ func (st *StreamTranslator) TranslateReader(r io.Reader, emit func(frame SSEFram
 	return nil
 }
 
+// TranslateStreamToResponse consumes an upstream SSE stream (TargetFormat), aggregates all decoded IR
+// stream events into a single complete IR Response, persists TurnBridge metadata, and encodes the
+// response into SourceFormat JSON (used e.g. when a non-streaming client targets a stream-only upstream like Codex).
+func (p *Pipeline) TranslateStreamToResponse(r io.Reader, fallbackModel string) ([]byte, *Response, *StreamEvent, int, error) {
+	decodeCtx := NewStreamContext(p.target.Format(), p.source.Format())
+	decodeCtx.MetadataMode = p.mode
+	decodeCtx.BridgeScope = p.bridgeScope
+	decodeCtx.Model = fallbackModel
+	for k, v := range p.options {
+		decodeCtx.Options[k] = v
+	}
+
+	var (
+		textBuf          strings.Builder
+		reasoningBuf     strings.Builder
+		signatureBuf     strings.Builder
+		refusalBuf       strings.Builder
+		redactedData     string
+		reasoningOrigin  Format
+		images           []*ImageSource
+		toolCallsByID    = make(map[string]*ToolCall)
+		toolCallsByIndex = make(map[int]*ToolCall)
+		toolCallOrder    []*ToolCall
+		finishReason     FinishReason
+		rawFinishReason  string
+		streamErr        *StreamEvent
+	)
+
+	reader := NewSSEReader(r)
+	for {
+		evName, data, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, nil, streamErr, decodeCtx.ReceivedChunks, err
+		}
+		trimmed := bytes.TrimSpace(data)
+		if len(trimmed) == 0 {
+			continue
+		}
+		if bytes.Equal(trimmed, []byte("[DONE]")) {
+			break
+		}
+		decodeCtx.ReceivedChunks++
+		events, decErr := p.target.DecodeStreamEvent(evName, trimmed, decodeCtx)
+		if decErr != nil {
+			return nil, nil, streamErr, decodeCtx.ReceivedChunks, decErr
+		}
+		for _, ev := range events {
+			if ev.ResponseID != "" && decodeCtx.ResponseID == "" {
+				decodeCtx.ResponseID = ev.ResponseID
+			}
+			if ev.Model != "" && decodeCtx.Model == "" {
+				decodeCtx.Model = ev.Model
+			}
+			if ev.Created > 0 && decodeCtx.Created == 0 {
+				decodeCtx.Created = ev.Created
+			}
+			if ev.Usage != nil {
+				decodeCtx.MergeUsage(ev.Usage)
+			}
+			switch ev.Type {
+			case EventError:
+				copied := ev
+				streamErr = &copied
+			case EventTextDelta:
+				textBuf.WriteString(ev.Text)
+			case EventImage:
+				if ev.Image != nil {
+					copiedImg := *ev.Image
+					images = append(images, &copiedImg)
+				}
+			case EventReasoningDelta:
+				reasoningBuf.WriteString(ev.Reasoning)
+				if ev.Signature != "" {
+					signatureBuf.WriteString(ev.Signature)
+				}
+				if ev.RedactedData != "" {
+					redactedData = ev.RedactedData
+				}
+				if ev.OriginFormat != FormatUnknown {
+					reasoningOrigin = ev.OriginFormat
+				}
+			case EventReasoningSignatureDelta:
+				if ev.Signature != "" {
+					signatureBuf.WriteString(ev.Signature)
+				}
+				if ev.OriginFormat != FormatUnknown {
+					reasoningOrigin = ev.OriginFormat
+				}
+			case EventRefusalDelta:
+				refusalBuf.WriteString(ev.Refusal)
+			case EventToolCallStart:
+				tc := toolCallsByID[ev.ToolCallID]
+				if tc == nil && ev.ToolCallID == "" {
+					tc = toolCallsByIndex[ev.ToolCallIndex]
+				}
+				if tc == nil {
+					id := ev.ToolCallID
+					if id == "" {
+						id = SynthesizeToolCallID("call")
+					}
+					tc = &ToolCall{
+						ID:               id,
+						ItemID:           ev.ToolCallItemID,
+						Name:             ev.ToolName,
+						Kind:             ev.ToolKind,
+						ThoughtSignature: ev.ThoughtSignature,
+					}
+					toolCallsByID[id] = tc
+					toolCallsByIndex[ev.ToolCallIndex] = tc
+					toolCallOrder = append(toolCallOrder, tc)
+				} else {
+					if ev.ToolCallItemID != "" {
+						tc.ItemID = ev.ToolCallItemID
+					}
+					if ev.ToolName != "" {
+						tc.Name = ev.ToolName
+					}
+					if ev.ToolKind != "" {
+						tc.Kind = ev.ToolKind
+					}
+					if ev.ThoughtSignature != "" {
+						tc.ThoughtSignature = ev.ThoughtSignature
+					}
+				}
+				if ev.ToolArguments != "" {
+					tc.Arguments += ev.ToolArguments
+				}
+			case EventToolCallDelta:
+				var tc *ToolCall
+				if ev.ToolCallID != "" {
+					tc = toolCallsByID[ev.ToolCallID]
+				} else {
+					tc = toolCallsByIndex[ev.ToolCallIndex]
+				}
+				if tc == nil {
+					id := ev.ToolCallID
+					if id == "" {
+						id = SynthesizeToolCallID("call")
+					}
+					tc = &ToolCall{
+						ID:               id,
+						ItemID:           ev.ToolCallItemID,
+						Name:             ev.ToolName,
+						Kind:             ev.ToolKind,
+						ThoughtSignature: ev.ThoughtSignature,
+					}
+					toolCallsByID[id] = tc
+					toolCallsByIndex[ev.ToolCallIndex] = tc
+					toolCallOrder = append(toolCallOrder, tc)
+				} else {
+					if ev.ToolName != "" && tc.Name == "" {
+						tc.Name = ev.ToolName
+					}
+					if ev.ThoughtSignature != "" && tc.ThoughtSignature == "" {
+						tc.ThoughtSignature = ev.ThoughtSignature
+					}
+				}
+				if ev.ToolArguments != "" {
+					tc.Arguments += ev.ToolArguments
+				}
+			case EventFinish:
+				if ev.FinishReason != "" {
+					finishReason = ev.FinishReason
+				}
+				if ev.RawFinishReason != "" {
+					rawFinishReason = ev.RawFinishReason
+				}
+			}
+		}
+	}
+
+	if streamErr != nil && textBuf.Len() == 0 && reasoningBuf.Len() == 0 && len(toolCallOrder) == 0 && len(images) == 0 {
+		return nil, nil, streamErr, decodeCtx.ReceivedChunks, nil
+	}
+
+	var parts []ContentPart
+	if reasoningBuf.Len() > 0 || signatureBuf.Len() > 0 || redactedData != "" {
+		orig := reasoningOrigin
+		if orig == FormatUnknown {
+			orig = p.target.Format()
+		}
+		parts = append(parts, ContentPart{
+			Type: PartReasoning,
+			Reasoning: &Reasoning{
+				Text:         reasoningBuf.String(),
+				Signature:    signatureBuf.String(),
+				RedactedData: redactedData,
+				OriginFormat: orig,
+			},
+		})
+	}
+	if textBuf.Len() > 0 {
+		parts = append(parts, ContentPart{Type: PartText, Text: textBuf.String()})
+	}
+	for _, img := range images {
+		parts = append(parts, ContentPart{Type: PartImage, Image: img})
+	}
+	if refusalBuf.Len() > 0 {
+		parts = append(parts, ContentPart{Type: PartRefusal, Refusal: refusalBuf.String()})
+	}
+	for _, tc := range toolCallOrder {
+		if strings.TrimSpace(tc.Arguments) == "" && tc.Kind != "custom" {
+			tc.Arguments = "{}"
+		}
+		parts = append(parts, ContentPart{Type: PartToolCall, ToolCall: tc})
+	}
+
+	if finishReason == "" {
+		if len(toolCallOrder) > 0 {
+			finishReason = FinishToolCalls
+		} else {
+			finishReason = FinishStop
+		}
+	}
+
+	decodeCtx.EnsureEnvelope("resp")
+	model := decodeCtx.Model
+	if model == "" {
+		model = fallbackModel
+	}
+	irResp := &Response{
+		ID:      decodeCtx.ResponseID,
+		Model:   model,
+		Created: decodeCtx.Created,
+		Choices: []Choice{{
+			Index: 0,
+			Message: Message{
+				Role:  RoleAssistant,
+				Parts: parts,
+			},
+			FinishReason:    finishReason,
+			RawFinishReason: rawFinishReason,
+		}},
+		Usage: decodeCtx.LastUsage,
+	}
+
+	if p.bridge != nil {
+		decodeCtx.BridgeState.ExtractResponseBridge(irResp, p.target.Format())
+		p.bridge.Save(p.bridgeScope, decodeCtx.BridgeState)
+	}
+
+	encCtx := NewConversionContext(p.target.Format(), p.source.Format())
+	encCtx.MetadataMode = p.mode
+	encCtx.BridgeScope = p.bridgeScope
+	for k, v := range p.options {
+		encCtx.Options[k] = v
+	}
+	out, err := p.source.EncodeResponse(irResp, encCtx)
+	if err != nil {
+		return nil, irResp, streamErr, decodeCtx.ReceivedChunks, fmt.Errorf("ir: encode aggregated %s response: %w", p.source.Format(), err)
+	}
+	if p.sourceShim != nil && len(p.sourceShim.PostIRResponseTransforms) > 0 {
+		out, err = ApplyJSONTransforms(out, p.sourceShim.PostIRResponseTransforms, encCtx)
+		if err != nil {
+			return nil, irResp, streamErr, decodeCtx.ReceivedChunks, fmt.Errorf("ir: source post-IR response shim: %w", err)
+		}
+	}
+	return out, irResp, streamErr, decodeCtx.ReceivedChunks, nil
+}
+
+func (st *StreamTranslator) appendOutputEstimate(s string) {
+	if s == "" {
+		return
+	}
+	remaining := maxOutputTextEstimateBytes - st.decodeCtx.OutputTextEstimate.Len()
+	if remaining <= 0 {
+		return
+	}
+	if len(s) > remaining {
+		st.decodeCtx.OutputTextEstimate.WriteString(s[:remaining])
+		return
+	}
+	st.decodeCtx.OutputTextEstimate.WriteString(s)
+}
+
 func (st *StreamTranslator) recordStreamAccounting(ev StreamEvent) {
 	if ev.ResponseID != "" && st.encodeCtx.ResponseID == "" {
 		st.encodeCtx.ResponseID = ev.ResponseID
@@ -314,20 +641,14 @@ func (st *StreamTranslator) recordStreamAccounting(ev StreamEvent) {
 	if ev.Created > 0 && st.encodeCtx.Created == 0 {
 		st.encodeCtx.Created = ev.Created
 	}
-	if ev.Text != "" {
-		st.decodeCtx.OutputTextEstimate.WriteString(ev.Text)
-	}
-	if ev.Reasoning != "" {
-		st.decodeCtx.OutputTextEstimate.WriteString(ev.Reasoning)
-	}
-	if ev.ToolArguments != "" {
-		st.decodeCtx.OutputTextEstimate.WriteString(ev.ToolArguments)
-	}
+	st.appendOutputEstimate(ev.Text)
+	st.appendOutputEstimate(ev.Reasoning)
+	st.appendOutputEstimate(ev.ToolArguments)
 	if ev.Usage != nil {
 		st.decodeCtx.MergeUsage(ev.Usage)
 		st.encodeCtx.MergeUsage(ev.Usage)
 	}
-	if ev.Type == EventToolCallStart && ev.ToolCallID != "" {
+	if (ev.Type == EventToolCallStart || ev.Type == EventToolCallDelta) && ev.ToolCallID != "" {
 		st.decodeCtx.BridgeState.RecordToolCall(ToolCallBridgeEntry{
 			ToolCallID:       ev.ToolCallID,
 			ResponsesItemID:  ev.ToolCallItemID,
@@ -339,8 +660,9 @@ func (st *StreamTranslator) recordStreamAccounting(ev StreamEvent) {
 }
 
 func (st *StreamTranslator) persistBridge() {
-	if st.pipeline.bridge == nil {
+	if st.bridgePersisted || st.pipeline.bridge == nil {
 		return
 	}
+	st.bridgePersisted = true
 	st.pipeline.bridge.Save(st.pipeline.bridgeScope, st.decodeCtx.BridgeState)
 }

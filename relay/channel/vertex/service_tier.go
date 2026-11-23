@@ -19,10 +19,26 @@ const (
 	vertexFlexServerTimeoutSeconds = "1800"
 )
 
+// isOfficialGeminiModel reports whether the current request targets a Google-published Gemini model,
+// handling bare names ("gemini-2.5-pro") as well as prefixed IDs ("google/gemini-2.5-pro",
+// "publishers/google/models/gemini-2.5-pro").
+func (a *Adaptor) isOfficialGeminiModel(info *relaycommon.RelayInfo) bool {
+	if info == nil || info.ChannelMeta == nil || a.RequestMode != RequestModeGemini {
+		return false
+	}
+	if a.capability.Model != "" {
+		return a.capability.Publisher == "google" && strings.HasPrefix(strings.ToLower(a.capability.Model), "gemini")
+	}
+	model := strings.TrimSpace(info.UpstreamModelName)
+	model = strings.TrimPrefix(model, "publishers/google/models/")
+	model = strings.TrimPrefix(model, "google/")
+	return strings.HasPrefix(strings.ToLower(model), "gemini")
+}
+
 // useSharedScheduling 当前请求是否需要进入 Vertex 共享按量调度（PayGo / Flex / Priority）。
 // 仅对 gemini-* 官方原生模型生效，其余发布方（Claude/Llama 等）官方不支持层级切换，直接走原通道。
 func (a *Adaptor) useSharedScheduling(info *relaycommon.RelayInfo) bool {
-	if a.RequestMode != RequestModeGemini || !strings.HasPrefix(info.UpstreamModelName, "gemini") {
+	if !a.isOfficialGeminiModel(info) {
 		return false
 	}
 	return info.ChannelOtherSettings.VertexPayGoOnly || a.useNonStandardTier(info)
@@ -30,10 +46,7 @@ func (a *Adaptor) useSharedScheduling(info *relaycommon.RelayInfo) bool {
 
 // useNonStandardTier 当前请求是否启用了非标准层级（Flex / Priority）。
 func (a *Adaptor) useNonStandardTier(info *relaycommon.RelayInfo) bool {
-	if a.RequestMode != RequestModeGemini {
-		return false
-	}
-	if !strings.HasPrefix(info.UpstreamModelName, "gemini") {
+	if !a.isOfficialGeminiModel(info) {
 		return false
 	}
 	tier := info.ChannelOtherSettings.VertexServiceTier

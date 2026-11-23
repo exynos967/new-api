@@ -180,7 +180,7 @@ func (c *Codec) DecodeStreamEvent(_ string, rawData []byte, ctx *ir.StreamContex
 				Function: ch.Delta.FunctionCall,
 			}
 			if ch.Delta.FunctionCall.Name != "" {
-				legacyTC.ID = "call_legacy_0"
+				legacyTC.ID = ir.SynthesizeToolCallID("call_legacy")
 			}
 			events = append(events, decodeStreamToolCallDelta(ch.Index, legacyTC, ctx)...)
 		}
@@ -242,6 +242,12 @@ func decodeStreamToolCallDelta(choiceIdx int, tc chatStreamToolCallWire, ctx *ir
 		if kind == "" {
 			kind = "function"
 		}
+		var prevName string
+		if regIdx >= 0 && tc.ID == "" {
+			if existing := ctx.ToolCallsByIndex[regIdx]; existing != nil {
+				prevName = existing.Name
+			}
+		}
 		tracked, created := ctx.RegisterToolCall(regIdx, tc.ID, "", name, kind, "")
 		if created || !tracked.Started {
 			tracked.Started = true
@@ -253,6 +259,21 @@ func decodeStreamToolCallDelta(choiceIdx int, tc chatStreamToolCallWire, ctx *ir
 				ToolName:      tracked.Name,
 				ToolKind:      tracked.Kind,
 			})
+		} else if name != "" && prevName == "" {
+			// Split id/name chunks: propagate late-arriving function name via delta.
+			events = append(events, ir.StreamEvent{
+				Type:          ir.EventToolCallDelta,
+				ChoiceIndex:   choiceIdx,
+				ToolCallIndex: tracked.Index,
+				ToolCallID:    tracked.ID,
+				ToolName:      tracked.Name,
+				ToolKind:      tracked.Kind,
+				ToolArguments: args,
+			})
+			if args != "" {
+				tracked.Args.WriteString(args)
+			}
+			return events
 		}
 		if args != "" {
 			tracked.Args.WriteString(args)
@@ -307,6 +328,9 @@ func decodeStreamToolCallDelta(choiceIdx int, tc chatStreamToolCallWire, ctx *ir
 func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
 	if ctx == nil {
 		ctx = ir.NewStreamContext(ir.FormatUnknown, ir.FormatOpenAIChat)
+	}
+	if ctx.Ended {
+		return nil, nil
 	}
 
 	syncStreamEnvelope(ev, ctx)
@@ -393,6 +417,26 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 			}},
 		})
 
+	case ir.EventImage:
+		md := formatImageMarkdown(ev.Image)
+		if md == "" {
+			return nil, nil
+		}
+		role := startStreamIfNeeded(ctx)
+		return marshalChunkFrame(outStreamChunk{
+			ID:      ctx.ResponseID,
+			Object:  "chat.completion.chunk",
+			Created: ctx.Created,
+			Model:   ctx.Model,
+			Choices: []outStreamChoice{{
+				Index: ev.ChoiceIndex,
+				Delta: outStreamDelta{
+					Role:    role,
+					Content: &md,
+				},
+			}},
+		})
+
 	case ir.EventToolCallStart:
 		role := startStreamIfNeeded(ctx)
 		regIdx := ev.ToolCallIndex
@@ -407,7 +451,34 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 		if kind == "" {
 			kind = "function"
 		}
-		tracked, _ := ctx.RegisterToolCall(regIdx, ev.ToolCallID, ev.ToolCallItemID, ev.ToolName, kind, ev.ThoughtSignature)
+		tracked, created := ctx.RegisterToolCall(regIdx, ev.ToolCallID, ev.ToolCallItemID, ev.ToolName, kind, ev.ThoughtSignature)
+		if ev.BlockIndex >= 0 && tracked.BlockIndex < 0 {
+			tracked.BlockIndex = ev.BlockIndex
+		}
+		if !created && tracked.Started {
+			// Prevent duplicate start chunk that would corrupt concatenated function.name.
+			if ev.ToolArguments == "" {
+				return nil, nil
+			}
+			tracked.Args.WriteString(ev.ToolArguments)
+			args := ev.ToolArguments
+			var deltaTC outStreamToolCall
+			if tracked.Kind == "custom" {
+				deltaTC = outStreamToolCall{Index: tracked.Index, Custom: &outStreamToolCustom{Input: &args}}
+			} else {
+				deltaTC = outStreamToolCall{Index: tracked.Index, Function: &outStreamToolFunc{Arguments: &args}}
+			}
+			return marshalChunkFrame(outStreamChunk{
+				ID:      ctx.ResponseID,
+				Object:  "chat.completion.chunk",
+				Created: ctx.Created,
+				Model:   ctx.Model,
+				Choices: []outStreamChoice{{
+					Index: ev.ChoiceIndex,
+					Delta: outStreamDelta{Role: role, ToolCalls: []outStreamToolCall{deltaTC}},
+				}},
+			})
+		}
 		tracked.Started = true
 
 		initArgs := ev.ToolArguments
@@ -453,38 +524,65 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 		})
 
 	case ir.EventToolCallDelta:
-		if ev.ToolArguments == "" {
+		if ev.ToolArguments == "" && ev.ToolName == "" {
 			return nil, nil
 		}
 		role := startStreamIfNeeded(ctx)
 		tracked := ctx.LookupToolCall(ev.ToolCallIndex, ev.ToolCallID)
+		if tracked == nil && (ev.ToolCallID != "" || ev.ToolName != "") {
+			kind := ev.ToolKind
+			if kind == "" {
+				kind = "function"
+			}
+			tracked, _ = ctx.RegisterToolCall(ev.ToolCallIndex, ev.ToolCallID, ev.ToolCallItemID, ev.ToolName, kind, ev.ThoughtSignature)
+			tracked.Started = true
+		}
+		if tracked != nil && tracked.Closed {
+			return nil, nil
+		}
 		idx := ev.ToolCallIndex
 		kind := ev.ToolKind
+		emitName := ""
 		if tracked != nil {
 			idx = tracked.Index
 			if tracked.Kind != "" {
 				kind = tracked.Kind
 			}
-			tracked.Args.WriteString(ev.ToolArguments)
+			if ev.ToolName != "" && tracked.Name == "" {
+				tracked.Name = ev.ToolName
+				emitName = ev.ToolName
+			}
+			if ev.ToolArguments != "" {
+				tracked.Args.WriteString(ev.ToolArguments)
+			}
 		}
 		if idx < 0 {
 			idx = 0
 		}
 
 		args := ev.ToolArguments
+		var argsPtr *string
+		if args != "" {
+			argsPtr = &args
+		}
+		if argsPtr == nil && emitName == "" {
+			return nil, nil
+		}
 		var outTC outStreamToolCall
 		if kind == "custom" {
 			outTC = outStreamToolCall{
 				Index: idx,
 				Custom: &outStreamToolCustom{
-					Input: &args,
+					Name:  emitName,
+					Input: argsPtr,
 				},
 			}
 		} else {
 			outTC = outStreamToolCall{
 				Index: idx,
 				Function: &outStreamToolFunc{
-					Arguments: &args,
+					Name:      emitName,
+					Arguments: argsPtr,
 				},
 			}
 		}
@@ -502,6 +600,46 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 				},
 			}},
 		})
+
+	case ir.EventContentBlockEnd:
+		if ev.BlockType == ir.PartToolCall {
+			var tc *ir.TrackedToolCall
+			if ev.ToolCallID != "" {
+				tc = ctx.LookupToolCall(-1, ev.ToolCallID)
+			}
+			if tc == nil && ev.BlockIndex >= 0 {
+				tc = ctx.LookupToolCallByBlockIndex(ev.BlockIndex)
+			}
+			if tc == nil && ev.ToolCallIndex >= 0 {
+				tc = ctx.LookupToolCall(ev.ToolCallIndex, "")
+			}
+			if tc != nil && tc.Started && !tc.Closed {
+				tc.Closed = true
+				if tc.Kind != "custom" && tc.Args.Len() == 0 {
+					emptyObj := "{}"
+					tc.Args.WriteString(emptyObj)
+					ctx.EnsureEnvelope("chatcmpl")
+					return marshalChunkFrame(outStreamChunk{
+						ID:      ctx.ResponseID,
+						Object:  "chat.completion.chunk",
+						Created: ctx.Created,
+						Model:   ctx.Model,
+						Choices: []outStreamChoice{{
+							Index: ev.ChoiceIndex,
+							Delta: outStreamDelta{
+								ToolCalls: []outStreamToolCall{{
+									Index: tc.Index,
+									Function: &outStreamToolFunc{
+										Arguments: &emptyObj,
+									},
+								}},
+							},
+						}},
+					})
+				}
+			}
+		}
+		return nil, nil
 
 	case ir.EventFinish:
 		if !ctx.Started {
@@ -522,12 +660,22 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 		if ev.Usage != nil {
 			ctx.MergeUsage(ev.Usage)
 		}
-		if ctx.FinishEmitted {
+		if ctx.ChoiceFinishEmitted == nil {
+			ctx.ChoiceFinishEmitted = make(map[int]bool)
+		}
+		if ctx.ChoiceFinishEmitted[ev.ChoiceIndex] {
 			return nil, nil
 		}
+		var frames []ir.SSEFrame
+		if emptyFrames, err := emitEmptyToolArgDeltas(ctx, ev.ChoiceIndex); err != nil {
+			return nil, err
+		} else {
+			frames = append(frames, emptyFrames...)
+		}
 		wireFR := encodeFinishReason(fr)
+		ctx.ChoiceFinishEmitted[ev.ChoiceIndex] = true
 		ctx.FinishEmitted = true
-		return marshalChunkFrame(outStreamChunk{
+		finishFrames, err := marshalChunkFrame(outStreamChunk{
 			ID:      ctx.ResponseID,
 			Object:  "chat.completion.chunk",
 			Created: ctx.Created,
@@ -538,6 +686,11 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 				FinishReason: &wireFR,
 			}},
 		})
+		if err != nil {
+			return frames, err
+		}
+		frames = append(frames, finishFrames...)
+		return frames, nil
 
 	case ir.EventUsage:
 		if ev.Usage != nil {
@@ -556,6 +709,9 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 			})
 		}
 		return nil, nil
+
+	case ir.EventStreamEnd:
+		return c.FlushStream(ctx)
 
 	case ir.EventError:
 		errType := ev.ErrorType
@@ -577,6 +733,9 @@ func (c *Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 		if err != nil {
 			return nil, err
 		}
+		// Terminate stream so FlushStream never fabricates finish_reason:"stop" or [DONE] after an error.
+		ctx.FinishEmitted = true
+		ctx.Ended = true
 		return []ir.SSEFrame{{Data: data}}, nil
 
 	case ir.EventPassthrough:
@@ -606,6 +765,11 @@ func (c *Codec) FlushStream(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
 
 	if ctx.Started && !ctx.FinishEmitted {
 		ctx.EnsureEnvelope("chatcmpl")
+		if emptyFrames, err := emitEmptyToolArgDeltas(ctx, 0); err != nil {
+			return frames, err
+		} else {
+			frames = append(frames, emptyFrames...)
+		}
 		fr := ir.FinishStop
 		if ctx.PendingFinish != nil && *ctx.PendingFinish != "" {
 			fr = *ctx.PendingFinish
@@ -648,8 +812,46 @@ func (c *Codec) FlushStream(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
 		ctx.UsageEmitted = true
 	}
 
-	frames = append(frames, ir.SSEFrame{Data: []byte("[DONE]")})
+	if ctx.Started || ctx.FinishEmitted || ctx.UsageEmitted {
+		frames = append(frames, ir.SSEFrame{Data: []byte("[DONE]")})
+	}
 	ctx.Ended = true
+	return frames, nil
+}
+
+func emitEmptyToolArgDeltas(ctx *ir.StreamContext, choiceIndex int) ([]ir.SSEFrame, error) {
+	var frames []ir.SSEFrame
+	for _, tc := range ctx.ToolCallOrder {
+		if tc == nil || !tc.Started || tc.Closed {
+			continue
+		}
+		tc.Closed = true
+		if tc.Kind != "custom" && tc.Args.Len() == 0 {
+			emptyObj := "{}"
+			tc.Args.WriteString(emptyObj)
+			chunkFrames, err := marshalChunkFrame(outStreamChunk{
+				ID:      ctx.ResponseID,
+				Object:  "chat.completion.chunk",
+				Created: ctx.Created,
+				Model:   ctx.Model,
+				Choices: []outStreamChoice{{
+					Index: choiceIndex,
+					Delta: outStreamDelta{
+						ToolCalls: []outStreamToolCall{{
+							Index: tc.Index,
+							Function: &outStreamToolFunc{
+								Arguments: &emptyObj,
+							},
+						}},
+					},
+				}},
+			})
+			if err != nil {
+				return frames, err
+			}
+			frames = append(frames, chunkFrames...)
+		}
+	}
 	return frames, nil
 }
 

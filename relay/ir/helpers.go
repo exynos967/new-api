@@ -15,8 +15,12 @@ func ConvertPayload(sourceFormat, targetFormat Format, sourceReq any, targetShim
 	if err != nil {
 		return nil, fmt.Errorf("ir: marshal source %s request: %w", sourceFormat, err)
 	}
+	var bridge *TurnBridge
+	if bridgeScope != "" {
+		bridge = DefaultTurnBridge()
+	}
 	p, err := NewPipeline(PipelineConfig{
-		Bridge:       DefaultTurnBridge(),
+		Bridge:       bridge,
 		BridgeScope:  bridgeScope,
 		SourceFormat: sourceFormat,
 		TargetFormat: targetFormat,

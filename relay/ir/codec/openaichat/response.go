@@ -30,13 +30,15 @@ type chatResponseChoiceWire struct {
 }
 
 type chatUsageWire struct {
-	PromptTokens            int                        `json:"prompt_tokens"`
-	CompletionTokens        int                        `json:"completion_tokens"`
-	TotalTokens             int                        `json:"total_tokens"`
-	PromptCacheHitTokens    int                        `json:"prompt_cache_hit_tokens,omitempty"`
-	PromptCacheMissTokens   int                        `json:"prompt_cache_miss_tokens,omitempty"`
-	PromptTokensDetails     *chatPromptTokenDetails    `json:"prompt_tokens_details,omitempty"`
-	CompletionTokensDetails *chatCompletionTokenDetail `json:"completion_tokens_details,omitempty"`
+	PromptTokens                int                        `json:"prompt_tokens"`
+	CompletionTokens            int                        `json:"completion_tokens"`
+	TotalTokens                 int                        `json:"total_tokens"`
+	PromptCacheHitTokens        int                        `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens       int                        `json:"prompt_cache_miss_tokens,omitempty"`
+	ClaudeCacheCreation5mTokens int                        `json:"claude_cache_creation_5_m_tokens,omitempty"`
+	ClaudeCacheCreation1hTokens int                        `json:"claude_cache_creation_1_h_tokens,omitempty"`
+	PromptTokensDetails         *chatPromptTokenDetails    `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails     *chatCompletionTokenDetail `json:"completion_tokens_details,omitempty"`
 }
 
 type chatPromptTokenDetails struct {
@@ -185,6 +187,18 @@ func (c *Codec) EncodeResponse(resp *ir.Response, ctx *ir.ConversionContext) ([]
 			case ir.PartText:
 				textBuf.WriteString(p.Text)
 				hasText = true
+			case ir.PartImage:
+				if p.Image != nil {
+					if md := formatImageMarkdown(p.Image); md != "" {
+						if textBuf.Len() > 0 {
+							textBuf.WriteByte('\n')
+						}
+						textBuf.WriteString(md)
+						hasText = true
+					}
+				}
+			case ir.PartAudio, ir.PartFile:
+				ctx.AddWarning("unsupported_response_part", "choices.message.content", fmt.Sprintf("OpenAI Chat Completions text response cannot carry %q part natively", p.Type))
 			case ir.PartReasoning:
 				if p.Reasoning == nil {
 					continue
@@ -295,7 +309,7 @@ func encodeToolCallWire(tc *ir.ToolCall) chatToolCall {
 		}
 	}
 	args := tc.Arguments
-	if args == "" {
+	if strings.TrimSpace(args) == "" {
 		args = "{}"
 	}
 	return chatToolCall{
@@ -308,15 +322,34 @@ func encodeToolCallWire(tc *ir.ToolCall) chatToolCall {
 	}
 }
 
+func formatImageMarkdown(img *ir.ImageSource) string {
+	if img == nil {
+		return ""
+	}
+	if img.URL != "" {
+		return fmt.Sprintf("![image](%s)", img.URL)
+	}
+	if img.Data != "" {
+		mt := img.MediaType
+		if mt == "" {
+			mt = "image/png"
+		}
+		return fmt.Sprintf("![image](data:%s;base64,%s)", mt, img.Data)
+	}
+	return ""
+}
+
 func decodeUsage(u *chatUsageWire) *ir.Usage {
 	if u == nil {
 		return nil
 	}
 	out := &ir.Usage{
-		InputTokens:    u.PromptTokens,
-		OutputTokens:   u.CompletionTokens,
-		TotalTokens:    u.TotalTokens,
-		InputExclusive: false,
+		InputTokens:           u.PromptTokens,
+		OutputTokens:          u.CompletionTokens,
+		TotalTokens:           u.TotalTokens,
+		InputExclusive:        false,
+		CacheCreation5mTokens: u.ClaudeCacheCreation5mTokens,
+		CacheCreation1hTokens: u.ClaudeCacheCreation1hTokens,
 	}
 	if u.PromptTokensDetails != nil {
 		d := u.PromptTokensDetails
@@ -333,6 +366,9 @@ func decodeUsage(u *chatUsageWire) *ir.Usage {
 			out.CacheCreationTokens = d.CachedCreationTokens
 		}
 	}
+	if out.CacheCreationTokens == 0 && (out.CacheCreation5mTokens > 0 || out.CacheCreation1hTokens > 0) {
+		out.CacheCreationTokens = out.CacheCreation5mTokens + out.CacheCreation1hTokens
+	}
 	// DeepSeek compatibility fallback when prompt_tokens_details.cached_tokens is absent.
 	if out.CachedReadTokens == 0 && u.PromptCacheHitTokens > 0 {
 		out.CachedReadTokens = u.PromptCacheHitTokens
@@ -344,7 +380,7 @@ func decodeUsage(u *chatUsageWire) *ir.Usage {
 		out.AudioOutputTokens = d.AudioTokens
 		out.ImageOutputTokens = d.ImageTokens
 	}
-	if out.TotalTokens == 0 && (out.InputTokens > 0 || out.OutputTokens > 0) {
+	if out.TotalTokens < out.InputTokens+out.OutputTokens {
 		out.TotalTokens = out.InputTokens + out.OutputTokens
 	}
 	return out
@@ -357,14 +393,16 @@ func encodeUsage(u *ir.Usage) *chatUsageWire {
 	promptTokens := u.InclusiveInputTokens()
 	completionTokens := u.OutputTokens
 	totalTokens := u.TotalTokens
-	if totalTokens == 0 || (u.InputExclusive && totalTokens < promptTokens+completionTokens) {
+	if totalTokens < promptTokens+completionTokens {
 		totalTokens = promptTokens + completionTokens
 	}
 
 	out := &chatUsageWire{
-		PromptTokens:     promptTokens,
-		CompletionTokens: completionTokens,
-		TotalTokens:      totalTokens,
+		PromptTokens:                promptTokens,
+		CompletionTokens:            completionTokens,
+		TotalTokens:                 totalTokens,
+		ClaudeCacheCreation5mTokens: u.CacheCreation5mTokens,
+		ClaudeCacheCreation1hTokens: u.CacheCreation1hTokens,
 	}
 
 	if u.CachedReadTokens > 0 || u.CacheCreationTokens > 0 || u.TextInputTokens > 0 || u.AudioInputTokens > 0 || u.ImageInputTokens > 0 {

@@ -6,12 +6,21 @@ import (
 	"errors"
 	"io"
 	"strings"
+
+	"github.com/QuantumNous/new-api/constant"
 )
 
 const (
 	defaultSSEInitBuf = 64 * 1024
 	defaultSSEMaxBuf  = 64 * 1024 * 1024
 )
+
+func configuredSSEMaxBuf() int {
+	if constant.StreamScannerMaxBufferMB > 0 {
+		return constant.StreamScannerMaxBufferMB << 20
+	}
+	return defaultSSEMaxBuf
+}
 
 // FormatSSEFrame encodes an SSEFrame into standard "\n\n"-delimited SSE wire bytes.
 func FormatSSEFrame(frame SSEFrame) []byte {
@@ -36,22 +45,32 @@ func FormatSSEFrame(frame SSEFrame) []byte {
 
 // SSEReader reads complete SSE frames while preserving both event names and multi-line data payloads.
 type SSEReader struct {
-	reader *bufio.Reader
-	maxBuf int
+	reader  *bufio.Reader
+	maxBuf  int
+	dataBuf bytes.Buffer
+	lineBuf bytes.Buffer
 }
 
 // NewSSEReader wraps an io.Reader with a streaming SSE frame parser.
 func NewSSEReader(r io.Reader) *SSEReader {
+	return NewSSEReaderWithMaxBuf(r, configuredSSEMaxBuf())
+}
+
+// NewSSEReaderWithMaxBuf wraps an io.Reader with an explicit per-event maximum buffer size.
+func NewSSEReaderWithMaxBuf(r io.Reader, maxBuf int) *SSEReader {
+	if maxBuf <= 0 {
+		maxBuf = configuredSSEMaxBuf()
+	}
 	return &SSEReader{
 		reader: bufio.NewReaderSize(r, defaultSSEInitBuf),
-		maxBuf: defaultSSEMaxBuf,
+		maxBuf: maxBuf,
 	}
 }
 
 // Next returns the next SSE frame (event name, data bytes).
 // Returns io.EOF when the underlying stream ends cleanly.
 func (s *SSEReader) Next() (eventName string, data []byte, err error) {
-	var dataBuf bytes.Buffer
+	s.dataBuf.Reset()
 	hasData := false
 
 	for {
@@ -65,7 +84,7 @@ func (s *SSEReader) Next() (eventName string, data []byte, err error) {
 
 		if line == "" {
 			if hasData {
-				return eventName, bytes.Clone(dataBuf.Bytes()), nil
+				return eventName, bytes.Clone(s.dataBuf.Bytes()), nil
 			}
 			eventName = ""
 			if errors.Is(readErr, io.EOF) {
@@ -78,7 +97,7 @@ func (s *SSEReader) Next() (eventName string, data []byte, err error) {
 		if strings.HasPrefix(line, ":") {
 			if errors.Is(readErr, io.EOF) {
 				if hasData {
-					return eventName, bytes.Clone(dataBuf.Bytes()), nil
+					return eventName, bytes.Clone(s.dataBuf.Bytes()), nil
 				}
 				return "", nil, io.EOF
 			}
@@ -92,16 +111,23 @@ func (s *SSEReader) Next() (eventName string, data []byte, err error) {
 			if strings.HasPrefix(payload, " ") {
 				payload = payload[1:]
 			}
+			addLen := len(payload)
 			if hasData {
-				dataBuf.WriteByte('\n')
+				addLen++ // newline separator
 			}
-			dataBuf.WriteString(payload)
+			if s.dataBuf.Len()+addLen > s.maxBuf {
+				return "", nil, errors.New("ir: SSE event exceeds maximum buffer size")
+			}
+			if hasData {
+				s.dataBuf.WriteByte('\n')
+			}
+			s.dataBuf.WriteString(payload)
 			hasData = true
 		}
 
 		if errors.Is(readErr, io.EOF) {
 			if hasData {
-				return eventName, bytes.Clone(dataBuf.Bytes()), nil
+				return eventName, bytes.Clone(s.dataBuf.Bytes()), nil
 			}
 			return "", nil, io.EOF
 		}
@@ -109,23 +135,23 @@ func (s *SSEReader) Next() (eventName string, data []byte, err error) {
 }
 
 func (s *SSEReader) readLine() (string, error) {
-	var full bytes.Buffer
+	s.lineBuf.Reset()
 	for {
 		fragment, isPrefix, err := s.reader.ReadLine()
 		if len(fragment) > 0 {
-			if full.Len()+len(fragment) > s.maxBuf {
+			if s.lineBuf.Len()+len(fragment) > s.maxBuf {
 				return "", errors.New("ir: SSE line exceeds maximum buffer size")
 			}
-			full.Write(fragment)
+			s.lineBuf.Write(fragment)
 		}
 		if err != nil {
-			if errors.Is(err, io.EOF) && full.Len() > 0 {
-				return full.String(), io.EOF
+			if errors.Is(err, io.EOF) && s.lineBuf.Len() > 0 {
+				return s.lineBuf.String(), io.EOF
 			}
 			return "", err
 		}
 		if !isPrefix {
-			return full.String(), nil
+			return s.lineBuf.String(), nil
 		}
 	}
 }

@@ -786,11 +786,13 @@ func decodeGoogleGenerationConfig(gc *googleGenerationConfig, req *ir.Request) {
 			rc.Enabled = boolPtr(true)
 			rc.Mode = "enabled"
 		case tc.IncludeThoughts != nil:
-			rc.Enabled = boolPtr(*tc.IncludeThoughts)
 			if *tc.IncludeThoughts {
+				rc.Enabled = boolPtr(true)
 				rc.Mode = "enabled"
 			} else {
-				rc.Mode = "disabled"
+				// includeThoughts=false only hides thoughts from output; do NOT synthesize Mode="disabled"
+				// (which would emit thinkingBudget=0 and fail on Gemini 2.5 Pro / 3 Pro).
+				rc.Display = "omitted"
 			}
 		}
 		if tc.IncludeThoughts != nil && !*tc.IncludeThoughts && rc.Mode != "disabled" {
@@ -808,15 +810,20 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 		return nil, errors.New("google: nil IR request")
 	}
 
-	// Pre-scan tool call ID -> function name mapping across the entire conversation.
-	toolNameByID := make(map[string]string)
+	// Fallback full-conversation toolNameByID map (used only if a tool_result references an ID
+	// not yet seen chronologically); live map updates chronologically so duplicate IDs across turns
+	// resolve to their own turn's tool call rather than a later turn's overwrite.
+	fallbackToolNameByID := make(map[string]string)
 	for _, msg := range req.Messages {
 		for _, part := range msg.Parts {
 			if part.Type == ir.PartToolCall && part.ToolCall != nil && part.ToolCall.ID != "" && part.ToolCall.Name != "" {
-				toolNameByID[part.ToolCall.ID] = part.ToolCall.Name
+				if _, exists := fallbackToolNameByID[part.ToolCall.ID]; !exists {
+					fallbackToolNameByID[part.ToolCall.ID] = part.ToolCall.Name
+				}
 			}
 		}
 	}
+	toolNameByID := make(map[string]string)
 
 	// Build systemInstruction from req.System and system/developer messages.
 	var sysParts []googlePart
@@ -843,7 +850,7 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 		gReq.SystemInstruction = &googleContent{Parts: sysParts}
 	}
 
-	// Encode messages and merge adjacent same-role contents to preserve Gemini role alternation.
+	// Encode messages chronologically and merge adjacent same-role contents to preserve Gemini role alternation.
 	for _, msg := range req.Messages {
 		if msg.Role == ir.RoleSystem || msg.Role == ir.RoleDeveloper {
 			continue
@@ -853,9 +860,16 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 			role = "model"
 		}
 
+		// Record assistant tool calls as we encounter them chronologically.
+		for _, p := range msg.Parts {
+			if p.Type == ir.PartToolCall && p.ToolCall != nil && p.ToolCall.ID != "" && p.ToolCall.Name != "" {
+				toolNameByID[p.ToolCall.ID] = p.ToolCall.Name
+			}
+		}
+
 		parts := make([]googlePart, 0, len(msg.Parts))
 		for _, p := range msg.Parts {
-			encoded, ok := encodeRequestPart(p, toolNameByID, ctx)
+			encoded, ok := encodeRequestPart(p, toolNameByID, fallbackToolNameByID, ctx)
 			if ok {
 				parts = append(parts, encoded)
 			}
@@ -872,6 +886,19 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 				Parts: parts,
 			})
 		}
+	}
+
+	// Gemini requires non-empty contents starting with a "user" turn.
+	if len(gReq.Contents) == 0 {
+		gReq.Contents = []googleContent{{
+			Role:  "user",
+			Parts: []googlePart{{Text: strPtr("...")}},
+		}}
+	} else if gReq.Contents[0].Role != "user" {
+		gReq.Contents = append([]googleContent{{
+			Role:  "user",
+			Parts: []googlePart{{Text: strPtr("...")}},
+		}}, gReq.Contents...)
 	}
 
 	// Enforce Gemini 3 thoughtSignature requirement on the first functionCall in each model turn.
@@ -914,13 +941,25 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 	return json.Marshal(gReq)
 }
 
-func encodeRequestPart(p ir.ContentPart, toolNameByID map[string]string, ctx *ir.ConversionContext) (googlePart, bool) {
+func encodeRequestPart(p ir.ContentPart, toolNameByID map[string]string, fallbackToolNameByID map[string]string, ctx *ir.ConversionContext) (googlePart, bool) {
 	switch p.Type {
 	case ir.PartText:
-		if p.Text == "" {
+		var sig string
+		if p.ProviderMetadata != nil {
+			if s, ok := p.ProviderMetadata["thought_signature"].(string); ok && s != "" {
+				if ctx == nil || ctx.ShouldPreserveMetadata(ir.FormatGoogleGenAI) {
+					sig = s
+				}
+			}
+		}
+		if p.Text == "" && sig == "" {
 			return googlePart{}, false
 		}
-		return googlePart{Text: strPtr(p.Text)}, true
+		gp := googlePart{ThoughtSignature: sig}
+		if p.Text != "" {
+			gp.Text = strPtr(p.Text)
+		}
+		return gp, true
 
 	case ir.PartRefusal:
 		if p.Refusal == "" {
@@ -932,12 +971,15 @@ func encodeRequestPart(p ir.ContentPart, toolNameByID map[string]string, ctx *ir
 		if p.Reasoning == nil {
 			return googlePart{}, false
 		}
-		if p.Reasoning.OriginFormat == ir.FormatGoogleGenAI && p.Reasoning.Text != "" {
-			return googlePart{
-				Text:             strPtr(p.Reasoning.Text),
+		if p.Reasoning.OriginFormat == ir.FormatGoogleGenAI && (p.Reasoning.Text != "" || p.Reasoning.Signature != "") {
+			gp := googlePart{
 				Thought:          true,
 				ThoughtSignature: p.Reasoning.Signature,
-			}, true
+			}
+			if p.Reasoning.Text != "" {
+				gp.Text = strPtr(p.Reasoning.Text)
+			}
+			return gp, true
 		}
 		if p.Reasoning.OriginFormat != ir.FormatGoogleGenAI {
 			ctx.AddWarning(
@@ -1019,6 +1061,9 @@ func encodeRequestPart(p ir.ContentPart, toolNameByID map[string]string, ctx *ir
 		if p.File == nil {
 			return googlePart{}, false
 		}
+		if p.File.Text != "" && p.File.Data == "" && p.File.URL == "" && p.File.FileID == "" {
+			return googlePart{Text: strPtr(p.File.Text)}, true
+		}
 		if p.File.Data != "" {
 			mime := p.File.MediaType
 			if mime == "" {
@@ -1062,14 +1107,14 @@ func encodeRequestPart(p ir.ContentPart, toolNameByID map[string]string, ctx *ir
 		if p.ToolResult == nil {
 			return googlePart{}, false
 		}
-		name := resolveToolResultName(p.ToolResult, toolNameByID, ctx)
+		name := resolveToolResultName(p.ToolResult, toolNameByID, fallbackToolNameByID, ctx)
 		respObj := buildFunctionResponseObject(p.ToolResult)
 		var subParts []googlePart
 		for _, sp := range p.ToolResult.Parts {
 			if sp.Type == ir.PartText {
 				continue
 			}
-			if encodedSub, ok := encodeRequestPart(sp, toolNameByID, ctx); ok {
+			if encodedSub, ok := encodeRequestPart(sp, toolNameByID, fallbackToolNameByID, ctx); ok {
 				subParts = append(subParts, encodedSub)
 			}
 		}
@@ -1087,13 +1132,18 @@ func encodeRequestPart(p ir.ContentPart, toolNameByID map[string]string, ctx *ir
 	}
 }
 
-func resolveToolResultName(tr *ir.ToolResult, toolNameByID map[string]string, ctx *ir.ConversionContext) string {
+func resolveToolResultName(tr *ir.ToolResult, toolNameByID map[string]string, fallbackToolNameByID map[string]string, ctx *ir.ConversionContext) string {
 	if tr.Name != "" {
 		return tr.Name
 	}
 	if tr.ToolCallID != "" {
 		if name := toolNameByID[tr.ToolCallID]; name != "" {
 			return name
+		}
+		if fallbackToolNameByID != nil {
+			if name := fallbackToolNameByID[tr.ToolCallID]; name != "" {
+				return name
+			}
 		}
 		if ctx != nil && ctx.BridgeState != nil {
 			if entry, ok := ctx.BridgeState.ToolCalls[tr.ToolCallID]; ok && entry.ToolName != "" {
@@ -1247,9 +1297,12 @@ func encodeGoogleToolConfig(tc *ir.ToolChoice) *googleToolConfig {
 	fcc := &googleFunctionCallingConfig{}
 	switch strings.ToLower(strings.TrimSpace(tc.Mode)) {
 	case "auto":
-		fcc.Mode = "AUTO"
+		// Gemini rejects allowedFunctionNames when mode == "AUTO"; use "VALIDATED" if restricted.
 		if len(tc.AllowedTools) > 0 {
+			fcc.Mode = "VALIDATED"
 			fcc.AllowedFunctionNames = tc.AllowedTools
+		} else {
+			fcc.Mode = "AUTO"
 		}
 	case "none":
 		fcc.Mode = "NONE"
@@ -1270,7 +1323,7 @@ func encodeGoogleToolConfig(tc *ir.ToolChoice) *googleToolConfig {
 			fcc.Mode = "ANY"
 			fcc.AllowedFunctionNames = []string{tc.ToolName}
 		} else if len(tc.AllowedTools) > 0 {
-			fcc.Mode = "AUTO"
+			fcc.Mode = "VALIDATED"
 			fcc.AllowedFunctionNames = tc.AllowedTools
 		} else {
 			return nil
@@ -1351,18 +1404,24 @@ func encodeGoogleThinkingConfig(rc *ir.ReasoningConfig) *googleThinkingConfig {
 		}
 	}
 
-	includeThoughts := true
+	tc := &googleThinkingConfig{}
 	if strings.EqualFold(rc.Display, "omitted") {
-		includeThoughts = false
-	}
-	tc := &googleThinkingConfig{
-		IncludeThoughts: boolPtr(includeThoughts),
+		tc.IncludeThoughts = boolPtr(false)
+	} else if (rc.Enabled != nil && *rc.Enabled) ||
+		strings.EqualFold(rc.Mode, "enabled") ||
+		strings.EqualFold(rc.Mode, "adaptive") ||
+		rc.BudgetTokens != nil ||
+		effortLower != "" {
+		tc.IncludeThoughts = boolPtr(true)
 	}
 	if rc.BudgetTokens != nil {
 		b := *rc.BudgetTokens
 		tc.ThinkingBudget = &b
 	} else if effortLower != "" {
 		tc.ThinkingLevel = mapEffortToGoogleThinkingLevel(effortLower)
+	}
+	if tc.IncludeThoughts == nil && tc.ThinkingBudget == nil && tc.ThinkingLevel == "" {
+		return nil
 	}
 	return tc
 }
@@ -1416,9 +1475,20 @@ var geminiUnsupportedSchemaKeys = map[string]struct{}{
 	"unevaluatedItems":      {},
 }
 
+const (
+	maxGeminiSchemaDepth = 20
+	maxGeminiSchemaNodes = 2000
+)
+
+type schemaSanitizeState struct {
+	defs     map[string]map[string]any
+	visiting map[string]bool
+	nodes    int
+}
+
 // sanitizeGeminiSchema recursively removes JSON Schema keywords rejected by Gemini's
-// OpenAPI 3.0 schema validator, inlines local $ref/$defs pointers when possible, and
-// preserves user-defined property keys inside "properties".
+// OpenAPI 3.0 schema validator, inlines local $ref/$defs pointers with depth/node limits,
+// flattens unsupported oneOf/allOf composites, and preserves user property keys inside "properties".
 func sanitizeGeminiSchema(raw json.RawMessage) json.RawMessage {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -1428,8 +1498,11 @@ func sanitizeGeminiSchema(raw json.RawMessage) json.RawMessage {
 	if err := json.Unmarshal(trimmed, &root); err != nil {
 		return raw
 	}
-	defs := collectSchemaDefs(root)
-	cleaned := sanitizeSchemaNode(root, defs, make(map[string]bool))
+	state := &schemaSanitizeState{
+		defs:     collectSchemaDefs(root),
+		visiting: make(map[string]bool),
+	}
+	cleaned := sanitizeSchemaNode(root, state, 0)
 	out, err := json.Marshal(cleaned)
 	if err != nil {
 		return raw
@@ -1451,18 +1524,21 @@ func collectSchemaDefs(root map[string]any) map[string]map[string]any {
 	return defs
 }
 
-func sanitizeSchemaNode(node map[string]any, defs map[string]map[string]any, visiting map[string]bool) map[string]any {
+func sanitizeSchemaNode(node map[string]any, state *schemaSanitizeState, depth int) map[string]any {
 	if node == nil {
 		return nil
 	}
+	state.nodes++
+	if depth > maxGeminiSchemaDepth || state.nodes > maxGeminiSchemaNodes {
+		return map[string]any{"type": "object"}
+	}
 
 	// Inline local $ref if present and resolvable without cycles.
-	if refStr, ok := node["$ref"].(string); ok && refStr != "" && !visiting[refStr] {
-		if target, exists := defs[refStr]; exists {
-			visiting[refStr] = true
-			resolved := sanitizeSchemaNode(target, defs, visiting)
-			delete(visiting, refStr)
-			// Preserve sibling description if provided alongside $ref.
+	if refStr, ok := node["$ref"].(string); ok && refStr != "" && !state.visiting[refStr] {
+		if target, exists := state.defs[refStr]; exists {
+			state.visiting[refStr] = true
+			resolved := sanitizeSchemaNode(target, state, depth+1)
+			delete(state.visiting, refStr)
 			if desc, ok := node["description"].(string); ok && desc != "" {
 				resolved["description"] = desc
 			}
@@ -1478,9 +1554,11 @@ func sanitizeSchemaNode(node map[string]any, defs map[string]map[string]any, vis
 
 		switch k {
 		case "const":
-			// Convert JSON Schema `const` to single-element `enum` when not already set.
+			// Gemini only permits string values in enum; convert string const to single-element enum.
 			if _, hasEnum := node["enum"]; !hasEnum && v != nil {
-				out["enum"] = []any{v}
+				if s, ok := v.(string); ok {
+					out["enum"] = []any{s}
+				}
 			}
 
 		case "type":
@@ -1512,7 +1590,7 @@ func sanitizeSchemaNode(node map[string]any, defs map[string]map[string]any, vis
 				cleanProps := make(map[string]any, len(props))
 				for propName, propVal := range props {
 					if propMap, ok := propVal.(map[string]any); ok {
-						cleanProps[propName] = sanitizeSchemaNode(propMap, defs, visiting)
+						cleanProps[propName] = sanitizeSchemaNode(propMap, state, depth+1)
 					} else {
 						cleanProps[propName] = propVal
 					}
@@ -1522,16 +1600,16 @@ func sanitizeSchemaNode(node map[string]any, defs map[string]map[string]any, vis
 
 		case "items":
 			if itemMap, ok := v.(map[string]any); ok {
-				out["items"] = sanitizeSchemaNode(itemMap, defs, visiting)
+				out["items"] = sanitizeSchemaNode(itemMap, state, depth+1)
 			} else if itemList, ok := v.([]any); ok && len(itemList) > 0 {
 				if firstMap, ok := itemList[0].(map[string]any); ok {
-					out["items"] = sanitizeSchemaNode(firstMap, defs, visiting)
+					out["items"] = sanitizeSchemaNode(firstMap, state, depth+1)
 				}
 			}
 
 		case "anyOf", "oneOf", "allOf":
 			if arr, ok := v.([]any); ok {
-				sanitizedBranch, simplified := sanitizeCompositeSchema(k, arr, defs, visiting)
+				sanitizedBranch, simplified := sanitizeCompositeSchema(k, arr, state, depth+1)
 				if simplified != nil {
 					for sk, sv := range simplified {
 						if _, exists := out[sk]; !exists {
@@ -1539,13 +1617,14 @@ func sanitizeSchemaNode(node map[string]any, defs map[string]map[string]any, vis
 						}
 					}
 				} else if len(sanitizedBranch) > 0 {
-					out[k] = sanitizedBranch
+					// Gemini supports anyOf but rejects oneOf/allOf; map surviving oneOf branches to anyOf.
+					out["anyOf"] = sanitizedBranch
 				}
 			}
 
 		default:
 			if subMap, ok := v.(map[string]any); ok {
-				out[k] = sanitizeSchemaNode(subMap, defs, visiting)
+				out[k] = sanitizeSchemaNode(subMap, state, depth+1)
 			} else {
 				out[k] = v
 			}
@@ -1555,7 +1634,23 @@ func sanitizeSchemaNode(node map[string]any, defs map[string]map[string]any, vis
 	return out
 }
 
-func sanitizeCompositeSchema(keyword string, branches []any, defs map[string]map[string]any, visiting map[string]bool) ([]any, map[string]any) {
+func isNullSchemaBranch(bm map[string]any) bool {
+	t, ok := bm["type"].(string)
+	if !ok || !strings.EqualFold(t, "null") {
+		return false
+	}
+	for k := range bm {
+		switch k {
+		case "type", "title", "description", "default", "examples", "$comment":
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func sanitizeCompositeSchema(keyword string, branches []any, state *schemaSanitizeState, depth int) ([]any, map[string]any) {
 	var nonNull []map[string]any
 	hasNull := false
 	for _, b := range branches {
@@ -1563,13 +1658,60 @@ func sanitizeCompositeSchema(keyword string, branches []any, defs map[string]map
 		if !ok {
 			continue
 		}
-		if t, ok := bm["type"].(string); ok && t == "null" && len(bm) == 1 {
+		if isNullSchemaBranch(bm) {
 			hasNull = true
 			continue
 		}
-		nonNull = append(nonNull, sanitizeSchemaNode(bm, defs, visiting))
+		nonNull = append(nonNull, sanitizeSchemaNode(bm, state, depth))
 	}
-	// Simplify common nullable union: anyOf/oneOf: [<schema>, {"type": "null"}] -> <schema> + nullable: true
+
+	// Flatten allOf into a single merged schema (Gemini rejects allOf).
+	if keyword == "allOf" && len(nonNull) > 0 {
+		merged := make(map[string]any)
+		mergedProps := make(map[string]any)
+		var mergedReq []any
+		reqSeen := make(map[string]bool)
+		for _, m := range nonNull {
+			for k, v := range m {
+				switch k {
+				case "properties":
+					if pm, ok := v.(map[string]any); ok {
+						for pk, pv := range pm {
+							mergedProps[pk] = pv
+						}
+					}
+				case "required":
+					if rl, ok := v.([]any); ok {
+						for _, rv := range rl {
+							if rs, ok := rv.(string); ok && !reqSeen[rs] {
+								reqSeen[rs] = true
+								mergedReq = append(mergedReq, rs)
+							}
+						}
+					}
+				default:
+					if _, exists := merged[k]; !exists {
+						merged[k] = v
+					}
+				}
+			}
+		}
+		if len(mergedProps) > 0 {
+			merged["properties"] = mergedProps
+			if _, hasType := merged["type"]; !hasType {
+				merged["type"] = "object"
+			}
+		}
+		if len(mergedReq) > 0 {
+			merged["required"] = mergedReq
+		}
+		if hasNull {
+			merged["nullable"] = true
+		}
+		return nil, merged
+	}
+
+	// Simplify common nullable union: anyOf/oneOf: [<schema>, {"type": "null", ...}] -> <schema> + nullable: true
 	if (keyword == "anyOf" || keyword == "oneOf") && hasNull && len(nonNull) == 1 {
 		merged := nonNull[0]
 		merged["nullable"] = true

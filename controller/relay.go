@@ -150,6 +150,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if c.GetBool("openrouter_response_committed") && c.Writer.Written() {
 				return
 			}
+			if c.GetBool("ir_response_committed") && c.Writer.Written() {
+				return
+			}
 			if c.GetBool("qianwen_audio_committed") && c.Writer.Written() {
 				return // Do not append JSON to an audio binary stream or an SSE error.
 			}
@@ -534,6 +537,9 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 
 func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
 	if c.GetBool("openrouter_response_committed") && c.Writer.Written() {
+		return false
+	}
+	if c.GetBool("ir_response_committed") && c.Writer.Written() {
 		return false
 	}
 	if c.GetBool("vertex_batch_started") || (common.GetContextKeyInt(c, constant.ContextKeyChannelType) == constant.ChannelTypeVertexAi && c.Writer.Written()) {

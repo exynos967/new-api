@@ -3,6 +3,7 @@ package model_setting
 import (
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/QuantumNous/new-api/setting/config"
 )
@@ -39,8 +40,17 @@ type GlobalSettings struct {
 	ChatCompletionsToResponsesPolicy ChatCompletionsToResponsesPolicy `json:"chat_completions_to_responses_policy"`
 }
 
-// 默认配置
-var defaultOpenaiSettings = GlobalSettings{
+// globalSettingsMu protects concurrent access to globalSettings while keeping GlobalSettings
+// a value-copyable struct (preserving compatibility with callers/tests that snapshot *GetGlobalSettings()).
+var globalSettingsMu sync.RWMutex
+
+func (*GlobalSettings) ConfigRLock()   { globalSettingsMu.RLock() }
+func (*GlobalSettings) ConfigRUnlock() { globalSettingsMu.RUnlock() }
+func (*GlobalSettings) ConfigLock()    { globalSettingsMu.Lock() }
+func (*GlobalSettings) ConfigUnlock()  { globalSettingsMu.Unlock() }
+
+// 全局实例
+var globalSettings = GlobalSettings{
 	PassThroughRequestEnabled: false,
 	IRConversionEnabled:       true,
 	ThinkingModelBlacklist: []string{
@@ -53,9 +63,6 @@ var defaultOpenaiSettings = GlobalSettings{
 	},
 }
 
-// 全局实例
-var globalSettings = defaultOpenaiSettings
-
 func init() {
 	// 注册到全局配置管理器
 	config.GlobalConfig.Register("global", &globalSettings)
@@ -67,7 +74,17 @@ func GetGlobalSettings() *GlobalSettings {
 
 // IsIRConversionEnabled 判断是否启用 IR 跨协议转换引擎
 func IsIRConversionEnabled() bool {
-	return GetGlobalSettings().IRConversionEnabled
+	globalSettingsMu.RLock()
+	enabled := globalSettings.IRConversionEnabled
+	globalSettingsMu.RUnlock()
+	return enabled
+}
+
+// SetIRConversionEnabled 并发安全地切换 IR 跨协议转换引擎开关
+func SetIRConversionEnabled(enabled bool) {
+	globalSettingsMu.Lock()
+	globalSettings.IRConversionEnabled = enabled
+	globalSettingsMu.Unlock()
 }
 
 // ShouldPreserveThinkingSuffix 判断模型是否配置为保留 thinking/-nothinking/-low/-high/-medium 后缀
@@ -77,6 +94,8 @@ func ShouldPreserveThinkingSuffix(modelName string) bool {
 		return false
 	}
 
+	globalSettingsMu.RLock()
+	defer globalSettingsMu.RUnlock()
 	for _, entry := range globalSettings.ThinkingModelBlacklist {
 		if strings.TrimSpace(entry) == target {
 			return true

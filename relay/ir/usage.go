@@ -39,8 +39,8 @@ func (u *Usage) ToDTOUsage() *dto.Usage {
 		v := u.CacheCreationTokens
 		out.PromptTokensDetails.CacheWriteTokens = &v
 	}
-	if out.TotalTokens == 0 && (out.PromptTokens > 0 || out.CompletionTokens > 0) {
-		out.TotalTokens = u.InclusiveInputTokens() + out.CompletionTokens
+	if computed := u.InclusiveInputTokens() + out.CompletionTokens; out.TotalTokens < computed {
+		out.TotalTokens = computed
 	}
 	return out
 }

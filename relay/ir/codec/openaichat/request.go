@@ -14,6 +14,8 @@ type chatRequestWire struct {
 	Messages             []chatMessage          `json:"messages"`
 	Tools                []json.RawMessage      `json:"tools,omitempty"`
 	ToolChoice           json.RawMessage        `json:"tool_choice,omitempty"`
+	Functions            []chatToolFunction     `json:"functions,omitempty"`
+	FunctionCall         json.RawMessage        `json:"function_call,omitempty"`
 	ParallelToolCalls    *bool                  `json:"parallel_tool_calls,omitempty"`
 	MaxTokens            *int                   `json:"max_tokens,omitempty"`
 	MaxCompletionTokens  *int                   `json:"max_completion_tokens,omitempty"`
@@ -79,6 +81,14 @@ type chatMessage struct {
 	FunctionCall     *chatFunctionCall `json:"function_call,omitempty"`
 	CacheControl     *ir.CacheControl  `json:"cache_control,omitempty"`
 	Annotations      []chatAnnotation  `json:"annotations,omitempty"`
+	Audio            *chatMessageAudio `json:"audio,omitempty"`
+}
+
+type chatMessageAudio struct {
+	ID         string `json:"id,omitempty"`
+	Data       string `json:"data,omitempty"`
+	Transcript string `json:"transcript,omitempty"`
+	ExpiresAt  int64  `json:"expires_at,omitempty"`
 }
 
 type chatContentPart struct {
@@ -163,13 +173,18 @@ type chatURLCitation struct {
 	EndIndex   int    `json:"end_index,omitempty"`
 }
 
-const extStreamIncludeObfuscation = "stream_options.include_obfuscation"
+const (
+	extStreamIncludeObfuscation = "stream_options.include_obfuscation"
+	extUseMaxCompletionTokens   = "_use_max_completion_tokens"
+)
 
 var canonicalRequestKeys = map[string]struct{}{
 	"model":                  {},
 	"messages":               {},
 	"tools":                  {},
 	"tool_choice":            {},
+	"functions":              {},
+	"function_call":          {},
 	"parallel_tool_calls":    {},
 	"max_tokens":             {},
 	"max_completion_tokens":  {},
@@ -266,6 +281,7 @@ func (c *Codec) DecodeRequest(raw []byte, ctx *ir.ConversionContext) (*ir.Reques
 	if wire.MaxCompletionTokens != nil {
 		v := *wire.MaxCompletionTokens
 		gen.MaxTokens = &v
+		ensureExtensions(req)[extUseMaxCompletionTokens] = json.RawMessage("true")
 	} else if wire.MaxTokens != nil {
 		v := *wire.MaxTokens
 		gen.MaxTokens = &v
@@ -319,11 +335,24 @@ func (c *Codec) DecodeRequest(raw []byte, ctx *ir.ConversionContext) (*ir.Reques
 		req.ResponseFormat = rf
 	}
 
-	// Tools & tool_choice.
+	// Tools & tool_choice (including legacy functions / function_call).
 	if len(wire.Tools) > 0 {
 		tools, err := decodeTools(wire.Tools)
 		if err != nil {
 			return nil, err
+		}
+		req.Tools = tools
+	} else if len(wire.Functions) > 0 {
+		tools := make([]ir.ToolDefinition, 0, len(wire.Functions))
+		for _, fn := range wire.Functions {
+			tools = append(tools, ir.ToolDefinition{
+				Type:         "function",
+				Name:         fn.Name,
+				Description:  fn.Description,
+				Parameters:   cloneBytes(fn.Parameters),
+				Strict:       fn.Strict,
+				OriginFormat: ir.FormatOpenAIChat,
+			})
 		}
 		req.Tools = tools
 	}
@@ -333,11 +362,19 @@ func (c *Codec) DecodeRequest(raw []byte, ctx *ir.ConversionContext) (*ir.Reques
 			return nil, err
 		}
 		req.ToolChoice = tc
+	} else if !isNullOrEmptyJSON(wire.FunctionCall) {
+		tc, err := decodeLegacyFunctionCallChoice(wire.FunctionCall)
+		if err != nil {
+			return nil, err
+		}
+		req.ToolChoice = tc
 	}
 
 	// Messages: extract leading pure-text system/developer messages into req.System
 	// when they carry no message-level special fields (name / message cache_control).
 	leadingSystem := true
+	pendingLegacyCalls := make(map[string][]string)
+	lastLegacyCallID := make(map[string]string)
 	for _, msg := range wire.Messages {
 		role := normalizeRole(msg.Role)
 		if leadingSystem && (role == ir.RoleSystem || role == ir.RoleDeveloper) {
@@ -350,7 +387,7 @@ func (c *Codec) DecodeRequest(raw []byte, ctx *ir.ConversionContext) (*ir.Reques
 		}
 		leadingSystem = false
 
-		irMsg, err := decodeChatMessage(msg, ctx)
+		irMsg, err := decodeChatMessageWithLegacy(msg, pendingLegacyCalls, lastLegacyCallID, ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -425,6 +462,35 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 			}
 		}
 
+		// Guard against an empty/malformed RoleTool message emitting role:"tool" without tool_call_id.
+		if msg.Role == ir.RoleTool {
+			if len(otherParts) == 0 {
+				continue
+			}
+			// Convert stray non-tool parts to a user follow-up rather than an invalid role:"tool".
+			msg.Role = ir.RoleUser
+		}
+
+		// When transitioning from tool results to a user message, merge pending tool images into
+		// that user message rather than emitting two consecutive role:"user" messages.
+		if msg.Role == ir.RoleUser && len(pendingToolImages) > 0 {
+			encodedParts := append([]map[string]any{}, pendingToolImages...)
+			pendingToolImages = nil
+			encodedParts = append(encodedParts, encodeContentPartsArray(otherParts, ctx)...)
+			userMsg := map[string]any{
+				"role":    "user",
+				"content": encodedParts,
+			}
+			if msg.Name != "" {
+				userMsg["name"] = msg.Name
+			}
+			if msg.CacheControl != nil && shouldEmitChatCacheControl(ctx) {
+				userMsg["cache_control"] = msg.CacheControl
+			}
+			messages = append(messages, userMsg)
+			continue
+		}
+
 		// Leaving a contiguous run of tool messages -> emit any buffered vision tool images first.
 		flushToolImages()
 
@@ -437,7 +503,13 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 
 	out["messages"] = messages
 
-	// Tools.
+	// Tools (and record custom tool names for tool_choice fidelity).
+	customToolNames := make(map[string]bool)
+	for _, t := range req.Tools {
+		if t.Type == "custom" && t.Name != "" {
+			customToolNames[t.Name] = true
+		}
+	}
 	if len(req.Tools) > 0 {
 		encodedTools := encodeTools(req.Tools, ctx)
 		if len(encodedTools) > 0 {
@@ -447,7 +519,7 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 
 	// Tool choice.
 	if req.ToolChoice != nil {
-		if tc := encodeToolChoice(req.ToolChoice); tc != nil {
+		if tc := encodeToolChoice(req.ToolChoice, customToolNames); tc != nil {
 			out["tool_choice"] = tc
 		}
 	}
@@ -462,7 +534,13 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 	// Generation config.
 	gen := req.Generation
 	if gen.MaxTokens != nil {
-		if ctx != nil && ctx.GetBoolOption("use_max_completion_tokens", false) {
+		useMaxCompletion := ctx != nil && ctx.GetBoolOption("use_max_completion_tokens", false)
+		if !useMaxCompletion && ctx != nil && ctx.ShouldPreserveMetadata(ir.FormatOpenAIChat) {
+			if rawFlag, ok := req.ProviderExtensions[extUseMaxCompletionTokens]; ok && string(bytes.TrimSpace(rawFlag)) == "true" {
+				useMaxCompletion = true
+			}
+		}
+		if useMaxCompletion {
 			out["max_completion_tokens"] = *gen.MaxTokens
 		} else {
 			out["max_tokens"] = *gen.MaxTokens
@@ -567,7 +645,8 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 	}
 
 	// Stream and stream_options.
-	if req.Stream {
+	isStream := req.Stream || (ctx != nil && ctx.GetBoolOption("stream", false))
+	if isStream {
 		out["stream"] = true
 		disableStreamOptions := ctx != nil && ctx.GetBoolOption("disable_stream_options", false)
 		if !disableStreamOptions {
@@ -593,7 +672,7 @@ func (c *Codec) EncodeRequest(req *ir.Request, ctx *ir.ConversionContext) ([]byt
 	if len(req.ProviderExtensions) > 0 {
 		preserveAll := ctx != nil && (ctx.MetadataMode == ir.MetadataPreserve || ctx.SourceFormat == ir.FormatOpenAIChat)
 		for k, v := range req.ProviderExtensions {
-			if k == extStreamIncludeObfuscation || isNullOrEmptyJSON(v) {
+			if k == extStreamIncludeObfuscation || k == extUseMaxCompletionTokens || strings.HasPrefix(k, "_") || isNullOrEmptyJSON(v) {
 				continue
 			}
 			if _, exists := out[k]; exists {
@@ -661,6 +740,10 @@ func tryExtractLeadingSystemParts(msg chatMessage, role ir.Role, ctx *ir.Convers
 }
 
 func decodeChatMessage(msg chatMessage, ctx *ir.ConversionContext) (ir.Message, error) {
+	return decodeChatMessageWithLegacy(msg, nil, nil, ctx)
+}
+
+func decodeChatMessageWithLegacy(msg chatMessage, pendingLegacyCalls map[string][]string, lastLegacyCallID map[string]string, ctx *ir.ConversionContext) (ir.Message, error) {
 	role := normalizeRole(msg.Role)
 	irMsg := ir.Message{
 		Role:         role,
@@ -669,8 +752,17 @@ func decodeChatMessage(msg chatMessage, ctx *ir.ConversionContext) (ir.Message, 
 	}
 
 	if role == ir.RoleTool {
+		callID := msg.ToolCallID
+		if callID == "" && msg.Name != "" && pendingLegacyCalls != nil {
+			if q := pendingLegacyCalls[msg.Name]; len(q) > 0 {
+				callID = q[0]
+				pendingLegacyCalls[msg.Name] = q[1:]
+			} else if lastLegacyCallID != nil {
+				callID = lastLegacyCallID[msg.Name]
+			}
+		}
 		tr := &ir.ToolResult{
-			ToolCallID: msg.ToolCallID,
+			ToolCallID: callID,
 			Name:       msg.Name,
 		}
 		if !isNullOrEmptyJSON(msg.Content) {
@@ -720,12 +812,31 @@ func decodeChatMessage(msg chatMessage, ctx *ir.ConversionContext) (ir.Message, 
 	}
 
 	// Main content.
-	skipEmptyText := role == ir.RoleAssistant && (len(msg.ToolCalls) > 0 || msg.FunctionCall != nil || (msg.Refusal != nil && *msg.Refusal != ""))
+	skipEmptyText := role == ir.RoleAssistant && (len(msg.ToolCalls) > 0 || msg.FunctionCall != nil || (msg.Refusal != nil && *msg.Refusal != "") || msg.Audio != nil)
 	contentParts, err := decodeMessageContent(msg.Content, skipEmptyText, ctx)
 	if err != nil {
 		return irMsg, err
 	}
 	irMsg.Parts = append(irMsg.Parts, contentParts...)
+
+	// Assistant audio output (transcript + optional raw audio data).
+	if msg.Audio != nil {
+		if msg.Audio.Transcript != "" && len(contentParts) == 0 {
+			irMsg.Parts = append(irMsg.Parts, ir.ContentPart{
+				Type: ir.PartText,
+				Text: msg.Audio.Transcript,
+			})
+		}
+		if msg.Audio.Data != "" {
+			irMsg.Parts = append(irMsg.Parts, ir.ContentPart{
+				Type: ir.PartAudio,
+				Audio: &ir.AudioSource{
+					Data:   msg.Audio.Data,
+					Format: "wav",
+				},
+			})
+		}
+	}
 
 	// Refusal.
 	if msg.Refusal != nil && *msg.Refusal != "" {
@@ -746,7 +857,7 @@ func decodeChatMessage(msg chatMessage, ctx *ir.ConversionContext) (ir.Message, 
 	}
 
 	// Tool calls (and legacy function_call).
-	for _, tc := range decodeToolCalls(msg.ToolCalls, msg.FunctionCall) {
+	for _, tc := range decodeToolCalls(msg.ToolCalls, msg.FunctionCall, pendingLegacyCalls, lastLegacyCallID) {
 		irMsg.Parts = append(irMsg.Parts, ir.ContentPart{
 			Type:     ir.PartToolCall,
 			ToolCall: tc,
@@ -885,6 +996,9 @@ func decodeImageURLPart(raw json.RawMessage) (*ir.ImageSource, error) {
 		imgURL = obj.URL
 		detail = obj.Detail
 	}
+	if strings.TrimSpace(imgURL) == "" {
+		return nil, nil
+	}
 	if mediaType, data, ok := ir.ParseDataURL(imgURL); ok {
 		return &ir.ImageSource{
 			Data:      data,
@@ -898,7 +1012,7 @@ func decodeImageURLPart(raw json.RawMessage) (*ir.ImageSource, error) {
 	}, nil
 }
 
-func decodeToolCalls(calls []chatToolCall, legacy *chatFunctionCall) []*ir.ToolCall {
+func decodeToolCalls(calls []chatToolCall, legacy *chatFunctionCall, pendingLegacyCalls map[string][]string, lastLegacyCallID map[string]string) []*ir.ToolCall {
 	out := make([]*ir.ToolCall, 0, len(calls))
 	for _, tc := range calls {
 		if tc.Type == "custom" && tc.Custom != nil {
@@ -927,8 +1041,17 @@ func decodeToolCalls(calls []chatToolCall, legacy *chatFunctionCall) []*ir.ToolC
 		})
 	}
 	if len(out) == 0 && legacy != nil {
+		id := ir.SynthesizeToolCallID("call_legacy")
+		if legacy.Name != "" {
+			if pendingLegacyCalls != nil {
+				pendingLegacyCalls[legacy.Name] = append(pendingLegacyCalls[legacy.Name], id)
+			}
+			if lastLegacyCallID != nil {
+				lastLegacyCallID[legacy.Name] = id
+			}
+		}
 		out = append(out, &ir.ToolCall{
-			ID:        "call_legacy_0",
+			ID:        id,
 			Name:      legacy.Name,
 			Arguments: legacy.Arguments,
 			Kind:      "function",
@@ -1055,6 +1178,9 @@ func decodeToolChoice(raw json.RawMessage) (*ir.ToolChoice, error) {
 				Function *struct {
 					Name string `json:"name"`
 				} `json:"function,omitempty"`
+				Custom *struct {
+					Name string `json:"name"`
+				} `json:"custom,omitempty"`
 			} `json:"tools"`
 		} `json:"allowed_tools,omitempty"`
 	}
@@ -1064,13 +1190,13 @@ func decodeToolChoice(raw json.RawMessage) (*ir.ToolChoice, error) {
 
 	switch obj.Type {
 	case "function":
-		tc := &ir.ToolChoice{Mode: "tool"}
+		tc := &ir.ToolChoice{Mode: "tool", ToolType: "function"}
 		if obj.Function != nil {
 			tc.ToolName = obj.Function.Name
 		}
 		return tc, nil
 	case "custom":
-		tc := &ir.ToolChoice{Mode: "tool"}
+		tc := &ir.ToolChoice{Mode: "tool", ToolType: "custom"}
 		if obj.Custom != nil {
 			tc.ToolName = obj.Custom.Name
 		}
@@ -1082,7 +1208,13 @@ func decodeToolChoice(raw json.RawMessage) (*ir.ToolChoice, error) {
 				tc.Mode = obj.AllowedTools.Mode
 			}
 			for _, t := range obj.AllowedTools.Tools {
-				if t.Function != nil && t.Function.Name != "" {
+				if t.Custom != nil && t.Custom.Name != "" {
+					tc.AllowedTools = append(tc.AllowedTools, t.Custom.Name)
+					if tc.AllowedToolTypes == nil {
+						tc.AllowedToolTypes = make(map[string]string)
+					}
+					tc.AllowedToolTypes[t.Custom.Name] = "custom"
+				} else if t.Function != nil && t.Function.Name != "" {
 					tc.AllowedTools = append(tc.AllowedTools, t.Function.Name)
 				}
 			}
@@ -1094,6 +1226,40 @@ func decodeToolChoice(raw json.RawMessage) (*ir.ToolChoice, error) {
 		}
 		return nil, nil
 	}
+}
+
+func decodeLegacyFunctionCallChoice(raw json.RawMessage) (*ir.ToolChoice, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+	if trimmed[0] == '"' {
+		var mode string
+		if err := json.Unmarshal(trimmed, &mode); err != nil {
+			return nil, fmt.Errorf("openaichat: decode function_call string: %w", err)
+		}
+		return &ir.ToolChoice{Mode: mode}, nil
+	}
+	var obj struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
+		return nil, fmt.Errorf("openaichat: decode function_call object: %w", err)
+	}
+	if obj.Name != "" {
+		return &ir.ToolChoice{Mode: "tool", ToolType: "function", ToolName: obj.Name}, nil
+	}
+	return nil, nil
+}
+
+func shouldEmitChatCacheControl(ctx *ir.ConversionContext) bool {
+	if ctx == nil {
+		return false
+	}
+	if ctx.GetBoolOption("preserve_cache_control", false) {
+		return true
+	}
+	return ctx.SourceFormat == ir.FormatOpenAIChat && ctx.ShouldPreserveMetadata(ir.FormatOpenAIChat)
 }
 
 func encodeSystemParts(parts []ir.ContentPart, ctx *ir.ConversionContext) []map[string]any {
@@ -1123,11 +1289,12 @@ func encodeSystemParts(parts []ir.ContentPart, ctx *ir.ConversionContext) []map[
 		}
 	}
 
+	emitCC := shouldEmitChatCacheControl(ctx)
 	msgs := make([]map[string]any, 0, len(groups))
 	for _, g := range groups {
 		hasSpecial := false
 		for _, p := range g.parts {
-			if p.Type != ir.PartText || p.CacheControl != nil {
+			if p.Type != ir.PartText || (emitCC && p.CacheControl != nil) {
 				hasSpecial = true
 				break
 			}
@@ -1150,7 +1317,10 @@ func encodeSystemParts(parts []ir.ContentPart, ctx *ir.ConversionContext) []map[
 
 func encodeToolResultMessage(trPart ir.ContentPart, msgName string, msgCache *ir.CacheControl, ctx *ir.ConversionContext) (map[string]any, []map[string]any) {
 	tr := trPart.ToolResult
+	emitCC := shouldEmitChatCacheControl(ctx)
 	var textParts []string
+	var structuredParts []map[string]any
+	hasPartCC := false
 	var imageParts []map[string]any
 
 	for _, p := range tr.Parts {
@@ -1158,9 +1328,15 @@ func encodeToolResultMessage(trPart ir.ContentPart, msgName string, msgCache *ir
 		case ir.PartText:
 			if p.Text != "" {
 				textParts = append(textParts, p.Text)
+				item := map[string]any{"type": "text", "text": p.Text}
+				if emitCC && p.CacheControl != nil {
+					item["cache_control"] = p.CacheControl
+					hasPartCC = true
+				}
+				structuredParts = append(structuredParts, item)
 			}
 		case ir.PartImage:
-			if encoded := encodeImagePart(p.Image, p.CacheControl); encoded != nil {
+			if encoded := encodeImagePart(p.Image, p.CacheControl, emitCC); encoded != nil {
 				imageParts = append(imageParts, encoded)
 			}
 		default:
@@ -1168,21 +1344,24 @@ func encodeToolResultMessage(trPart ir.ContentPart, msgName string, msgCache *ir
 		}
 	}
 
-	var content string
-	if len(textParts) > 0 {
-		if tr.Content != "" && tr.Content != strings.Join(textParts, "\n") {
-			content = tr.Content + "\n" + strings.Join(textParts, "\n")
-		} else {
-			content = strings.Join(textParts, "\n")
-		}
-	} else {
-		content = tr.Content
-	}
-
 	toolMsg := map[string]any{
 		"role":         "tool",
 		"tool_call_id": tr.ToolCallID,
-		"content":      content,
+	}
+	if hasPartCC && len(structuredParts) > 0 {
+		toolMsg["content"] = structuredParts
+	} else {
+		var content string
+		if len(textParts) > 0 {
+			if tr.Content != "" && tr.Content != strings.Join(textParts, "\n") {
+				content = tr.Content + "\n" + strings.Join(textParts, "\n")
+			} else {
+				content = strings.Join(textParts, "\n")
+			}
+		} else {
+			content = tr.Content
+		}
+		toolMsg["content"] = content
 	}
 	name := tr.Name
 	if name == "" {
@@ -1195,7 +1374,7 @@ func encodeToolResultMessage(trPart ir.ContentPart, msgName string, msgCache *ir
 	if cc == nil {
 		cc = msgCache
 	}
-	if cc != nil {
+	if emitCC && cc != nil {
 		toolMsg["cache_control"] = cc
 	}
 
@@ -1247,18 +1426,19 @@ func encodeNonToolMessage(role ir.Role, parts []ir.ContentPart, name string, msg
 		}
 	}
 
+	emitCC := shouldEmitChatCacheControl(ctx)
 	msg := map[string]any{
 		"role": wireRole,
 	}
 	if name != "" {
 		msg["name"] = name
 	}
-	if msgCache != nil {
+	if emitCC && msgCache != nil {
 		msg["cache_control"] = msgCache
 	}
 
 	if len(contentParts) > 0 {
-		if len(contentParts) == 1 && contentParts[0].Type == ir.PartText && contentParts[0].CacheControl == nil {
+		if len(contentParts) == 1 && contentParts[0].Type == ir.PartText && (!emitCC || contentParts[0].CacheControl == nil) {
 			msg["content"] = contentParts[0].Text
 		} else if encoded := encodeContentPartsArray(contentParts, ctx); len(encoded) > 0 {
 			msg["content"] = encoded
@@ -1283,6 +1463,7 @@ func encodeNonToolMessage(role ir.Role, parts []ir.ContentPart, name string, msg
 }
 
 func encodeContentPartsArray(parts []ir.ContentPart, ctx *ir.ConversionContext) []map[string]any {
+	emitCC := shouldEmitChatCacheControl(ctx)
 	out := make([]map[string]any, 0, len(parts))
 	for _, p := range parts {
 		switch p.Type {
@@ -1291,12 +1472,12 @@ func encodeContentPartsArray(parts []ir.ContentPart, ctx *ir.ConversionContext) 
 				"type": "text",
 				"text": p.Text,
 			}
-			if p.CacheControl != nil {
+			if emitCC && p.CacheControl != nil {
 				item["cache_control"] = p.CacheControl
 			}
 			out = append(out, item)
 		case ir.PartImage:
-			if item := encodeImagePart(p.Image, p.CacheControl); item != nil {
+			if item := encodeImagePart(p.Image, p.CacheControl, emitCC); item != nil {
 				out = append(out, item)
 			}
 		case ir.PartAudio:
@@ -1323,12 +1504,23 @@ func encodeContentPartsArray(parts []ir.ContentPart, ctx *ir.ConversionContext) 
 					"format": format,
 				},
 			}
-			if p.CacheControl != nil {
+			if emitCC && p.CacheControl != nil {
 				item["cache_control"] = p.CacheControl
 			}
 			out = append(out, item)
 		case ir.PartFile:
 			if p.File == nil {
+				continue
+			}
+			if p.File.Text != "" && p.File.FileID == "" && p.File.Data == "" {
+				item := map[string]any{
+					"type": "text",
+					"text": p.File.Text,
+				}
+				if emitCC && p.CacheControl != nil {
+					item["cache_control"] = p.CacheControl
+				}
+				out = append(out, item)
 				continue
 			}
 			fileObj := make(map[string]any)
@@ -1345,8 +1537,10 @@ func encodeContentPartsArray(parts []ir.ContentPart, ctx *ir.ConversionContext) 
 					fileObj["file_data"] = p.File.Data
 				}
 			}
-			if p.File.URL != "" {
-				fileObj["file_url"] = p.File.URL
+			if p.File.URL != "" && p.File.FileID == "" && p.File.Data == "" {
+				// OpenAI Chat Completions file content parts do not support file_url.
+				ctx.AddWarning("unsupported_field", "file.url", "OpenAI Chat Completions file part does not support file_url; omitted")
+				continue
 			}
 			if len(fileObj) == 0 {
 				continue
@@ -1355,7 +1549,7 @@ func encodeContentPartsArray(parts []ir.ContentPart, ctx *ir.ConversionContext) 
 				"type": "file",
 				"file": fileObj,
 			}
-			if p.CacheControl != nil {
+			if emitCC && p.CacheControl != nil {
 				item["cache_control"] = p.CacheControl
 			}
 			out = append(out, item)
@@ -1370,7 +1564,7 @@ func encodeContentPartsArray(parts []ir.ContentPart, ctx *ir.ConversionContext) 
 	return out
 }
 
-func encodeImagePart(img *ir.ImageSource, cc *ir.CacheControl) map[string]any {
+func encodeImagePart(img *ir.ImageSource, cc *ir.CacheControl, emitCC bool) map[string]any {
 	if img == nil {
 		return nil
 	}
@@ -1395,7 +1589,7 @@ func encodeImagePart(img *ir.ImageSource, cc *ir.CacheControl) map[string]any {
 		"type":      "image_url",
 		"image_url": urlObj,
 	}
-	if cc != nil {
+	if emitCC && cc != nil {
 		item["cache_control"] = cc
 	}
 	return item
@@ -1413,7 +1607,7 @@ func encodeToolCallMap(tc *ir.ToolCall) map[string]any {
 		}
 	}
 	args := tc.Arguments
-	if args == "" {
+	if strings.TrimSpace(args) == "" {
 		args = "{}"
 	}
 	return map[string]any{
@@ -1427,6 +1621,7 @@ func encodeToolCallMap(tc *ir.ToolCall) map[string]any {
 }
 
 func encodeTools(tools []ir.ToolDefinition, ctx *ir.ConversionContext) []any {
+	emitCC := shouldEmitChatCacheControl(ctx)
 	out := make([]any, 0, len(tools))
 	for _, t := range tools {
 		if t.Type == "" || t.Type == "function" {
@@ -1446,7 +1641,34 @@ func encodeTools(tools []ir.ToolDefinition, ctx *ir.ConversionContext) []any {
 				"type":     "function",
 				"function": fn,
 			}
-			if t.CacheControl != nil {
+			if emitCC && t.CacheControl != nil {
+				item["cache_control"] = t.CacheControl
+			}
+			out = append(out, item)
+			continue
+		}
+
+		if t.Type == "custom" {
+			if len(t.NativeRaw) > 0 && (t.OriginFormat == ir.FormatOpenAIChat || t.OriginFormat == ir.FormatUnknown) {
+				out = append(out, t.NativeRaw)
+				continue
+			}
+			customObj := map[string]any{
+				"name": t.Name,
+			}
+			if t.Description != "" {
+				customObj["description"] = t.Description
+			}
+			if t.ProviderMetadata != nil {
+				if format, ok := t.ProviderMetadata["format"]; ok && format != nil {
+					customObj["format"] = format
+				}
+			}
+			item := map[string]any{
+				"type":   "custom",
+				"custom": customObj,
+			}
+			if emitCC && t.CacheControl != nil {
 				item["cache_control"] = t.CacheControl
 			}
 			out = append(out, item)
@@ -1463,9 +1685,15 @@ func encodeTools(tools []ir.ToolDefinition, ctx *ir.ConversionContext) []any {
 	return out
 }
 
-func encodeToolChoice(tc *ir.ToolChoice) any {
+func encodeToolChoice(tc *ir.ToolChoice, customToolNames map[string]bool) any {
 	if tc == nil {
 		return nil
+	}
+	isCustom := func(name string) bool {
+		if tc.AllowedToolTypes != nil && tc.AllowedToolTypes[name] == "custom" {
+			return true
+		}
+		return customToolNames[name]
 	}
 	if len(tc.AllowedTools) > 0 {
 		mode := tc.Mode
@@ -1476,10 +1704,17 @@ func encodeToolChoice(tc *ir.ToolChoice) any {
 		}
 		allowed := make([]map[string]any, 0, len(tc.AllowedTools))
 		for _, name := range tc.AllowedTools {
-			allowed = append(allowed, map[string]any{
-				"type":     "function",
-				"function": map[string]any{"name": name},
-			})
+			if isCustom(name) {
+				allowed = append(allowed, map[string]any{
+					"type":   "custom",
+					"custom": map[string]any{"name": name},
+				})
+			} else {
+				allowed = append(allowed, map[string]any{
+					"type":     "function",
+					"function": map[string]any{"name": name},
+				})
+			}
 		}
 		return map[string]any{
 			"type": "allowed_tools",
@@ -1490,6 +1725,19 @@ func encodeToolChoice(tc *ir.ToolChoice) any {
 		}
 	}
 
+	encodeNamedTool := func(name string) map[string]any {
+		if tc.ToolType == "custom" || customToolNames[name] {
+			return map[string]any{
+				"type":   "custom",
+				"custom": map[string]any{"name": name},
+			}
+		}
+		return map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": name},
+		}
+	}
+
 	switch tc.Mode {
 	case "none", "auto", "required":
 		return tc.Mode
@@ -1497,18 +1745,12 @@ func encodeToolChoice(tc *ir.ToolChoice) any {
 		return "required"
 	case "tool":
 		if tc.ToolName != "" {
-			return map[string]any{
-				"type":     "function",
-				"function": map[string]any{"name": tc.ToolName},
-			}
+			return encodeNamedTool(tc.ToolName)
 		}
 		return "required"
 	default:
 		if tc.ToolName != "" {
-			return map[string]any{
-				"type":     "function",
-				"function": map[string]any{"name": tc.ToolName},
-			}
+			return encodeNamedTool(tc.ToolName)
 		}
 		if tc.Mode != "" {
 			return tc.Mode
@@ -1521,11 +1763,17 @@ func encodeReasoningEffort(rc *ir.ReasoningConfig, ctx *ir.ConversionContext) st
 	if rc == nil {
 		return ""
 	}
-	if rc.Effort != "" {
-		return rc.Effort
-	}
+	// Disabled must take precedence over any residual Effort field.
 	if rc.Mode == "disabled" || (rc.Enabled != nil && !*rc.Enabled) {
 		return "none"
+	}
+	if rc.Effort != "" {
+		effort := strings.ToLower(strings.TrimSpace(rc.Effort))
+		if effort == "max" {
+			ctx.AddWarning("adjusted_reasoning_effort", "reasoning.effort", "mapped Anthropic effort 'max' to OpenAI reasoning_effort 'high'")
+			return "high"
+		}
+		return effort
 	}
 	if rc.BudgetTokens != nil && *rc.BudgetTokens > 0 {
 		ctx.AddWarning("lossy_mapping", "reasoning.budget_tokens", "mapped reasoning budget_tokens to OpenAI reasoning_effort")

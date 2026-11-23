@@ -8,6 +8,14 @@ import (
 	"github.com/QuantumNous/new-api/relay/ir"
 )
 
+const (
+	metaKeyDecodePTBlocks = "_anthropic_dec_pt_blocks"
+	metaKeyEncodePTActive = "_anthropic_enc_pt_active"
+	metaKeyEncodePTIndex  = "_anthropic_enc_pt_index"
+	metaKeyActiveRedacted = "_anthropic_active_is_redacted"
+	metaKeyDeferredTools  = "_anthropic_deferred_tools"
+)
+
 type wireStreamMessageStart struct {
 	ID           string     `json:"id"`
 	Type         string     `json:"type"`
@@ -152,13 +160,8 @@ func (*Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.StreamC
 			Type:       ir.EventStreamStart,
 			ResponseID: id,
 			Model:      model,
+			Usage:      initialUsage,
 		}}
-		if initialUsage != nil {
-			events = append(events, ir.StreamEvent{
-				Type:  ir.EventUsage,
-				Usage: initialUsage,
-			})
-		}
 		return events, nil
 
 	case "content_block_start":
@@ -177,7 +180,6 @@ func (*Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.StreamC
 				Type:       ir.EventContentBlockStart,
 				BlockIndex: env.Index,
 				BlockType:  ir.PartText,
-				Text:       cb.Text,
 			}}
 			if cb.Text != "" {
 				events = append(events, ir.StreamEvent{
@@ -199,8 +201,6 @@ func (*Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.StreamC
 				Type:         ir.EventContentBlockStart,
 				BlockIndex:   env.Index,
 				BlockType:    ir.PartReasoning,
-				Reasoning:    cb.Thinking,
-				Signature:    cb.Signature,
 				OriginFormat: ir.FormatAnthropic,
 			}}
 			if cb.Thinking != "" {
@@ -273,6 +273,7 @@ func (*Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.StreamC
 			return events, nil
 
 		default:
+			markDecodePassthroughBlock(ctx, env.Index, true)
 			return []ir.StreamEvent{{
 				Type:             ir.EventPassthrough,
 				BlockIndex:       env.Index,
@@ -285,6 +286,15 @@ func (*Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.StreamC
 	case "content_block_delta":
 		if env.Delta == nil {
 			return nil, nil
+		}
+		if isDecodePassthroughBlock(ctx, env.Index) {
+			return []ir.StreamEvent{{
+				Type:             ir.EventPassthrough,
+				BlockIndex:       env.Index,
+				OriginFormat:     ir.FormatAnthropic,
+				PassthroughEvent: evType,
+				PassthroughData:  bytes.Clone(trimmed),
+			}}, nil
 		}
 		d := env.Delta
 		switch d.Type {
@@ -315,21 +325,27 @@ func (*Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.StreamC
 			}}, nil
 
 		case "input_json_delta":
-			var tcID, tcName string
-			tcIdx := -1
-			if tc := findToolCallByBlockIndex(ctx, env.Index); tc != nil {
-				tcID = tc.ID
-				tcName = tc.Name
-				tcIdx = tc.Index
+			tc := findToolCallByBlockIndex(ctx, env.Index)
+			if tc == nil {
+				return nil, nil
 			}
 			return []ir.StreamEvent{{
 				Type:          ir.EventToolCallDelta,
 				BlockIndex:    env.Index,
 				BlockType:     ir.PartToolCall,
-				ToolCallID:    tcID,
-				ToolName:      tcName,
-				ToolCallIndex: tcIdx,
+				ToolCallID:    tc.ID,
+				ToolName:      tc.Name,
+				ToolCallIndex: tc.Index,
 				ToolArguments: d.PartialJSON,
+			}}, nil
+
+		case "citations_delta":
+			return []ir.StreamEvent{{
+				Type:             ir.EventPassthrough,
+				BlockIndex:       env.Index,
+				OriginFormat:     ir.FormatAnthropic,
+				PassthroughEvent: evType,
+				PassthroughData:  bytes.Clone(trimmed),
 			}}, nil
 
 		default:
@@ -337,6 +353,16 @@ func (*Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.StreamC
 		}
 
 	case "content_block_stop":
+		if isDecodePassthroughBlock(ctx, env.Index) {
+			markDecodePassthroughBlock(ctx, env.Index, false)
+			return []ir.StreamEvent{{
+				Type:             ir.EventPassthrough,
+				BlockIndex:       env.Index,
+				OriginFormat:     ir.FormatAnthropic,
+				PassthroughEvent: evType,
+				PassthroughData:  bytes.Clone(trimmed),
+			}}, nil
+		}
 		var blockType ir.PartType
 		if ctx != nil && ctx.BlockOpen && ctx.ActiveBlockIndex == env.Index {
 			blockType = ctx.ActiveBlockType
@@ -344,11 +370,17 @@ func (*Codec) DecodeStreamEvent(sseEvent string, rawData []byte, ctx *ir.StreamC
 			ctx.ActiveBlockIndex = -1
 			ctx.ActiveBlockType = ""
 		}
-		return []ir.StreamEvent{{
+		ev := ir.StreamEvent{
 			Type:       ir.EventContentBlockEnd,
 			BlockIndex: env.Index,
 			BlockType:  blockType,
-		}}, nil
+		}
+		if tc := findToolCallByBlockIndex(ctx, env.Index); tc != nil {
+			ev.BlockType = ir.PartToolCall
+			ev.ToolCallID = tc.ID
+			ev.ToolCallIndex = tc.Index
+		}
+		return []ir.StreamEvent{ev}, nil
 
 	case "message_delta":
 		var events []ir.StreamEvent
@@ -412,7 +444,7 @@ func nonEmptyInitialToolInput(raw json.RawMessage) string {
 }
 
 func findToolCallByBlockIndex(ctx *ir.StreamContext, blockIdx int) *ir.TrackedToolCall {
-	if ctx == nil {
+	if ctx == nil || blockIdx < 0 {
 		return nil
 	}
 	for _, tc := range ctx.ToolCallOrder {
@@ -420,10 +452,87 @@ func findToolCallByBlockIndex(ctx *ir.StreamContext, blockIdx int) *ir.TrackedTo
 			return tc
 		}
 	}
-	if len(ctx.ToolCallOrder) > 0 {
-		return ctx.ToolCallOrder[len(ctx.ToolCallOrder)-1]
-	}
 	return nil
+}
+
+func markDecodePassthroughBlock(ctx *ir.StreamContext, idx int, open bool) {
+	if ctx == nil {
+		return
+	}
+	if ctx.Metadata == nil {
+		ctx.Metadata = make(map[string]any)
+	}
+	set, _ := ctx.Metadata[metaKeyDecodePTBlocks].(map[int]bool)
+	if set == nil {
+		if !open {
+			return
+		}
+		set = make(map[int]bool)
+		ctx.Metadata[metaKeyDecodePTBlocks] = set
+	}
+	if open {
+		set[idx] = true
+	} else {
+		delete(set, idx)
+	}
+}
+
+func isDecodePassthroughBlock(ctx *ir.StreamContext, idx int) bool {
+	if ctx == nil || ctx.Metadata == nil {
+		return false
+	}
+	set, _ := ctx.Metadata[metaKeyDecodePTBlocks].(map[int]bool)
+	return set[idx]
+}
+
+func isActiveRedactedBlock(ctx *ir.StreamContext) bool {
+	if ctx == nil || ctx.Metadata == nil {
+		return false
+	}
+	b, _ := ctx.Metadata[metaKeyActiveRedacted].(bool)
+	return b
+}
+
+func setActiveRedactedBlock(ctx *ir.StreamContext, v bool) {
+	if ctx == nil {
+		return
+	}
+	if ctx.Metadata == nil {
+		ctx.Metadata = make(map[string]any)
+	}
+	ctx.Metadata[metaKeyActiveRedacted] = v
+}
+
+func getDeferredTools(ctx *ir.StreamContext) []*ir.TrackedToolCall {
+	if ctx == nil || ctx.Metadata == nil {
+		return nil
+	}
+	list, _ := ctx.Metadata[metaKeyDeferredTools].([]*ir.TrackedToolCall)
+	return list
+}
+
+func appendDeferredTool(ctx *ir.StreamContext, tc *ir.TrackedToolCall) {
+	if ctx == nil || tc == nil {
+		return
+	}
+	if ctx.Metadata == nil {
+		ctx.Metadata = make(map[string]any)
+	}
+	list := getDeferredTools(ctx)
+	for _, existing := range list {
+		if existing == tc {
+			return
+		}
+	}
+	ctx.Metadata[metaKeyDeferredTools] = append(list, tc)
+}
+
+func clearDeferredTools(ctx *ir.StreamContext) []*ir.TrackedToolCall {
+	list := getDeferredTools(ctx)
+	if ctx != nil && ctx.Metadata != nil {
+		delete(ctx.Metadata, metaKeyDeferredTools)
+	}
+	return list
 }
 
 // EncodeStreamEvent translates a single IR StreamEvent into Anthropic SSE frames while
@@ -475,14 +584,15 @@ func (*Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.
 		}
 		frames = append(frames, startFrames...)
 
-		if !ctx.BlockOpen || ctx.ActiveBlockType != ir.PartReasoning {
-			stopFrames, err := closeActiveBlockFrames(ctx)
+		if !ctx.BlockOpen || ctx.ActiveBlockType != ir.PartReasoning || isActiveRedactedBlock(ctx) {
+			stopFrames, err := closeActiveAndDeferredFrames(ctx)
 			if err != nil {
 				return nil, err
 			}
 			frames = append(frames, stopFrames...)
 
 			idx := ctx.OpenBlock(ir.PartReasoning)
+			setActiveRedactedBlock(ctx, false)
 			f, err := makeSSEFrame("content_block_start", wireContentBlockStartEventEnc{
 				Type:         "content_block_start",
 				Index:        idx,
@@ -506,7 +616,7 @@ func (*Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.
 		return frames, nil
 
 	case ir.EventReasoningSignatureDelta:
-		if ev.Signature == "" || !ctx.BlockOpen || ctx.ActiveBlockType != ir.PartReasoning {
+		if ev.Signature == "" || !ctx.BlockOpen || ctx.ActiveBlockType != ir.PartReasoning || isActiveRedactedBlock(ctx) {
 			return nil, nil
 		}
 		if ev.OriginFormat != ir.FormatUnknown && ev.OriginFormat != ir.FormatAnthropic {
@@ -522,10 +632,12 @@ func (*Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.
 		}
 		return []ir.SSEFrame{f}, nil
 
-	case ir.EventTextDelta, ir.EventRefusalDelta:
+	case ir.EventTextDelta, ir.EventRefusalDelta, ir.EventImage:
 		text := ev.Text
 		if ev.Type == ir.EventRefusalDelta {
 			text = ev.Refusal
+		} else if ev.Type == ir.EventImage {
+			text = formatAnthropicImageMarkdown(ev.Image)
 		}
 		if text == "" {
 			return nil, nil
@@ -538,7 +650,7 @@ func (*Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.
 		frames = append(frames, startFrames...)
 
 		if !ctx.BlockOpen || ctx.ActiveBlockType != ir.PartText {
-			stopFrames, err := closeActiveBlockFrames(ctx)
+			stopFrames, err := closeActiveAndDeferredFrames(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -585,8 +697,18 @@ func (*Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.
 		if tc == nil {
 			tc, _ = ctx.RegisterToolCall(ev.ToolCallIndex, ev.ToolCallID, ev.ToolCallItemID, ev.ToolName, ev.ToolKind, ev.ThoughtSignature)
 		}
+		if tc.Closed {
+			return frames, nil
+		}
 		if !tc.Started {
-			stopFrames, err := closeActiveBlockFrames(ctx)
+			// If another tool_use block is still open, buffer this interleaved tool's args until
+			// the active tool closes so we never emit input_json_delta to a closed Anthropic block.
+			if ctx.BlockOpen && ctx.ActiveBlockType == ir.PartToolCall {
+				tc.Args.WriteString(ev.ToolArguments)
+				appendDeferredTool(ctx, tc)
+				return frames, nil
+			}
+			stopFrames, err := closeActiveAndDeferredFrames(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -612,15 +734,15 @@ func (*Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.
 			frames = append(frames, f)
 		}
 
-		blkIdx := tc.BlockIndex
-		if blkIdx < 0 {
-			blkIdx = ctx.ActiveBlockIndex
+		// Guard: never emit deltas to a block index that is not the currently open Anthropic block.
+		if !ctx.BlockOpen || ctx.ActiveBlockType != ir.PartToolCall || tc.BlockIndex != ctx.ActiveBlockIndex {
+			return frames, nil
 		}
-		tc.Args.WriteString(ev.ToolArguments)
 
+		tc.Args.WriteString(ev.ToolArguments)
 		f, err := makeSSEFrame("content_block_delta", wireContentBlockDeltaEventEnc{
 			Type:  "content_block_delta",
-			Index: blkIdx,
+			Index: tc.BlockIndex,
 			Delta: wireInputJSONDeltaEnc{
 				Type:        "input_json_delta",
 				PartialJSON: ev.ToolArguments,
@@ -633,6 +755,17 @@ func (*Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.
 		return frames, nil
 
 	case ir.EventContentBlockEnd:
+		if !ctx.BlockOpen {
+			return nil, nil
+		}
+		if ev.BlockType != "" && ev.BlockType != ctx.ActiveBlockType {
+			return nil, nil
+		}
+		if ev.BlockType == ir.PartToolCall && ev.ToolCallID != "" {
+			if tc := ctx.LookupToolCall(-1, ev.ToolCallID); tc != nil && tc.BlockIndex != ctx.ActiveBlockIndex {
+				return nil, nil
+			}
+		}
 		return closeActiveBlockFrames(ctx)
 
 	case ir.EventFinish:
@@ -643,10 +776,9 @@ func (*Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.
 		if ev.RawFinishReason != "" {
 			ctx.PendingRawFinish = ev.RawFinishReason
 		}
-		// Close any open content block now; defer message_delta + message_stop until
-		// EventStreamEnd or FlushStream so trailing EventUsage frames (e.g. OpenAI Chat)
-		// are captured before terminal usage is emitted.
-		return closeActiveBlockFrames(ctx)
+		// Close any open content block and flush deferred interleaved tool calls; defer message_delta + message_stop
+		// until EventStreamEnd or FlushStream so trailing EventUsage frames (e.g. OpenAI Chat) are captured.
+		return closeActiveAndDeferredFrames(ctx)
 
 	case ir.EventStreamEnd:
 		return finalizeAnthropicStream(ctx)
@@ -669,10 +801,7 @@ func (*Codec) EncodeStreamEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.
 
 	case ir.EventPassthrough:
 		if ctx.ShouldPreserveMetadata(ev.OriginFormat) && len(ev.PassthroughData) > 0 {
-			return []ir.SSEFrame{{
-				Event: ev.PassthroughEvent,
-				Data:  bytes.Clone(ev.PassthroughData),
-			}}, nil
+			return encodePassthroughEvent(ev, ctx)
 		}
 		return nil, nil
 
@@ -712,6 +841,7 @@ func encodeContentBlockStartEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 			frames = append(frames, stopFrames...)
 
 			idx := ctx.OpenBlock(ir.PartReasoning)
+			setActiveRedactedBlock(ctx, true)
 			f, err := makeSSEFrame("content_block_start", wireContentBlockStartEventEnc{
 				Type:         "content_block_start",
 				Index:        idx,
@@ -724,14 +854,15 @@ func encodeContentBlockStartEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 			return frames, nil
 		}
 
-		if !ctx.BlockOpen || ctx.ActiveBlockType != ir.PartReasoning {
-			stopFrames, err := closeActiveBlockFrames(ctx)
+		if !ctx.BlockOpen || ctx.ActiveBlockType != ir.PartReasoning || isActiveRedactedBlock(ctx) {
+			stopFrames, err := closeActiveAndDeferredFrames(ctx)
 			if err != nil {
 				return nil, err
 			}
 			frames = append(frames, stopFrames...)
 
 			idx := ctx.OpenBlock(ir.PartReasoning)
+			setActiveRedactedBlock(ctx, false)
 			f, err := makeSSEFrame("content_block_start", wireContentBlockStartEventEnc{
 				Type:         "content_block_start",
 				Index:        idx,
@@ -746,7 +877,7 @@ func encodeContentBlockStartEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]i
 
 	case ir.PartText:
 		if !ctx.BlockOpen || ctx.ActiveBlockType != ir.PartText {
-			stopFrames, err := closeActiveBlockFrames(ctx)
+			stopFrames, err := closeActiveAndDeferredFrames(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -778,13 +909,44 @@ func encodeToolCallStartEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.SS
 	}
 	frames = append(frames, startFrames...)
 
-	stopFrames, err := closeActiveBlockFrames(ctx)
+	tc, created := ctx.RegisterToolCall(ev.ToolCallIndex, ev.ToolCallID, ev.ToolCallItemID, ev.ToolName, ev.ToolKind, ev.ThoughtSignature)
+	if !created && tc.Started {
+		// Deduplicate repeated EventToolCallStart for an already-opened tool block.
+		if ev.ToolArguments != "" && !tc.Closed && ctx.BlockOpen && ctx.ActiveBlockType == ir.PartToolCall && tc.BlockIndex == ctx.ActiveBlockIndex {
+			tc.Args.WriteString(ev.ToolArguments)
+			deltaFrame, err := makeSSEFrame("content_block_delta", wireContentBlockDeltaEventEnc{
+				Type:  "content_block_delta",
+				Index: tc.BlockIndex,
+				Delta: wireInputJSONDeltaEnc{
+					Type:        "input_json_delta",
+					PartialJSON: ev.ToolArguments,
+				},
+			})
+			if err != nil {
+				return nil, err
+			}
+			frames = append(frames, deltaFrame)
+		}
+		return frames, nil
+	}
+
+	// If another tool_use block is currently open (e.g. interleaved parallel OpenAI Chat tool calls),
+	// defer emitting this new tool_use block until the active tool finishes so prior tool deltas
+	// can still stream into their open block without violating Anthropic's single-open-block rule.
+	if ctx.BlockOpen && ctx.ActiveBlockType == ir.PartToolCall {
+		if ev.ToolArguments != "" {
+			tc.Args.WriteString(ev.ToolArguments)
+		}
+		appendDeferredTool(ctx, tc)
+		return frames, nil
+	}
+
+	stopFrames, err := closeActiveAndDeferredFrames(ctx)
 	if err != nil {
 		return nil, err
 	}
 	frames = append(frames, stopFrames...)
 
-	tc, _ := ctx.RegisterToolCall(ev.ToolCallIndex, ev.ToolCallID, ev.ToolCallItemID, ev.ToolName, ev.ToolKind, ev.ThoughtSignature)
 	idx := ctx.OpenBlock(ir.PartToolCall)
 	tc.BlockIndex = idx
 	tc.Started = true
@@ -822,6 +984,76 @@ func encodeToolCallStartEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.SS
 	return frames, nil
 }
 
+func encodePassthroughEvent(ev ir.StreamEvent, ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
+	var frames []ir.SSEFrame
+	startFrames, err := ensureMessageStartFrames(ctx)
+	if err != nil {
+		return nil, err
+	}
+	frames = append(frames, startFrames...)
+
+	switch ev.PassthroughEvent {
+	case "content_block_start":
+		stopFrames, err := closeActiveAndDeferredFrames(ctx)
+		if err != nil {
+			return nil, err
+		}
+		frames = append(frames, stopFrames...)
+		idx := ctx.OpenBlock(ir.PartType("passthrough"))
+		if ctx.Metadata == nil {
+			ctx.Metadata = make(map[string]any)
+		}
+		ctx.Metadata[metaKeyEncodePTActive] = true
+		ctx.Metadata[metaKeyEncodePTIndex] = idx
+		data := rewriteJSONIndex(ev.PassthroughData, idx)
+		frames = append(frames, ir.SSEFrame{Event: ev.PassthroughEvent, Data: data})
+		return frames, nil
+
+	case "content_block_delta":
+		idx := ctx.ActiveBlockIndex
+		if idx < 0 {
+			idx = ev.BlockIndex
+		}
+		data := rewriteJSONIndex(ev.PassthroughData, idx)
+		frames = append(frames, ir.SSEFrame{Event: ev.PassthroughEvent, Data: data})
+		return frames, nil
+
+	case "content_block_stop":
+		idx, _, ok := ctx.CloseActiveBlock()
+		if ctx.Metadata != nil {
+			ctx.Metadata[metaKeyEncodePTActive] = false
+		}
+		if !ok {
+			idx = ev.BlockIndex
+		}
+		data := rewriteJSONIndex(ev.PassthroughData, idx)
+		frames = append(frames, ir.SSEFrame{Event: ev.PassthroughEvent, Data: data})
+		return frames, nil
+
+	default:
+		frames = append(frames, ir.SSEFrame{
+			Event: ev.PassthroughEvent,
+			Data:  bytes.Clone(ev.PassthroughData),
+		})
+		return frames, nil
+	}
+}
+
+func rewriteJSONIndex(raw json.RawMessage, idx int) []byte {
+	var obj map[string]any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&obj); err != nil || obj == nil {
+		return bytes.Clone(raw)
+	}
+	obj["index"] = idx
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return bytes.Clone(raw)
+	}
+	return out
+}
+
 func ensureMessageStartFrames(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
 	if ctx.Started {
 		return nil, nil
@@ -831,6 +1063,8 @@ func ensureMessageStartFrames(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
 	ctx.Started = true
 
 	initialUsage := encodeUsage(ctx.LastUsage)
+	// Per Anthropic streaming spec, message_start carries input/cache counts with output_tokens=0 (or initial).
+	initialUsage.OutputTokens = 0
 	f, err := makeSSEFrame("message_start", wireMessageStartEventEnc{
 		Type: "message_start",
 		Message: wireStreamMessageStart{
@@ -851,9 +1085,15 @@ func ensureMessageStartFrames(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
 }
 
 func closeActiveBlockFrames(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
-	idx, _, ok := ctx.CloseActiveBlock()
+	idx, bt, ok := ctx.CloseActiveBlock()
 	if !ok {
 		return nil, nil
+	}
+	setActiveRedactedBlock(ctx, false)
+	if bt == ir.PartToolCall {
+		if tc := findToolCallByBlockIndex(ctx, idx); tc != nil {
+			tc.Closed = true
+		}
 	}
 	f, err := makeSSEFrame("content_block_stop", wireContentBlockStopEventEnc{
 		Type:  "content_block_stop",
@@ -863,6 +1103,60 @@ func closeActiveBlockFrames(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
 		return nil, err
 	}
 	return []ir.SSEFrame{f}, nil
+}
+
+func closeActiveAndDeferredFrames(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
+	var frames []ir.SSEFrame
+	stopFrames, err := closeActiveBlockFrames(ctx)
+	if err != nil {
+		return nil, err
+	}
+	frames = append(frames, stopFrames...)
+
+	for _, tc := range clearDeferredTools(ctx) {
+		if tc == nil || tc.Started || tc.Closed {
+			continue
+		}
+		idx := ctx.OpenBlock(ir.PartToolCall)
+		tc.BlockIndex = idx
+		tc.Started = true
+		startFrame, err := makeSSEFrame("content_block_start", wireContentBlockStartEventEnc{
+			Type:  "content_block_start",
+			Index: idx,
+			ContentBlock: wireToolUseBlockEnc{
+				Type:  "tool_use",
+				ID:    tc.ID,
+				Name:  tc.Name,
+				Input: json.RawMessage(`{}`),
+			},
+		})
+		if err != nil {
+			return frames, err
+		}
+		frames = append(frames, startFrame)
+
+		if args := tc.Args.String(); args != "" {
+			deltaFrame, err := makeSSEFrame("content_block_delta", wireContentBlockDeltaEventEnc{
+				Type:  "content_block_delta",
+				Index: idx,
+				Delta: wireInputJSONDeltaEnc{
+					Type:        "input_json_delta",
+					PartialJSON: args,
+				},
+			})
+			if err != nil {
+				return frames, err
+			}
+			frames = append(frames, deltaFrame)
+		}
+
+		tcStop, err := closeActiveBlockFrames(ctx)
+		if err != nil {
+			return frames, err
+		}
+		frames = append(frames, tcStop...)
+	}
+	return frames, nil
 }
 
 func finalizeAnthropicStream(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
@@ -881,7 +1175,7 @@ func finalizeAnthropicStream(ctx *ir.StreamContext) ([]ir.SSEFrame, error) {
 	}
 	frames = append(frames, startFrames...)
 
-	stopFrames, err := closeActiveBlockFrames(ctx)
+	stopFrames, err := closeActiveAndDeferredFrames(ctx)
 	if err != nil {
 		return nil, err
 	}
