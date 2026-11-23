@@ -154,4 +154,15 @@ var (
 			StripFields("n", "logit_bias", "seed"),
 		},
 	}
+
+	// CodexResponsesShim adapts OpenAI Responses payloads for ChatGPT/Codex backend constraints.
+	CodexResponsesShim = &Shim{
+		Name:       "codex--openai_responses",
+		BaseFormat: FormatOpenAIResponses,
+		PostIRRequestTransforms: []JSONTransform{
+			SetDefaultField("instructions", ""),
+			SetField("store", false),
+			StripFields("max_output_tokens", "temperature"),
+		},
+	}
 )

@@ -16,7 +16,7 @@ import (
 )
 
 func irBridgeScope(info *relaycommon.RelayInfo) string {
-	if info == nil || info.ChannelId <= 0 {
+	if info == nil || info.ChannelMeta == nil || info.ChannelId <= 0 {
 		return ""
 	}
 	return fmt.Sprintf("channel:%d", info.ChannelId)
@@ -58,7 +58,7 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 	}
 
 	// Preserve OpenRouter-specific reasoning/verbosity extensions and non-OpenRouter -thinking suffix semantics.
-	isOpenRouter := info != nil && info.ChannelType == constant.ChannelTypeOpenRouter
+	isOpenRouter := info != nil && info.ChannelMeta != nil && info.ChannelType == constant.ChannelTypeOpenRouter
 	if isOpenRouter {
 		if effort := claudeRequest.GetEfforts(); effort != "" {
 			effortBytes, _ := json.Marshal(effort)

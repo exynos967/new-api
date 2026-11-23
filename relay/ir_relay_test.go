@@ -13,7 +13,10 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	awsChannel "github.com/QuantumNous/new-api/relay/channel/aws"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
+	"github.com/QuantumNous/new-api/relay/channel/codex"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
+	"github.com/QuantumNous/new-api/relay/channel/opencode"
 	"github.com/QuantumNous/new-api/relay/channel/vertex"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -336,4 +339,101 @@ func TestIRBedrockTargetResolutionAndPayloadPreparation(t *testing.T) {
 	require.NotContains(t, m, "model")
 	require.NotContains(t, m, "stream")
 	require.Contains(t, string(prepared), "prompt-caching-2024-07-31")
+}
+
+func TestIRCrossProtocolGeminiAndClaudeToCodex(t *testing.T) {
+	service.InitHttpClient()
+	setIRToggleForTest(t, true)
+
+	var gotPath string
+	var gotAccountID string
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAccountID = r.Header.Get("chatgpt-account-id")
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id": "resp_codex_1",
+			"object": "response",
+			"status": "completed",
+			"model": "gpt-6-astra",
+			"output": [{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": "Codex OK"}]}],
+			"usage": {"input_tokens": 18, "output_tokens": 6, "total_tokens": 24}
+		}`)
+	}))
+	defer server.Close()
+
+	c, rec := newIRTestGinContext(http.MethodPost, "/v1beta/models/gpt-6-astra:generateContent")
+	info := &relaycommon.RelayInfo{
+		RelayFormat:     types.RelayFormatGemini,
+		RelayMode:       relayconstant.RelayModeGemini,
+		RequestURLPath:  "/v1beta/models/gpt-6-astra:generateContent",
+		IsStream:        false,
+		OriginModelName: "gpt-6-astra",
+		ClientModelName: "gpt-6-astra",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelId:         99,
+			ChannelType:       constant.ChannelTypeCodex,
+			ApiType:           constant.APITypeCodex,
+			ChannelBaseUrl:    server.URL,
+			ApiKey:            `{"access_token":"tok_abc","account_id":"acct_123"}`,
+			UpstreamModelName: "gpt-6-astra",
+		},
+	}
+	info.InitRequestConversionChain()
+	relaycommon.SetRelayInfo(c, info)
+	relaycommon.InstallRelayResponseWriter(c)
+
+	var req dto.GeminiChatRequest
+	require.NoError(t, common.UnmarshalJsonStr(`{"contents":[{"role":"user","parts":[{"text":"Ping Codex"}]}],"generationConfig":{"maxOutputTokens":64,"temperature":0.5}}`, &req))
+
+	adaptor := &codex.Adaptor{}
+	adaptor.Init(info)
+
+	handled, usage, apiErr := tryIRCrossProtocolRelay(c, info, adaptor, ir.FormatGoogleGenAI, &req)
+	require.True(t, handled)
+	require.Nil(t, apiErr)
+	require.Equal(t, "/backend-api/codex/responses", gotPath)
+	require.Equal(t, "acct_123", gotAccountID)
+	require.Equal(t, false, gotBody["store"])
+	require.Contains(t, gotBody, "instructions")
+	require.NotContains(t, gotBody, "max_output_tokens")
+	require.NotContains(t, gotBody, "temperature")
+	require.Contains(t, rec.Body.String(), "Codex OK")
+	require.NotNil(t, usage)
+	require.Equal(t, 18, usage.PromptTokens)
+	require.Equal(t, 6, usage.CompletionTokens)
+}
+
+func TestIRRoutingCoversOpenRouterAndOpenCodeGeminiResponses(t *testing.T) {
+	setIRToggleForTest(t, true)
+	c, _ := newIRTestGinContext(http.MethodPost, "/v1beta/models/gpt-6-astra:generateContent")
+
+	orInfo := &relaycommon.RelayInfo{
+		RelayFormat: types.RelayFormatGemini,
+		RelayMode:   relayconstant.RelayModeGemini,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenRouter,
+			ApiType:           constant.APITypeOpenRouter,
+			UpstreamModelName: "openai/gpt-5",
+		},
+	}
+	spec, ok := resolveTargetIRSpec(c, orInfo, &openai.Adaptor{}, ir.FormatGoogleGenAI)
+	require.True(t, ok)
+	require.Equal(t, ir.FormatOpenAIChat, spec.Format)
+
+	ocInfo := &relaycommon.RelayInfo{
+		RelayFormat: types.RelayFormatGemini,
+		RelayMode:   relayconstant.RelayModeGemini,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelType:       constant.ChannelTypeOpenCode,
+			ApiType:           constant.APITypeOpenCode,
+			UpstreamModelName: "gpt-5.6-sol",
+		},
+	}
+	ocSpec, ok := resolveTargetIRSpec(c, ocInfo, &opencode.Adaptor{}, ir.FormatGoogleGenAI)
+	require.True(t, ok)
+	require.Equal(t, ir.FormatOpenAIResponses, ocSpec.Format)
 }

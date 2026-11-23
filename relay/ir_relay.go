@@ -60,19 +60,83 @@ func resolveTargetIRSpec(c *gin.Context, info *relaycommon.RelayInfo, adaptor ch
 		return irTargetSpec{}, false
 	}
 
-	// Channels with bespoke transport / wrapping / per-model dynamic routing stay on their dedicated paths.
+	// Channels with bespoke transport / wrapping stay on their dedicated paths.
 	switch info.ChannelType {
 	case constant.ChannelTypeCline,
 		constant.ChannelTypeKilo,
 		constant.ChannelTypeGMICloud,
-		constant.ChannelTypeOpenCode,
-		constant.ChannelTypeOpenCodeGo,
 		constant.ChannelTypeXunfeiMaas,
 		constant.ChannelTypeBilibiliWeb:
+		return irTargetSpec{}, false
+	case constant.ChannelTypeOpenCode, constant.ChannelTypeOpenCodeGo:
+		// OpenCode free/chat/claude paths have dedicated stream guards and tool handling.
+		// Only bridge Gemini -> OpenCode Responses where opencode/adaptor.go otherwise returns 400.
+		if sourceFormat == ir.FormatGoogleGenAI {
+			ep := constant.GetOpenCodeEndpoint(info.UpstreamModelName)
+			if info.ChannelType == constant.ChannelTypeOpenCodeGo {
+				ep = constant.GetOpenCodeGoEndpoint(info.UpstreamModelName)
+			}
+			if ep == constant.OpenCodeEndpointResponses {
+				return irTargetSpec{
+					Format:      ir.FormatOpenAIResponses,
+					RelayMode:   relayconstant.RelayModeResponses,
+					URLPath:     "/v1/responses",
+					RelayFormat: types.RelayFormatOpenAIResponses,
+				}, true
+			}
+		}
 		return irTargetSpec{}, false
 	}
 
 	switch info.ApiType {
+	case constant.APITypeCodex:
+		return irTargetSpec{
+			Format:      ir.FormatOpenAIResponses,
+			Shim:        ir.CodexResponsesShim,
+			RelayMode:   relayconstant.RelayModeResponses,
+			URLPath:     "/v1/responses",
+			RelayFormat: types.RelayFormatOpenAIResponses,
+		}, true
+
+	case constant.APITypeOpenRouter:
+		if !info.ChannelOtherSettings.IsOpenRouterEnterprise() {
+			// OpenRouter native natively supports Chat, Responses, and Claude Messages.
+			if sourceFormat == ir.FormatOpenAIChat || sourceFormat == ir.FormatOpenAIResponses || sourceFormat == ir.FormatAnthropic {
+				return irTargetSpec{}, false
+			}
+			if shouldChatCompletionsUseResponses(info) {
+				return irTargetSpec{
+					Format:      ir.FormatOpenAIResponses,
+					RelayMode:   relayconstant.RelayModeResponses,
+					URLPath:     "/v1/responses",
+					RelayFormat: types.RelayFormatOpenAIResponses,
+				}, true
+			}
+			return irTargetSpec{
+				Format:      ir.FormatOpenAIChat,
+				RelayMode:   relayconstant.RelayModeChatCompletions,
+				URLPath:     "/v1/chat/completions",
+				RelayFormat: types.RelayFormatOpenAI,
+			}, true
+		}
+		if sourceFormat == ir.FormatOpenAIResponses {
+			return irTargetSpec{}, false
+		}
+		if shouldChatCompletionsUseResponses(info) {
+			return irTargetSpec{
+				Format:      ir.FormatOpenAIResponses,
+				RelayMode:   relayconstant.RelayModeResponses,
+				URLPath:     "/v1/responses",
+				RelayFormat: types.RelayFormatOpenAIResponses,
+			}, true
+		}
+		return irTargetSpec{
+			Format:      ir.FormatOpenAIChat,
+			RelayMode:   relayconstant.RelayModeChatCompletions,
+			URLPath:     "/v1/chat/completions",
+			RelayFormat: types.RelayFormatOpenAI,
+		}, true
+
 	case constant.APITypeAnthropic:
 		return irTargetSpec{
 			Format:      ir.FormatAnthropic,
@@ -141,18 +205,6 @@ func resolveTargetIRSpec(c *gin.Context, info *relaycommon.RelayInfo, adaptor ch
 		}, true
 
 	case constant.APITypeOpenAI:
-		if info.ChannelType == constant.ChannelTypeOpenRouter && !info.ChannelOtherSettings.IsOpenRouterEnterprise() {
-			// OpenRouter native natively supports Chat, Responses, and Claude Messages.
-			if sourceFormat == ir.FormatOpenAIChat || sourceFormat == ir.FormatOpenAIResponses || sourceFormat == ir.FormatAnthropic {
-				return irTargetSpec{}, false
-			}
-			return irTargetSpec{
-				Format:      ir.FormatOpenAIChat,
-				RelayMode:   relayconstant.RelayModeChatCompletions,
-				URLPath:     "/v1/chat/completions",
-				RelayFormat: types.RelayFormatOpenAI,
-			}, true
-		}
 		// Official OpenAI Chat (including Chat->Responses) stays on its official compatibility path
 		// to preserve prompt_cache_breakpoint & audio validation contracts.
 		if info.ChannelType == constant.ChannelTypeOpenAI && sourceFormat == ir.FormatOpenAIChat {
@@ -236,7 +288,19 @@ func resolveTargetIRSpec(c *gin.Context, info *relaycommon.RelayInfo, adaptor ch
 		constant.APITypeCloudflare,
 		constant.APITypeQianwenAI,
 		constant.APITypeMiMo,
-		constant.APITypeAgnesAI:
+		constant.APITypeAgnesAI,
+		constant.APITypePoe,
+		constant.APITypeXinference:
+		// When admin explicitly enables ChatCompletionsToResponsesPolicy for this channel/model,
+		// translate any non-Responses source format directly into OpenAI Responses via IR.
+		if sourceFormat != ir.FormatOpenAIResponses && shouldChatCompletionsUseResponses(info) {
+			return irTargetSpec{
+				Format:      ir.FormatOpenAIResponses,
+				RelayMode:   relayconstant.RelayModeResponses,
+				URLPath:     "/v1/responses",
+				RelayFormat: types.RelayFormatOpenAIResponses,
+			}, true
+		}
 		// These channels natively support OpenAI Chat and (mostly) Responses/Claude;
 		// bridge unsupported cross-protocol entries (e.g., Gemini -> Chat) via IR.
 		if sourceFormat == ir.FormatGoogleGenAI {
