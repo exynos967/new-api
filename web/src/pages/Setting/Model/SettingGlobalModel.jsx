@@ -189,8 +189,8 @@ export default function SettingGlobalModel(props) {
           style={{ marginBottom: 15 }}
         >
           <Form.Section text={t('全局设置')}>
-            <Row>
-              <Col xs={24} sm={12} md={8} lg={8} xl={8}>
+            <Row gutter={24}>
+              <Col xs={24} sm={12} md={10} lg={10} xl={10}>
                 <Form.Switch
                   label={t('启用请求透传')}
                   field={'global.pass_through_request_enabled'}
@@ -205,7 +205,13 @@ export default function SettingGlobalModel(props) {
                   )}
                 />
               </Col>
-              <Col xs={24} sm={12} md={8} lg={8} xl={8}>
+              <Col
+                xs={24}
+                sm={12}
+                md={{ span: 10, offset: 2 }}
+                lg={{ span: 10, offset: 2 }}
+                xl={{ span: 10, offset: 2 }}
+              >
                 <Form.Switch
                   label={t('启用 IR 跨协议转换引擎')}
                   field={'global.ir_conversion_enabled'}
